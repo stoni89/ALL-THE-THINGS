@@ -67,15 +67,17 @@ public class CompactOverlayWindow : Window
 
         OutlineText($"{plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
 
+        if (ImGui.Button(Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter"))
+            ImGui.OpenPopup("CompactTypeFilterPopup");
+
+        ImGui.SameLine();
+
         var onlyAffordable = config.CompactOnlyAffordable;
         if (ImGui.Checkbox(Loc.T("Nur leistbare Käufe", "Only affordable purchases") + "##Compact", ref onlyAffordable))
         {
             config.CompactOnlyAffordable = onlyAffordable;
             config.Save();
         }
-
-        if (ImGui.Button(Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter"))
-            ImGui.OpenPopup("CompactTypeFilterPopup");
 
         if (ImGui.BeginPopup("CompactTypeFilterPopup"))
         {
