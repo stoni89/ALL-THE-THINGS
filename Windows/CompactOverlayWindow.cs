@@ -56,9 +56,18 @@ public class CompactOverlayWindow : Window
     public override void Draw()
     {
         var config = plugin.Configuration;
+        using var fontScope = PushCompactFont(config);
+        ImGui.SetWindowFontScale(config.CompactFontScale);
+
         var currentTerritoryId = Plugin.ClientState.TerritoryType;
 
         OutlineText("All The Things", TitleColor);
+        if (ImGui.IsItemHovered())
+            ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+
+        if (ImGui.IsItemClicked())
+            plugin.OpenOptions();
+
         if (DrawCloseButtonTopRight())
         {
             config.ShowCompactOverlay = false;
@@ -210,6 +219,22 @@ public class CompactOverlayWindow : Window
 
         if (ImGui.IsItemClicked())
             plugin.OpenVendorMap(entry);
+    }
+
+    /// <summary>
+    /// Aktiviert bei Bedarf eine abweichende Schrift für das Overlay (nur, wenn sie bereits
+    /// geladen ist - andernfalls bleibt die reguläre Dalamud/ImGui-Schrift aktiv).
+    /// </summary>
+    private static System.IDisposable? PushCompactFont(Configuration config)
+    {
+        Dalamud.Interface.ManagedFontAtlas.IFontHandle? handle = config.CompactFontMode switch
+        {
+            CompactFontMode.Mono => Plugin.PluginInterface.UiBuilder.MonoFontHandle,
+            CompactFontMode.Custom => CustomFontManager.GetOrCreate(config.CompactCustomFontPath),
+            _ => null,
+        };
+
+        return handle is { Available: true } ? handle.Push() : null;
     }
 
     private static bool DrawCloseButtonTopRight()

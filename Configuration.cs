@@ -5,6 +5,13 @@ using System.Linq;
 
 namespace AllTheThings;
 
+public enum CompactFontMode
+{
+    Standard,
+    Mono,
+    Custom,
+}
+
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
@@ -37,6 +44,10 @@ public class Configuration : IPluginConfiguration
     public bool ShowCompactOverlay { get; set; } = false;
     public bool CompactOnlyAffordable { get; set; } = false;
     public bool ShowCurrencyWallet { get; set; } = true;
+    public float CompactFontScale { get; set; } = 1f;
+    public CompactFontMode CompactFontMode { get; set; } = CompactFontMode.Standard;
+    public string CompactCustomFontPath { get; set; } = string.Empty;
+    public string CompactCustomFontName { get; set; } = string.Empty;
 
     public void Save()
     {
