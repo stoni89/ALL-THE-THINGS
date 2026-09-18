@@ -88,6 +88,8 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
 
         var transparency = config.CompactTransparency;
         ImGui.SetNextItemWidth(200);
@@ -103,8 +105,5 @@ public class MainWindow : Window
             config.ShowCurrencyWallet = showWallet;
             config.Save();
         }
-        ImGui.TextDisabled(Loc.T(
-            "Zeigt im Overlay, wie viel du von den benötigten Währungen besitzt.",
-            "Shows how much of the required currencies you own, in the overlay."));
     }
 }
