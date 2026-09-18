@@ -1,0 +1,23 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>0.2.0</Version>
+    <!-- Manifest-Felder (siehe https://github.com/goatcorp/DalamudPackager) -->
+    <Author>Dein Name</Author>
+    <Name>All The Things</Name>
+    <Punchline>Sammel-Tracker pro Karte, inspiriert von "All the Things"</Punchline>
+    <Description>Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories und Triple-Triad-Karten in der aktuellen Zone noch fehlen.</Description>
+    <RepoUrl></RepoUrl>
+    <Tags>collection;tracker;utility;allthethings</Tags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="Data\mounts.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\minions.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\orchestrions.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\bardings.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\emotes.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\facewear.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\fashions.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\triadcards.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
