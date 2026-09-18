@@ -60,6 +60,8 @@ public sealed class Plugin : IDalamudPlugin
 
     private void ToggleMainUI() => MainWindow.IsOpen = !MainWindow.IsOpen;
 
+    public void OpenOptions() => MainWindow.IsOpen = true;
+
     /// <summary>
     /// Prüft, ob der Spieler ein bestimmtes Sammelobjekt bereits besitzt.
     /// Nutzt FFXIVClientStructs, um direkt auf die entsprechenden

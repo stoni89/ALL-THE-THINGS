@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using Dalamud.Interface.Windowing;
@@ -10,6 +11,7 @@ public class MainWindow : Window
 {
     private readonly Plugin plugin;
     private static readonly string VersionText = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
+    private string fontFilter = string.Empty;
 
     public MainWindow(Plugin plugin) : base(
         $"All The Things (v{VersionText})##AllTheThings",
@@ -19,12 +21,12 @@ public class MainWindow : Window
 
         // Standardgröße reicht, um alle Optionen ohne Scrollbalken zu zeigen -
         // gilt nur beim allerersten Öffnen, danach darf frei skaliert werden.
-        Size = new Vector2(420, 500);
+        Size = new Vector2(420, 580);
         SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints
         {
             MinimumSize = new Vector2(320, 260),
-            MaximumSize = new Vector2(650, 750),
+            MaximumSize = new Vector2(650, 820),
         };
     }
 
@@ -97,6 +99,64 @@ public class MainWindow : Window
         {
             config.CompactTransparency = transparency;
             config.Save();
+        }
+
+        var fontScale = config.CompactFontScale;
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.SliderFloat(Loc.T("Textgröße (kompaktes Overlay)", "Text size (compact overlay)"), ref fontScale, 0.7f, 2f, "%.2f"))
+        {
+            config.CompactFontScale = fontScale;
+            config.Save();
+        }
+
+        var monoLabel = Loc.T("Monospace", "Monospace");
+        var standardLabel = Loc.T("Standard", "Standard");
+        var currentLabel = config.CompactFontMode switch
+        {
+            CompactFontMode.Mono => monoLabel,
+            CompactFontMode.Custom when !string.IsNullOrEmpty(config.CompactCustomFontName) => config.CompactCustomFontName,
+            _ => standardLabel,
+        };
+
+        ImGui.SetNextItemWidth(200);
+        if (ImGui.BeginCombo(Loc.T("Schriftart (kompaktes Overlay)", "Font (compact overlay)"), currentLabel))
+        {
+            if (ImGui.Selectable(standardLabel, config.CompactFontMode == CompactFontMode.Standard))
+            {
+                config.CompactFontMode = CompactFontMode.Standard;
+                config.Save();
+            }
+
+            if (ImGui.Selectable(monoLabel, config.CompactFontMode == CompactFontMode.Mono))
+            {
+                config.CompactFontMode = CompactFontMode.Mono;
+                config.Save();
+            }
+
+            ImGui.Separator();
+            ImGui.SetNextItemWidth(-1);
+            ImGui.InputTextWithHint("##FontFilter", Loc.T("Windows-Schriften durchsuchen...", "Search Windows fonts..."), ref fontFilter, 100);
+
+            var installedFonts = WindowsFonts.GetInstalledFonts();
+            var filtered = string.IsNullOrWhiteSpace(fontFilter)
+                ? installedFonts
+                : installedFonts.Where(f => f.Name.Contains(fontFilter, System.StringComparison.OrdinalIgnoreCase)).ToList();
+
+            ImGui.BeginChild("##FontList", new Vector2(0, 150));
+            foreach (var font in filtered)
+            {
+                var isSelected = config.CompactFontMode == CompactFontMode.Custom && config.CompactCustomFontPath == font.Path;
+                if (ImGui.Selectable(font.Name, isSelected))
+                {
+                    config.CompactFontMode = CompactFontMode.Custom;
+                    config.CompactCustomFontPath = font.Path;
+                    config.CompactCustomFontName = font.Name;
+                    config.Save();
+                }
+            }
+            ImGui.EndChild();
+
+            ImGui.EndCombo();
         }
 
         var showWallet = config.ShowCurrencyWallet;
