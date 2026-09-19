@@ -52,6 +52,13 @@ public class Configuration : IPluginConfiguration
     // QoL
     public bool UseSprintOnCooldown { get; set; } = true;
 
+    // Mount für die Aetheryten-Automation: null = aus (zu Fuß mit Sprint), 0 = "Mount Roulette"
+    // (bei jedem Ruf wird zufällig eines der bereits freigeschalteten Mounts gewählt - es gibt
+    // dafür keine verlässliche, sprachunabhängige Spiel-IPC, daher wird die Zufallsauswahl selbst
+    // hier im Plugin gemacht statt über das Spiel-eigene Mount-Roulette-Feature), sonst die
+    // Lumina-RowId eines konkreten, bereits freigeschalteten Mounts.
+    public int? AetheryteMountId { get; set; } = null;
+
     // Debug
     public bool ShowDebugInfo { get; set; } = false;
 

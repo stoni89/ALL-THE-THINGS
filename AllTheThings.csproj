@@ -20,5 +20,6 @@
     <None Include="Data\fashions.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\triadcards.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\frames.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Data\icon.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

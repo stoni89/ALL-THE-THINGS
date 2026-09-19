@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Command;
@@ -301,26 +302,31 @@ public sealed class Plugin : IDalamudPlugin
                 ? siblingIds
                 : new[] { territoryId };
 
-            // Karten-Pin pro Heimat-Zone eines Kristalls (nicht pro aktuell besuchter Zone!) -
-            // gecacht, da mehrere Kristalle denselben Bezirk teilen können. MapId kommt bewusst
-            // NICHT aus dem Pin-Lookup (der z.B. ohne passenden MapMarker-Eintrag scheitern kann),
-            // sondern direkt von der jeweiligen Zone - sonst wäre ein Eintrag mit manuell
-            // hinterlegter Koordinate (ManualAetherytePositions) trotzdem nicht klickbar, weil
-            // MapId 0 geblieben wäre.
-            var pinCache = new Dictionary<uint, (uint MapId, float X, float Y)>();
-            (uint MapId, float X, float Y) GetPinForHomeTerritory(uint homeTerritoryId)
+            // Karten-Pin pro EINZELNEM Kristall (nicht pro Heimat-Zone!) - gecacht per (Zone,
+            // DataType, DataKey), da derselbe Kristall in mehreren Bezirken einer geteilten
+            // Hauptstadt auftauchen kann. Wichtig: NICHT (mehr) nur ein Pin pro Zone - Zonen mit
+            // mehreren eigenständigen großen Aetheryten (z.B. Northern Thanalan: Camp Bluefog UND
+            // Ceruleum Processing Plant) hätten sonst für BEIDE denselben (nur für den ersten
+            // gefundenen Marker zutreffenden) Punkt bekommen, wodurch die Aetheryten-Automation
+            // beim zweiten Kristall die Kartenflagge auf den ERSTEN setzt. MapId kommt bewusst NICHT
+            // aus dem Pin-Lookup (der z.B. ohne passenden MapMarker-Eintrag scheitern kann), sondern
+            // direkt von der jeweiligen Zone - sonst wäre ein Eintrag mit manuell hinterlegter
+            // Koordinate (ManualAetherytePositions) trotzdem nicht klickbar, weil MapId 0 geblieben wäre.
+            var pinCache = new Dictionary<(uint TerritoryId, byte DataType, uint DataKey), (uint MapId, float X, float Y)>();
+            (uint MapId, float X, float Y) GetPinForAetheryte(uint homeTerritoryId, byte expectedDataType, uint expectedDataKey)
             {
-                if (pinCache.TryGetValue(homeTerritoryId, out var cached))
+                var cacheKey = (homeTerritoryId, expectedDataType, expectedDataKey);
+                if (pinCache.TryGetValue(cacheKey, out var cached))
                     return cached;
 
                 (uint MapId, float X, float Y) pin = (0, 0, 0);
                 if (territorySheet.TryGetRow(homeTerritoryId, out var homeTerritory))
                 {
-                    var (pinX, pinY) = ResolveZoneAetherytePinPosition(homeTerritory);
+                    var (pinX, pinY) = ResolveZoneAetherytePinPosition(homeTerritory, expectedDataType, expectedDataKey);
                     pin = (homeTerritory.Map.RowId, pinX, pinY);
                 }
 
-                pinCache[homeTerritoryId] = pin;
+                pinCache[cacheKey] = pin;
                 return pin;
             }
 
@@ -347,7 +353,9 @@ public sealed class Plugin : IDalamudPlugin
                         continue;
 
                     var hasManual = ManualAetherytePositions.TryGetValue(row.RowId, out var manual);
-                    var homePin = GetPinForHomeTerritory(row.Territory.RowId);
+                    byte expectedDataType = row.IsAetheryte ? (byte)3 : (byte)4;
+                    var expectedDataKey = row.IsAetheryte ? row.RowId : row.AethernetName.RowId;
+                    var homePin = GetPinForAetheryte(row.Territory.RowId, expectedDataType, expectedDataKey);
                     var mapX = hasManual ? manual.X : homePin.X;
                     var mapY = hasManual ? manual.Y : homePin.Y;
                     var mapId = hasManual ? manual.MapId ?? homePin.MapId : homePin.MapId;
@@ -471,18 +479,18 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Löst NUR die X/Y-Position des Aetheryten-Pins einer Zone auf (nicht die MapId - die kommt
-    /// separat direkt von der Zone, siehe Aufrufstelle). Aetheryte selbst trägt für die
-    /// kleinen Aethernetz-Kristalle keine brauchbare Positionsangabe (AetherstreamX/Y ist dort
-    /// immer 0, die "Level"-Werte sind keine echten Level-Sheet-Referenzen) - der Client zeigt auf
-    /// der Karte ohnehin nur einen Pin pro Zone (den großen Aetheryten). Dieser Pin steckt im
-    /// "MapMarker"-Sheet: Map.MapMarkerRange verweist auf die Marker-Gruppe der Zone, darin liegt
-    /// genau ein Eintrag mit DataType == 3 (Aetheryte). Dessen rohe Pixelkoordinaten werden über die
-    /// dokumentierte Formel für Kartentextur-Pixel (nicht die Weltkoordinaten-Formel!) in
+    /// Löst NUR die X/Y-Position des Karten-Pins EINES BESTIMMTEN Aetheryten/Kristalls auf (nicht
+    /// die MapId - die kommt separat direkt von der Zone, siehe Aufrufstelle). Zonen mit mehreren
+    /// eigenständigen großen Aetheryten (z.B. Northern Thanalan: Camp Bluefog UND Ceruleum
+    /// Processing Plant) haben auch mehrere DataType==3-Marker - früher wurde hier einfach der
+    /// ERSTE gefundene für die ganze Zone übernommen, wodurch alle Aetheryten derselben Zone
+    /// fälschlich denselben Pin (und damit dieselbe Kartenflagge) bekamen. Jetzt wird wie bei
+    /// ResolveAetheryteWorldPosition exakt nach DataType+DataKey gefiltert (3/eigene RowId für
+    /// große Aetheryten, 4/AethernetName-RowId für kleine Kristalle). Pixelkoordinaten werden über
+    /// die dokumentierte Formel für Kartentextur-Pixel (nicht die Weltkoordinaten-Formel!) in
     /// Kartenkoordinaten umgerechnet: coord = pixel / sizeFactor * 2 + 1.
-    /// Alle Aetheryten/Kristalle derselben Zone teilen sich diesen einen Pin.
     /// </summary>
-    private (float X, float Y) ResolveZoneAetherytePinPosition(TerritoryType territory)
+    private (float X, float Y) ResolveZoneAetherytePinPosition(TerritoryType territory, byte expectedDataType, uint expectedDataKey)
     {
         var map = territory.Map.ValueNullable;
         if (map == null || map.Value.RowId == 0)
@@ -494,7 +502,7 @@ public sealed class Plugin : IDalamudPlugin
 
         foreach (var marker in markers)
         {
-            if (marker.DataType != 3)
+            if (marker.DataType != expectedDataType || marker.DataKey.RowId != expectedDataKey)
                 continue;
 
             var x = marker.X / (float)map.Value.SizeFactor * 2f + 1f;
@@ -759,6 +767,82 @@ public sealed class Plugin : IDalamudPlugin
             return;
 
         actionManager->UseAction(ActionType.GeneralAction, SprintGeneralActionId);
+    }
+
+    /// <summary>
+    /// Liefert die aktuell freigeschalteten Mounts (Id + Name) - für die Mount-Auswahl der
+    /// Aetheryten-Automation (siehe MainWindow QoL-Tab). Bewusst live berechnet statt gecacht -
+    /// die Liste ändert sich nur, wenn man ein neues Mount freischaltet, und das Optionsfenster
+    /// ist ohnehin nicht die ganze Zeit offen.
+    /// </summary>
+    public IReadOnlyList<CollectibleEntry> GetUnlockedMounts() =>
+        CollectionData.GetAllEntries()
+            .Where(e => e.Type == CollectibleType.Mount && IsOwned(e))
+            .OrderBy(e => e.Name)
+            .ToList();
+
+    /// <summary>
+    /// Stößt (falls in den Optionen ein Mount für die Aetheryten-Automation ausgewählt und man
+    /// nicht schon beritten ist) den Ruf des konfigurierten Mounts an - über den normalen "/mount"-
+    /// Chat-Befehl (nicht ActionManager direkt), da der Befehl genau das tut, was ein Spieler-Klick
+    /// im Mount-Menü auch tun würde (inkl. aller Sonderfälle wie "gerade nicht möglich"), und der
+    /// Mount-Name aus Lumina automatisch in der aktuellen Client-Sprache aufgelöst wird. "Mount
+    /// Roulette" (AetheryteMountId == 0) wird bewusst selbst simuliert (zufällige Auswahl aus den
+    /// eigenen freigeschalteten Mounts) statt über ein Spiel-eigenes Feature, da es dafür keine
+    /// verlässliche, sprachunabhängige Ansteuerung gibt.
+    /// Gibt true zurück, wenn ein Ruf losgeschickt wurde (Aufrufer sollte dann kurz aufs Aufsteigen
+    /// warten, bevor der eigentliche Laufauftrag an vnavmesh geht) - false, wenn nichts zu tun war
+    /// (Funktion aus, schon beritten, oder kein Mount auflösbar).
+    /// </summary>
+    public static unsafe bool TryRequestAetheryteMount()
+    {
+        var mountId = instance.Configuration.AetheryteMountId;
+        if (!mountId.HasValue)
+            return false;
+
+        if (Condition[ConditionFlag.Mounted])
+            return false;
+
+        var mountSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Mount>();
+        if (mountSheet == null)
+            return false;
+
+        uint resolvedMountId;
+        if (mountId.Value == 0)
+        {
+            // Zufällige Auswahl per RowId (nicht per Name aus der eigenen mounts.json) - so kommt
+            // der Name für den "/mount"-Befehl unten in jedem Fall aus Lumina und passt garantiert
+            // zur aktuellen Client-Sprache, auch wenn die eigene Datendatei z.B. nur englische
+            // Namen enthält.
+            var unlocked = instance.GetUnlockedMounts();
+            if (unlocked.Count == 0)
+                return false;
+
+            resolvedMountId = unlocked[Random.Shared.Next(unlocked.Count)].Id;
+        }
+        else
+        {
+            resolvedMountId = (uint)mountId.Value;
+        }
+
+        if (!mountSheet.TryGetRow(resolvedMountId, out var mount))
+            return false;
+
+        var mountName = mount.Singular.ToString();
+        if (string.IsNullOrEmpty(mountName))
+            return false;
+
+        try
+        {
+            CommandManager.ProcessCommand($"/mount \"{mountName}\"");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Rufen des Mounts für die Aetheryten-Automation.");
+            return false;
+        }
+
+        return true;
     }
 
     /// <summary>
