@@ -43,6 +43,10 @@ public class Configuration : IPluginConfiguration
     // Kompaktes Overlay (nur aktuelle Zone)
     public bool ShowCompactOverlay { get; set; } = false;
     public bool ShowCurrencyWallet { get; set; } = true;
+
+    // "Hinlaufen"-Icon neben verlinkten Einträgen (siehe CompactOverlayWindow.DrawClickableName) -
+    // läuft per vnavmesh/Lifestream automatisch zum Fundort, siehe GoToAutomation.
+    public bool ShowGoToIcon { get; set; } = true;
     public float CompactFontScale { get; set; } = 1.3f;
     public CompactFontMode CompactFontMode { get; set; } = CompactFontMode.Standard;
     public string CompactCustomFontPath { get; set; } = string.Empty;

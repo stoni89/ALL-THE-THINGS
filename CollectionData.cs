@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -34,7 +35,22 @@ public class CollectibleEntry
     public uint CurrencyAmount { get; init; } // benötigte Menge der Währung
     public string Source { get; init; } = string.Empty; // z.B. "Dungeon Drop", "Vendor", "Quest"
 
+    // Nur für Hunting-Log-Einträge (siehe Plugin.GetHuntingLogEntries/ManualHuntingLogPositions) -
+    // roamende Monster haben keine Kartenkoordinate wie Händler/Aetheryten, sondern (falls bekannt)
+    // eine von Hand nachgetragene rohe Weltposition, direkt fürs Laufen mit vnavmesh gedacht.
+    public Vector3? WorldPosition { get; init; }
+
+    // Nur für Hunting-Log-Einträge - RowId aus dem Lumina-Sheet "BNpcName", entspricht zur Laufzeit
+    // ICharacter.NameId eines lebenden Weltobjekts. Für HuntingLogAutomation, um das tatsächliche
+    // Monster in der Objekttabelle zu finden (und RotationSolver mitzuteilen, welches priorisiert
+    // angegriffen werden soll).
+    public uint? BNpcNameId { get; init; }
+
     public bool HasVendorLocation => TerritoryTypeId != 0 && MapId != 0 && (VendorMapX != 0 || VendorMapY != 0);
+
+    // "Hat irgendein Laufziel" - für das "Hinlaufen"-Icon (siehe CompactOverlayWindow.DrawClickableName/
+    // DrawGoToIcon und GoToAutomation), das beide Positionsarten gleich behandelt.
+    public bool HasGoToTarget => HasVendorLocation || WorldPosition.HasValue;
 }
 
 public enum CollectibleType
@@ -50,6 +66,7 @@ public enum CollectibleType
     FrameKit,
     Aetheryte,
     Quest,
+    HuntingLog,
 }
 
 public static class CollectionData

@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Linq;
 using System.Numerics;
 using System.Text.RegularExpressions;
+using Dalamud.Interface;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
@@ -107,6 +108,10 @@ public class CompactOverlayWindow : Window
         var siblingTerritories = Plugin.GetSplitCityTerritories(effectiveTerritoryId);
         var allForZone = CollectionData.GetAllEntries()
             .Concat(plugin.GetLiveZoneEntries(effectiveTerritoryId))
+            // Hunting-Log-Einträge sind bewusst an die TATSÄCHLICHE Zone (nicht die für geteilte
+            // Hauptstädte "aufgelöste" effectiveTerritoryId) gebunden - roamende Monster gibt es
+            // nur in genau dieser einen Zone, nicht stadtweit wie Aetheryten/Quest-NPCs.
+            .Concat(plugin.GetHuntingLogEntries(currentTerritoryId))
             .Where(e => siblingTerritories.Contains(e.TerritoryTypeId))
             .ToList();
 
@@ -142,22 +147,60 @@ public class CompactOverlayWindow : Window
             .ToList();
         plugin.AetheryteAutomation.Update(missingAetherytesCity);
 
+        // Bewusst NICHT stadtweit wie Aetheryten/Quests - Hunting-Log-Monster gibt es nur in genau
+        // dieser einen Zone (siehe Plugin.GetHuntingLogEntries), kein Bezirkswechsel nötig/möglich.
+        var missingHuntingLogInZone = allForZone
+            .Where(e => e.Type == CollectibleType.HuntingLog)
+            .ToList();
+        plugin.HuntingLogAutomation.Update(missingHuntingLogInZone);
+
+        // Unabhängig von den Automationen oben - das "Hinlaufen"-Icon (siehe DrawClickableName)
+        // betrifft immer nur einen einzelnen Eintrag, egal ob gerade eine Automation läuft.
+        plugin.GoToAutomation.Update();
+
         // "Unterstützt" heißt hier: noch nicht als von Questionable abgelehnt bekannt (siehe
         // QuestAutomation.IsKnownUnsupported) - erst nach einem Versuch bekannt, siehe dort.
         var hasActionableQuests = missingQuests.Any(q => !plugin.QuestAutomation.IsKnownUnsupported(q.Id));
         var hasActionableAetherytes = missingAetherytesCity.Count > 0;
+        var hasActionableHuntingLog = missingHuntingLogInZone.Any(e => e.WorldPosition.HasValue);
 
         DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
         ImGui.SameLine();
         DrawAetheryteAutomationButton(hasActionableAetherytes);
+        ImGui.SameLine();
+        DrawHuntingLogAutomationButton(hasActionableHuntingLog);
 
-        // Ganz rechts an den Fensterrand.
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (plugin.QuestAutomation.ShouldShowStatusText)
+            OutlineText(plugin.QuestAutomation.StatusText, plugin.QuestAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.AetheryteAutomation.ShouldShowStatusText)
+            OutlineText(plugin.AetheryteAutomation.StatusText, plugin.AetheryteAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.HuntingLogAutomation.ShouldShowStatusText)
+            OutlineText(plugin.HuntingLogAutomation.StatusText, plugin.HuntingLogAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (config.ShowDebugInfo)
+            OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
+
+        // Zähler links, "Typen filtern" weiterhin ganz rechts an den Fensterrand - jetzt zusammen
+        // auf derselben Zeile statt oben bei den Automation-Knöpfen, da sich der Filter direkt auf
+        // diese Anzahl auswirkt.
+        OutlineText($"[{entries.Count}]", TitleColor);
+
         var filterLabel = Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter";
         var filterButtonWidth = ImGui.CalcTextSize(Loc.T("Typen filtern", "Filter types")).X + ImGui.GetStyle().FramePadding.X * 2f;
         ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - filterButtonWidth);
         if (ImGui.Button(filterLabel))
             ImGui.OpenPopup("CompactTypeFilterPopup");
 
+        // Derselbe Hintergrundton wie im Optionsfenster (siehe ModernUi.PushStyle/PopupBg) - ohne
+        // diesen expliziten Push würde die Popup hier stattdessen mit dem ImGui-Standardgrau statt
+        // dem Rest des Plugin-Looks erscheinen.
+        ImGui.PushStyleColor(ImGuiCol.PopupBg, new Vector4(0.10f, 0.12f, 0.17f, 0.98f));
         if (ImGui.BeginPopup("CompactTypeFilterPopup"))
         {
             foreach (var type in config.TypeOrder)
@@ -172,27 +215,13 @@ public class CompactOverlayWindow : Window
 
             ImGui.EndPopup();
         }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (plugin.QuestAutomation.ShouldShowStatusText)
-            OutlineText(plugin.QuestAutomation.StatusText, plugin.QuestAutomation.IsActive ? AffordableColor : VendorLinkColor);
-
-        if (plugin.AetheryteAutomation.ShouldShowStatusText)
-            OutlineText(plugin.AetheryteAutomation.StatusText, plugin.AetheryteAutomation.IsActive ? AffordableColor : VendorLinkColor);
-
-        if (config.ShowDebugInfo)
-            OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
+        ImGui.PopStyleColor();
 
         if (entries.Count == 0)
         {
             OutlineText(Loc.T("Nichts Fehlendes in dieser Zone.", "Nothing missing in this zone."), MutedColor);
             return;
         }
-
-        OutlineText($"[{entries.Count}]", TitleColor);
 
         if (config.ShowCurrencyWallet)
             DrawCurrencyWallet(entries);
@@ -204,8 +233,7 @@ public class CompactOverlayWindow : Window
 
         foreach (var entry in entries)
         {
-            OutlineText("•", MutedColor);
-            ImGui.SameLine();
+            DrawGoToColumn(entry);
 
             var isUnsupportedQuest = entry.Type == CollectibleType.Quest && plugin.QuestAutomation.IsKnownUnsupported(entry.Id);
             var typeColor = isUnsupportedQuest ? UnsupportedColor : TypeColors.GetValueOrDefault(entry.Type, NormalColor);
@@ -313,11 +341,13 @@ public class CompactOverlayWindow : Window
         var automation = plugin.QuestAutomation;
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
-            : Loc.T("Quest-Automation", "Quest automation");
+            : Loc.T("Auto Quest", "Auto Quest");
+        var isQuestionableAvailable = automation.IsQuestionableAvailable();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
-        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
-        var isDisabled = !automation.IsActive && !hasActionableQuests;
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt Questionable, gibt
+        // es aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableQuests || !isQuestionableAvailable);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Quest]);
         if (isDisabled)
@@ -330,17 +360,11 @@ public class CompactOverlayWindow : Window
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
             ImGui.SetTooltip(isDisabled
-                ? Loc.T(
-                    "Keine von Questionable unterstützten Quests in dieser Zone.",
-                    "No quests supported by Questionable in this zone.")
+                ? !isQuestionableAvailable
+                    ? Loc.T("Questionable nicht gefunden - bitte installieren.", "Questionable not found - please install it.")
+                    : Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
                 : automation.IsActive
-                    ? Loc.T(
-                        "Schiebt keine weiteren Quests mehr nach. Questionable selbst kennt keine Stopp-IPC - " +
-                        "eine bereits laufende Quest läuft dort weiter, bis sie fertig ist oder du sie in " +
-                        "Questionables eigenem Fenster abbrichst.",
-                        "Stops queueing further quests. Questionable itself has no stop IPC - a quest it has " +
-                        "already started keeps running there until it finishes, or until you cancel it in " +
-                        "Questionable's own window.")
+                    ? Loc.T("Bricht die aktuelle Quest sofort ab und stoppt die Automation.", "Immediately cancels the current quest and stops the automation.")
                     : Loc.T(
                         "Lässt Questionable nacheinander alle fehlenden Quests dieser Zone annehmen und abschließen.",
                         "Has Questionable pick up and complete all missing quests in this zone, one by one."));
@@ -353,7 +377,7 @@ public class CompactOverlayWindow : Window
         {
             automation.Stop();
         }
-        else if (automation.IsQuestionableAvailable())
+        else if (isQuestionableAvailable)
         {
             automation.Start(effectiveTerritoryId);
         }
@@ -374,7 +398,7 @@ public class CompactOverlayWindow : Window
         var automation = plugin.AetheryteAutomation;
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
-            : Loc.T("Aetheryten-Automation", "Aetheryte automation");
+            : Loc.T("Auto Aetheryte", "Auto Aetheryte");
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
@@ -416,11 +440,72 @@ public class CompactOverlayWindow : Window
         }
     }
 
+    /// <summary>
+    /// Knopf, der die Hunting-Log-Kill-Automation (siehe HuntingLogAutomation.cs) für die aktuell
+    /// fehlenden Ziele (aktive Klasse/aktiver Rang) dieser Zone an-/ausschaltet. Braucht zum Laufen
+    /// zwingend vnavmesh - fehlt es, wird das per Tooltip erklärt statt der Knopf einfach nichts zu
+    /// tun. RotationSolver Reborn wird zum Kämpfen nur per Chat-Befehl/Best-Effort-IPC angesteuert
+    /// (siehe HuntingLogAutomation.IsRotationSolverAvailable), ist also kein hartes Gate mehr.
+    /// </summary>
+    private void DrawHuntingLogAutomationButton(bool hasActionableHuntingLog)
+    {
+        var automation = plugin.HuntingLogAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Auto Hunting Log", "Auto Hunting Log");
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
+        var isDisabled = !automation.IsActive && !hasActionableHuntingLog;
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.HuntingLog]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactHuntingLogAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(isDisabled
+                ? Loc.T(
+                    "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
+                    "No hunting log targets with a known position in this zone.")
+                : automation.IsActive
+                    ? Loc.T("Bricht Laufen/Kämpfen sofort ab und stoppt die Automation.", "Immediately stops moving/fighting and the automation.")
+                    : Loc.T(
+                        "Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit RotationSolver Reborn.",
+                        "Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with RotationSolver Reborn."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (automation.IsAvailable())
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
     private void DrawClickableName(CollectibleEntry entry)
     {
         var affordable = plugin.CanAfford(entry);
 
-        if (!entry.HasVendorLocation)
+        // Sowohl Kartenkoordinaten-Einträge (Händler/Aetheryten/Quest-NPCs) als auch Hunting-Log-
+        // Monster mit bekannter Weltposition (siehe WorldPosition) bekommen denselben klickbaren
+        // "Auf Karte anzeigen"-Namen - siehe Plugin.OpenEntryMap, das beide Positionsarten
+        // einheitlich behandelt. Das "Hinlaufen"-Icon selbst sitzt nicht mehr hier, sondern ganz
+        // vorne in der Zeile (siehe DrawGoToColumn).
+        if (!entry.HasGoToTarget)
         {
             OutlineText(entry.Name, affordable ? AffordableColor : NormalColor);
             return;
@@ -436,7 +521,89 @@ public class CompactOverlayWindow : Window
         }
 
         if (ImGui.IsItemClicked())
-            Plugin.OpenVendorMap(entry);
+            Plugin.OpenEntryMap(entry);
+    }
+
+    /// <summary>
+    /// Ganz vorne in jeder Zeile (vor dem [Typ]-Tag) statt des früheren Aufzählungspunkts - zeigt
+    /// das "Hinlaufen"-Icon (siehe DrawGoToIcon), oder wenn keins gezeigt wird (Einstellung aus,
+    /// oder der Eintrag hat kein Laufziel) einen gleich breiten Platzhalter, damit der [Typ]-Tag
+    /// in jeder Zeile an derselben X-Position beginnt.
+    /// </summary>
+    private void DrawGoToColumn(CollectibleEntry entry)
+    {
+        if (plugin.Configuration.ShowGoToIcon && entry.HasGoToTarget)
+        {
+            DrawGoToIcon(entry);
+        }
+        else
+        {
+            float width;
+            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                width = ImGui.CalcTextSize(FontAwesomeIcon.Running.ToIconString()).X + ImGui.GetStyle().FramePadding.X * 2f;
+            ImGui.Dummy(new Vector2(width, 1f));
+        }
+
+        ImGui.SameLine();
+    }
+
+    /// <summary>
+    /// "Hinlaufen"-Icon - startet bzw. bricht per Klick GoToAutomation für GENAU DIESEN Eintrag ab
+    /// (immer nur einer gleichzeitig, siehe GoToAutomation.GoTo). Ausgegraut, solange vnavmesh/
+    /// Lifestream nicht beide verfügbar sind - ohne beide könnte der Klick ohnehin nicht
+    /// zuverlässig ans Ziel führen.
+    /// </summary>
+    private void DrawGoToIcon(CollectibleEntry entry)
+    {
+        var automation = plugin.GoToAutomation;
+        var isThisEntryActive = automation.IsNavigatingTo(entry);
+        var available = automation.IsAvailable();
+
+        bool clicked;
+        bool hovered;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            var icon = isThisEntryActive ? FontAwesomeIcon.StopCircle : FontAwesomeIcon.Running;
+            var color = !available ? MutedColor : isThisEntryActive ? GoToActiveColor : AffordableColor;
+
+            ImGui.PushStyleColor(ImGuiCol.Text, color);
+            if (!available)
+                ImGui.BeginDisabled();
+
+            // Typ mit in die ImGui-ID einbezogen, nicht nur die entry.Id - verschiedene
+            // Sammelobjekt-Datenquellen (Mount/Minion/Aetheryte/Quest/HuntingLog) vergeben ihre IDs
+            // unabhängig voneinander, fangen also alle wieder bei 1 an. Ohne den Typ hier hätten
+            // z.B. Mount-Eintrag #1 und Hunting-Log-Ziel #1 (RowId aus MonsterNoteTarget) dieselbe
+            // ImGui-ID gehabt - dadurch reagierte der Klick auf keinem der beiden mehr zuverlässig.
+            clicked = ImGui.SmallButton($"{icon.ToIconString()}##GoTo{entry.Type}{entry.Id}");
+
+            if (!available)
+                ImGui.EndDisabled();
+            ImGui.PopStyleColor();
+
+            // Hover NUR hier feststellen, das eigentliche SetTooltip (siehe unten) muss außerhalb
+            // dieses using-Blocks passieren: Solange die Icon-Schriftart (FontAwesome) noch aktiv
+            // ist, würde der normale Tooltip-Text als Icon-Glyphen (also "komische Zeichen") statt
+            // als lesbarer Text gerendert.
+            hovered = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled);
+        }
+
+        if (hovered)
+        {
+            ImGui.SetTooltip(!available
+                ? Loc.T("vnavmesh/Lifestream nicht gefunden - bitte installieren.", "vnavmesh/Lifestream not found - please install them.")
+                : isThisEntryActive
+                    ? Loc.T("Hinlaufen abbrechen", "Cancel walking there")
+                    : Loc.T("Automatisch hinlaufen", "Automatically walk there"));
+        }
+
+        if (clicked && available)
+        {
+            if (isThisEntryActive)
+                automation.Cancel();
+            else
+                automation.GoTo(entry);
+        }
     }
 
     /// <summary>
@@ -469,6 +636,7 @@ public class CompactOverlayWindow : Window
     private static readonly Vector4 VendorLinkColor = new(0.5f, 0.8f, 1f, 1f);
     private static readonly Vector4 AffordableColor = new(0.55f, 0.95f, 0.55f, 1f);
     private static readonly Vector4 UnsupportedColor = new(1f, 0.3f, 0.3f, 1f);
+    private static readonly Vector4 GoToActiveColor = new(1f, 0.65f, 0.2f, 1f);
 
     private static readonly Dictionary<CollectibleType, Vector4> TypeColors = new()
     {
@@ -483,6 +651,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.FrameKit] = new(0.6f, 0.85f, 1f, 1f),
         [CollectibleType.Aetheryte] = new(0.6f, 1f, 0.75f, 1f),
         [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
+        [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
     };
     private static readonly Vector2[] ShadowOffsets =
     {
