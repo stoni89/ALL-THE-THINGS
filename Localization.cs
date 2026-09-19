@@ -25,6 +25,7 @@ public static class Loc
         CollectibleType.FrameKit => T("Portrait-Rahmen", "Portrait Frame"),
         CollectibleType.Aetheryte => T("Aetheryte", "Aetheryte"),
         CollectibleType.Quest => T("Quest", "Quest"),
+        CollectibleType.HuntingLog => T("Hunting Log", "Hunting Log"),
         _ => type.ToString(),
     };
 }

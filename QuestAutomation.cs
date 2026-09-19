@@ -49,6 +49,12 @@ public sealed class QuestAutomation
     // Rückreise an (siehe auch AetheryteAutomation.DistrictTravelSettleDelay).
     private static readonly TimeSpan TravelHomeSettleDelay = TimeSpan.FromSeconds(2);
 
+    // Verhindert eine Endlosschleife, falls Lifestream eine Rückreise wiederholt asynchron ablehnt
+    // (siehe UpdateTravelingHome) - nach so vielen gescheiterten Versuchen wird die aktuelle Zone
+    // stattdessen zur neuen Startzone, statt es immer wieder mit demselben Ergebnis zu versuchen.
+    private const int MaxTravelHomeAttempts = 2;
+    private int travelHomeFailureCount;
+
     private readonly ICallGateSubscriber<string, bool> startSingleQuest;
     private readonly ICallGateSubscriber<bool> isRunning;
 
@@ -230,6 +236,7 @@ public sealed class QuestAutomation
         currentQuestId = null;
         this.homeTerritoryId = homeTerritoryId;
         travelHomeFinishedAt = null;
+        travelHomeFailureCount = 0;
         runningWentFalseAt = null;
         skippedQuestIds.Clear();
         attemptCounts.Clear();
@@ -364,7 +371,7 @@ public sealed class QuestAutomation
                     break;
 
                 case State.TravelingHome:
-                    UpdateTravelingHome();
+                    UpdateTravelingHome(currentEffectiveTerritoryId);
                     break;
             }
         }
@@ -456,7 +463,7 @@ public sealed class QuestAutomation
         StatusText = Loc.T("Reise zurück zur Startzone...", "Traveling back to the starting zone...");
     }
 
-    private void UpdateTravelingHome()
+    private void UpdateTravelingHome(uint currentEffectiveTerritoryId)
     {
         if (!lifestreamIsBusy.InvokeFunc())
         {
@@ -468,6 +475,31 @@ public sealed class QuestAutomation
                 return;
 
             travelHomeFinishedAt = null;
+
+            // Lifestream kann eine Reise auch NACH dem angenommenen Auftrag noch asynchron
+            // ablehnen (z.B. "Destination could not be found" bei einem Aethernetz-Ziel, das laut
+            // IsAetheryteUnlocked zwar freigeschaltet ist, aber von Lifestream selbst nicht gefunden
+            // wird) - dabei wird IsBusy() genauso false wie bei einer echten, erfolgreichen Ankunft.
+            // Ohne diese Prüfung würde TryStartNext im nächsten Idle-Durchlauf die (unveränderte)
+            // Zone weiter als "nicht daheim" erkennen und denselben, deterministisch wieder
+            // scheiternden Reiseversuch endlos wiederholen, statt jemals weiterzumachen.
+            var arrivedHome = Plugin.GetSplitCityTerritories(homeTerritoryId!.Value).Contains(currentEffectiveTerritoryId);
+            if (!arrivedHome && ++travelHomeFailureCount <= MaxTravelHomeAttempts)
+            {
+                // Noch Versuche übrig - im nächsten Idle-Durchlauf erneut versuchen.
+                state = State.Idle;
+                return;
+            }
+
+            if (!arrivedHome)
+            {
+                homeTerritoryId = currentEffectiveTerritoryId;
+                StatusText = Loc.T(
+                    "Rückreise wiederholt gescheitert - mache stattdessen hier weiter.",
+                    "Trip back repeatedly failed - continuing from here instead.");
+            }
+
+            travelHomeFailureCount = 0;
             state = State.Idle;
             return;
         }

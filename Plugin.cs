@@ -46,6 +46,8 @@ public sealed class Plugin : IDalamudPlugin
     public CompactOverlayWindow CompactOverlayWindow { get; init; }
     public QuestAutomation QuestAutomation { get; init; }
     public AetheryteAutomation AetheryteAutomation { get; init; }
+    public GoToAutomation GoToAutomation { get; init; }
+    public HuntingLogAutomation HuntingLogAutomation { get; init; }
 
     public Plugin()
     {
@@ -56,6 +58,8 @@ public sealed class Plugin : IDalamudPlugin
 
         QuestAutomation = new QuestAutomation();
         AetheryteAutomation = new AetheryteAutomation();
+        GoToAutomation = new GoToAutomation();
+        HuntingLogAutomation = new HuntingLogAutomation();
 
         MainWindow = new MainWindow(this);
         WindowSystem.AddWindow(MainWindow);
@@ -709,6 +713,37 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
+    /// Wie OpenVendorMap, aber auch für Einträge mit roher Weltposition statt Kartenkoordinate
+    /// (aktuell nur Hunting-Log-Monster, siehe WorldPosition) - dafür wird die Weltposition mit
+    /// Dalamuds MapUtil.WorldToMap live in eine Kartenkoordinate umgerechnet (dieselbe Formel, mit
+    /// der auch das Spiel selbst Weltkoordinaten auf der Karte anzeigt), statt sie separat
+    /// vorzuberechnen und zu speichern. Ohne bekannte Position (weder Kartenkoordinate noch
+    /// Weltposition) passiert nichts - das Icon dafür wird dann ohnehin nicht angezeigt.
+    /// </summary>
+    public static void OpenEntryMap(CollectibleEntry entry)
+    {
+        if (entry.HasVendorLocation)
+        {
+            OpenVendorMap(entry);
+            return;
+        }
+
+        if (entry.WorldPosition is not { } worldPosition || entry.MapId == 0)
+            return;
+
+        var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+        if (mapSheet == null || !mapSheet.TryGetRow(entry.MapId, out var map))
+            return;
+
+        var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+            new Vector2(worldPosition.X, worldPosition.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+
+        var territoryForFlag = entry.FlagTerritoryTypeId ?? entry.TerritoryTypeId;
+        var payload = new MapLinkPayload(territoryForFlag, entry.MapId, mapCoords.X, mapCoords.Y);
+        GameGui.OpenMapWithMapLink(payload);
+    }
+
+    /// <summary>
     /// Setzt ein Weltobjekt als aktuelles Ziel - Voraussetzung für InteractWithGameObject unten.
     /// Muss (mindestens) einen Frame VOR dem eigentlichen Interact-Aufruf passiert sein, damit das
     /// Ziel im Spiel tatsächlich angewendet wurde.
@@ -737,6 +772,37 @@ public sealed class Plugin : IDalamudPlugin
             return;
 
         TargetSystem.Instance()->InteractWithObject(native, false);
+    }
+
+    /// <summary>
+    /// Sucht das nächstgelegene lebende Weltobjekt mit dieser BNpcName-RowId (siehe
+    /// CollectibleEntry.BNpcNameId) - für die Hunting-Log-Kill-Automation, um das tatsächliche
+    /// Monster zum Anvisieren zu finden. Anders als bei Aetheryten/Kristallen (die immer geladen
+    /// sind, sobald man in Reichweite steht) können mehrere Exemplare gleichzeitig existieren oder
+    /// gerade keins - deshalb wird hier IMMER live gesucht, nichts gecacht.
+    /// </summary>
+    public static Dalamud.Game.ClientState.Objects.Types.IBattleNpc? FindNearestLiveMonster(uint bNpcNameId, Vector3 nearPosition, float maxDistance)
+    {
+        Dalamud.Game.ClientState.Objects.Types.IBattleNpc? nearest = null;
+        var bestDistance = maxDistance;
+
+        foreach (var obj in ObjectTable)
+        {
+            if (obj is not Dalamud.Game.ClientState.Objects.Types.IBattleNpc battleNpc)
+                continue;
+
+            if (battleNpc.NameId != bNpcNameId || !battleNpc.IsTargetable || battleNpc.CurrentHp == 0)
+                continue;
+
+            var distance = Vector3.Distance(battleNpc.Position, nearPosition);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                nearest = battleNpc;
+            }
+        }
+
+        return nearest;
     }
 
     // General Action "Sprint" - feste Spiel-ID, kein Excel-Sheet-Lookup nötig (ändert sich nicht
@@ -843,6 +909,227 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump der rohen Hunting-Log-Fortschrittsdaten (FFXIVClientStructs
+    /// MonsterNoteManager) zusammen mit der aktuellen Klasse - für den Hunting-Log-Zonenfilter
+    /// (siehe CollectionData/GetLiveZoneEntries). Weder welcher der 12 Slots zu welcher Klasse
+    /// gehört, noch die genaue Bedeutung von Rank/Flags ist offiziell dokumentiert - das muss
+    /// einmalig live abgeglichen werden: pro Klasse hier klicken, die resultierenden Log-Zeilen
+    /// (siehe /xllog) mit der jeweils aktiven Klasse und dem im Spiel offenen Hunting Log
+    /// vergleichen (u.a. welcher Rang dort gerade als nächstes/unvollständig markiert ist).
+    /// </summary>
+    public static unsafe void DumpHuntingLogDebugInfo()
+    {
+        var player = ObjectTable.LocalPlayer;
+        Log.Info($"[HuntingLogDebug] Aktuelle Klasse: RowId={player?.ClassJob.RowId}, Name={player?.ClassJob.ValueNullable?.Name}, Level={player?.Level}");
+
+        var manager = MonsterNoteManager.Instance();
+        if (manager == null)
+        {
+            Log.Info("[HuntingLogDebug] MonsterNoteManager.Instance() ist null.");
+            return;
+        }
+
+        for (var slot = 0; slot < 12; slot++)
+        {
+            var slotInfo = manager->RankData[slot];
+            var perRank = new List<string>();
+            for (var rankIdx = 0; rankIdx < 10; rankIdx++)
+            {
+                var rankData = slotInfo.RankData[rankIdx];
+                perRank.Add($"{rankData[0]}/{rankData[1]}/{rankData[2]}/{rankData[3]}");
+            }
+
+            Log.Info($"[HuntingLogDebug] Slot {slot}: Index={slotInfo.Index}, Rank={slotInfo.Rank}, Flags={slotInfo.Flags}, Counts je Rang (0..9)=[{string.Join(", ", perRank)}]");
+        }
+
+        // Zusätzlich: alle 10 Teil-Ränge der aktuellen Zehner-Stufe (siehe GetHuntingLogEntries-
+        // Kommentar) mit ihren bis zu 4 Zielen, Fortschritt und PlaceNameZone-RowIds, plus der
+        // PlaceName-RowId der aktuellen Zone zum Abgleich.
+        var classId = player?.ClassJob.RowId ?? 0;
+        var tier = manager->RankData[0].Rank;
+        var noteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.MonsterNote>();
+        if (noteSheet == null)
+        {
+            Log.Info("[HuntingLogDebug] MonsterNote-Sheet nicht gefunden.");
+            return;
+        }
+
+        var currentTerritoryId = ClientState.TerritoryType;
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        var currentZonePlaceNameId = territorySheet != null && territorySheet.TryGetRow(currentTerritoryId, out var territoryRow)
+            ? territoryRow.PlaceName.RowId
+            : 0u;
+        Log.Info($"[HuntingLogDebug] Stufe (Rank)={tier}, aktuelle Zone={currentTerritoryId}, PlaceName-RowId der Zone={currentZonePlaceNameId}");
+
+        for (var subRank = 0; subRank < 10; subRank++)
+        {
+            var monsterNoteRowId = (uint)(classId * 10000 + tier * 10 + subRank + 1);
+            if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
+            {
+                Log.Info($"[HuntingLogDebug] Teil-Rang {subRank} (Zeile {monsterNoteRowId}): nicht gefunden.");
+                continue;
+            }
+
+            var rankCounts = manager->RankData[0].RankData[subRank];
+            for (var i = 0; i < 4; i++)
+            {
+                var targetRef = note.MonsterNoteTarget[i];
+                if (targetRef.RowId == 0)
+                    continue;
+
+                var target = targetRef.ValueNullable;
+                if (target == null)
+                {
+                    Log.Info($"[HuntingLogDebug] Teil-Rang {subRank}, Ziel {i}: RowId={targetRef.RowId}, aber ValueNullable ist null.");
+                    continue;
+                }
+
+                var zoneIds = string.Join(", ", target.Value.PlaceNameZone.Select(p => p.RowId));
+                Log.Info($"[HuntingLogDebug] Teil-Rang {subRank} (Zeile {monsterNoteRowId}), Ziel {i}: RowId={target.Value.RowId}, " +
+                         $"Name={target.Value.BNpcName.ValueNullable?.Singular}, Fortschritt={rankCounts[i]}/{note.Count[i]}, " +
+                         $"PlaceNameZone(RowIds)=[{zoneIds}]");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Von Hand nachgetragene Weltpositionen für Hunting-Log-Monster (Schlüssel = RowId aus dem
+    /// Lumina-Sheet "MonsterNoteTarget") - anders als Aetheryten/Händler haben roamende Monster
+    /// keine feste Kartenkoordinate, es gibt also keine automatische Auflösung wie über
+    /// ResolveAetheryteWorldPosition. Siehe HuntingLogPositions.cs für Quelle/Umrechnung; deckt
+    /// aktuell alle 9 ARR-Basisklassen ab. Fehlt ein Monster (z.B. spätere Job-eigene Logs), einfach
+    /// mit "/vnav moveto x y z" bzw. "/pos" im Spiel einen Punkt suchen und dort ergänzen.
+    /// </summary>
+    private static readonly Dictionary<uint, Vector3> ManualHuntingLogPositions = HuntingLogPositions.Positions;
+
+    /// <summary>
+    /// Berechnet die Hunting-Log-Einträge des AKTUELL AKTIVEN Rangs der AKTUELLEN Klasse, die zur
+    /// übergebenen Zone gehören - live pro Frame berechnet (nicht gecacht wie GetLiveZoneEntries,
+    /// da sich der Kill-Fortschritt laufend ändert). Quelle ist Slot 0 von FFXIVClientStructs'
+    /// MonsterNoteManager, der (empirisch per Debug-Dump bestätigt, siehe DumpHuntingLogDebugInfo)
+    /// immer die Daten der GERADE AKTIVEN Klasse enthält, nicht einen festen Klassen-Slot.
+    ///
+    /// WICHTIG (live per Screenshot korrigiert): MonsterNoteRankInfo.Rank ist NICHT der eine
+    /// gerade aktive Einzel-Rang, sondern die aktuelle ZEHNER-STUFE ("Rank" == 0 entspricht der im
+    /// Spiel links angezeigten Gruppe "RANK 1", die 10 Teil-Ränge "Klasse 01".."Klasse 10" bündelt,
+    /// alle gleichzeitig sichtbar/offen). Innerhalb dieser Stufe zählt RankData[0..9] den
+    /// Fortschritt JEDES der 10 Teil-Ränge parallel (Index 3 z.B. "Klasse 04"). Jede Lumina-
+    /// "MonsterNote"-Zeile ist EIN Teil-Rang (mit bis zu 4 Zielen + paralleler Count-Anforderung);
+    /// die RowId dafür kommt über dieselbe Formel wie AgentMonsterNote.GetMonsterNoteIdForIndex
+    /// (ClassId * 10000 + Stufe*10 + Teil-Rang-Index + 1) - ClassId wird dabei mit der Lumina-
+    /// ClassJob-RowId gleichgesetzt (beim Gladiator sind beide 1, für andere Klassen noch nicht
+    /// querverifiziert). Bereits abgeschlossene Teil-Ränge (alle Ziele erreicht) werden nicht mehr
+    /// angezeigt - das Spiel selbst hakt sie dann ab, statt sie weiter als "zu tun" zu listen.
+    /// </summary>
+    public unsafe List<CollectibleEntry> GetHuntingLogEntries(uint territoryId)
+    {
+        var result = new List<CollectibleEntry>();
+
+        var player = ObjectTable.LocalPlayer;
+        if (player == null)
+            return result;
+
+        var classId = player.ClassJob.RowId;
+        var className = player.ClassJob.ValueNullable?.Name.ToString();
+        if (classId == 0 || string.IsNullOrEmpty(className))
+            return result;
+
+        var manager = MonsterNoteManager.Instance();
+        if (manager == null)
+            return result;
+
+        var slot = manager->RankData[0];
+        var tier = slot.Rank;
+
+        var noteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.MonsterNote>();
+        if (noteSheet == null)
+            return result;
+
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null || !territorySheet.TryGetRow(territoryId, out var territoryRow))
+            return result;
+
+        var zonePlaceNameId = territoryRow.PlaceName.RowId;
+
+        for (var subRank = 0; subRank < 10; subRank++)
+        {
+            var monsterNoteRowId = (uint)(classId * 10000 + tier * 10 + subRank + 1);
+            if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
+                continue;
+
+            var rankCounts = slot.RankData[subRank];
+
+            // Teil-Rang schon komplett (alle seine Ziele erreicht)? Dann überspringen - siehe
+            // Klassenkommentar oben.
+            var isComplete = true;
+            for (var i = 0; i < 4; i++)
+            {
+                if (note.MonsterNoteTarget[i].RowId != 0 && rankCounts[i] < note.Count[i])
+                {
+                    isComplete = false;
+                    break;
+                }
+            }
+
+            if (isComplete)
+                continue;
+
+            for (var i = 0; i < 4; i++)
+            {
+                var targetRef = note.MonsterNoteTarget[i];
+                if (targetRef.RowId == 0)
+                    continue;
+
+                var target = targetRef.ValueNullable;
+                if (target == null)
+                    continue;
+
+                var requiredCount = note.Count[i];
+                var currentCount = rankCounts[i];
+                if (currentCount >= requiredCount)
+                    continue;
+
+                // Nur zeigen, wenn dieses Monster laut Sheet auch tatsächlich in der übergebenen
+                // Zone vorkommt - MonsterNoteTarget listet dafür bis zu 3 mögliche Zonen
+                // (PlaceNameZone).
+                var isInZone = false;
+                foreach (var placeNameZone in target.Value.PlaceNameZone)
+                {
+                    if (placeNameZone.RowId != 0 && placeNameZone.RowId == zonePlaceNameId)
+                    {
+                        isInZone = true;
+                        break;
+                    }
+                }
+
+                if (!isInZone)
+                    continue;
+
+                var monsterName = target.Value.BNpcName.ValueNullable?.Singular.ToString();
+                if (string.IsNullOrEmpty(monsterName))
+                    continue;
+
+                ManualHuntingLogPositions.TryGetValue(target.Value.RowId, out var manualPosition);
+
+                result.Add(new CollectibleEntry
+                {
+                    Id = target.Value.RowId,
+                    Name = $"{monsterName} ({currentCount}/{requiredCount})",
+                    Type = CollectibleType.HuntingLog,
+                    Category = Loc.T("Hunting Log", "Hunting Log"),
+                    TerritoryTypeId = territoryId,
+                    MapId = territoryRow.Map.RowId,
+                    WorldPosition = manualPosition == default ? null : manualPosition,
+                    BNpcNameId = target.Value.BNpcName.RowId,
+                    Source = $"{className} {tier * 10 + subRank + 1:00}",
+                });
+            }
+        }
+
+        return result;
     }
 
     /// <summary>

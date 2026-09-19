@@ -6,6 +6,7 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using Dalamud.Interface;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using Dalamud.Bindings.ImGui;
@@ -34,13 +35,25 @@ public class MainWindow : Window
     private bool collapsedLastFrame;
     private Vector2 expandedSize = new(720f, 960f);
 
-    // Nur so hoch wie die Kopfzeile selbst - der Rest (Sidebar/Inhalt) wird beim Einklappen komplett
-    // ausgeblendet, siehe PreDraw/Draw. Exakt die Kopfzeilen-Bandhöhe (52, siehe DrawCustomHeader)
-    // PLUS das (eingeklappt bewusst knappere, siehe PreDraw) obere/untere WindowPadding von 4 je
-    // Seite - keine zusätzliche Marge mehr, sonst wirkt die eingeklappte Titelleiste unnötig hoch.
-    // Falls der Inhalt durch Rundungsfehler doch mal 1-2px zu hoch wäre, wird er dank NoScrollbar am
-    // Fenster einfach knapp abgeschnitten statt eine Scrollbar zu zeigen.
-    private const float CollapsedHeight = 52f + 4f + 4f;
+    // Kopfzeilen-Bandhöhe und Titel-Skalierung je Zustand (siehe DrawCustomHeader) - eingeklappt
+    // bewusst kleiner, damit die Titelleiste dann wirklich kompakt wirkt, statt (wie zuvor) immer
+    // gleich hoch zu bleiben und nur das Fenster darunter wegzuschneiden.
+    private const float HeaderBandHeightExpanded = 60f;
+    private const float HeaderBandHeightCollapsed = 16f;
+    private const float TitleScaleExpanded = 2.4f;
+    private const float TitleScaleCollapsed = 0.9f;
+
+    // WindowPadding bleibt in beiden Zuständen identisch (siehe PreDraw) - genau das war der Grund
+    // für das gemeldete "Verschieben" der Titelleiste beim Ein-/Ausklappen: Ein unterschiedliches
+    // oberes Padding hätte Icon/Text/Buttons je Zustand an einer anderen Y-Position im Fenster
+    // platziert. Die kompaktere Höhe kommt jetzt ausschließlich aus der kleineren Bandhöhe oben.
+    private const float WindowPaddingY = 12f;
+
+    // Nur so hoch wie die (eingeklappte) Kopfzeile selbst - der Rest (Sidebar/Inhalt) wird beim
+    // Einklappen komplett ausgeblendet, siehe PreDraw/Draw. Falls der Inhalt durch Rundungsfehler
+    // doch mal 1-2px zu hoch wäre, wird er dank NoScrollbar am Fenster einfach knapp abgeschnitten
+    // statt eine Scrollbar zu zeigen.
+    private const float CollapsedHeight = HeaderBandHeightCollapsed + WindowPaddingY * 2f;
 
     // Mindesthöhe bewusst so hoch gewählt, dass selbst der Tab mit dem meisten Inhalt (Anzeige, mit
     // beiden Karten: Aussehen + Reihenfolge mit 8 Zeilen) ohne Scrollbalken hineinpasst - der
@@ -110,16 +123,42 @@ public class MainWindow : Window
 
         collapsedLastFrame = collapsed;
 
-        // Eingeklappt bewusst mit deutlich knapperem Innenabstand oben/unten - muss hier (vor
-        // Begin()) statt in Draw() passieren, siehe PushStyle-Kommentar, sonst würde die eingeklappte
-        // Titelleiste trotzdem den vollen (großzügigeren) Standardabstand behalten und unnötig hoch
-        // wirken.
-        ModernUi.PushStyle(collapsed ? new Vector2(12f, 4f) : new Vector2(12f, 12f));
+        // Bewusst IMMER derselbe Innenabstand (siehe WindowPaddingY-Kommentar oben) - die kompaktere
+        // Höhe im eingeklappten Zustand kommt allein aus der kleineren Kopfzeilen-Bandhöhe.
+        ModernUi.PushStyle(new Vector2(12f, WindowPaddingY));
     }
 
     public override void PostDraw()
     {
         ModernUi.PopStyle();
+    }
+
+    private static IFontHandle? titleFontHandle;
+
+    /// <summary>
+    /// Eigene, in nativer Pixelgröße gebaute Schrift (Noto Sans CJK Medium, etwas kräftiger als die
+    /// normale UI-Schrift) für den Titeltext im ausgeklappten Zustand - lazy erzeugt, da
+    /// Plugin.PluginInterface bei einem statischen Feld-Initializer noch nicht bereitstünde.
+    /// </summary>
+    private static IFontHandle GetTitleFontHandle()
+    {
+        titleFontHandle ??= Plugin.PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e => e.OnPreBuild(tk =>
+            tk.AddDalamudAssetFont(Dalamud.DalamudAsset.NotoSansCjkMedium, new SafeFontConfig
+            {
+                SizePx = Plugin.PluginInterface.UiBuilder.FontDefaultSizePx * TitleScaleExpanded,
+            })));
+        return titleFontHandle;
+    }
+
+    /// <summary>
+    /// Liefert das gepushte Titel-Font-Handle, oder null solange es (z.B. kurz nach dem Start,
+    /// während der Font-Atlas noch baut) noch nicht verfügbar ist - der Aufrufer fällt in dem Fall
+    /// auf das simple Hochskalieren der Standardschrift zurück.
+    /// </summary>
+    private static System.IDisposable? PushTitleFontIfAvailable()
+    {
+        var handle = GetTitleFontHandle();
+        return handle is { Available: true } ? handle.Push() : null;
     }
 
     /// <summary>
@@ -133,8 +172,9 @@ public class MainWindow : Window
         // Eigene Bandhöhe für die Kopfzeile statt nur "so hoch wie der Text" - Icon/Name/Buttons
         // werden weiter unten INNERHALB dieses Bandes vertikal zentriert, statt es einfach an der
         // Textgröße kleben zu lassen (dadurch sitzt der Inhalt jetzt mittig, mit sichtbarem
-        // Abstand über und unter sich, wie bei einer echten Titelleiste).
-        const float headerBandHeight = 52f;
+        // Abstand über und unter sich, wie bei einer echten Titelleiste). Eingeklappt bewusst
+        // kleiner (siehe HeaderBandHeightCollapsed-Kommentar oben).
+        var headerBandHeight = collapsed ? HeaderBandHeightCollapsed : HeaderBandHeightExpanded;
         var bandStartY = ImGui.GetCursorPosY();
         var bandStartX = ImGui.GetCursorPosX();
         var bandScreenPos = ImGui.GetCursorScreenPos();
@@ -158,12 +198,21 @@ public class MainWindow : Window
             ImGui.SetWindowPos(ImGui.GetWindowPos() + ImGui.GetIO().MouseDelta);
         ImGui.SetCursorScreenPos(bandScreenPos);
 
-        // Icon + Name vergrößert, beide mit demselben Skalierungsfaktor.
-        const float titleScale = 1.8f;
-        ImGui.SetWindowFontScale(titleScale);
-        var titleLineHeight = ImGui.GetTextLineHeight();
-        ImGui.SetWindowFontScale(1f);
+        // Icon + Name vergrößert - ausgeklappt über eine eigene, in nativer Pixelgröße gebaute
+        // Schrift (siehe GetTitleFontHandle) statt per SetWindowFontScale hochskaliert: Skalieren
+        // vergrößert nur die vorhandene (kleine) Schrifttextur und sah dadurch sichtbar verschwommen
+        // aus. Eingeklappt bleibt es beim einfachen Skalieren - der Faktor ist dort <1, und beim
+        // Verkleinern entsteht kein Blur.
+        var titleFontPush = collapsed ? null : PushTitleFontIfAvailable();
+        var usingTitleFont = titleFontPush != null;
+        if (!usingTitleFont)
+            ImGui.SetWindowFontScale(collapsed ? TitleScaleCollapsed : TitleScaleExpanded);
 
+        // Höhe direkt am tatsächlich gerenderten Titeltext gemessen (statt nur an der generischen
+        // Zeilenhöhe) - so ist das Icon garantiert exakt so groß wie der Text daneben, unabhängig
+        // davon, welche Schrift/welcher Skalierungsfaktor gerade aktiv ist.
+        const string titleText = "All The Things";
+        var titleLineHeight = ImGui.CalcTextSize(titleText).Y;
         var rowStartY = bandStartY + (headerBandHeight - titleLineHeight) * 0.5f;
         ImGui.SetCursorPosY(rowStartY);
 
@@ -171,9 +220,11 @@ public class MainWindow : Window
         ImGui.Image(headerIcon.Handle, new Vector2(titleLineHeight, titleLineHeight));
 
         ImGui.SameLine();
-        ImGui.SetWindowFontScale(titleScale);
-        ImGui.TextUnformatted("All The Things");
-        ImGui.SetWindowFontScale(1f);
+        ImGui.TextUnformatted(titleText);
+
+        if (!usingTitleFont)
+            ImGui.SetWindowFontScale(1f);
+        titleFontPush?.Dispose();
 
         var regionMaxX = ImGui.GetWindowContentRegionMax().X;
         var spacing = ImGui.GetStyle().ItemSpacing.X;
@@ -450,6 +501,17 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        var showGoToIcon = config.ShowGoToIcon;
+        if (ModernUi.ToggleRow(Loc.T("\"Hinlaufen\"-Icon anzeigen", "Show \"go to\" icon"), ref showGoToIcon))
+        {
+            config.ShowGoToIcon = showGoToIcon;
+            config.Save();
+        }
+        TextDisabledWrapped(Loc.T(
+            "Icon neben verlinkten Einträgen, um automatisch per vnavmesh/Lifestream dorthin zu laufen.",
+            "Icon next to linked entries to automatically walk there via vnavmesh/Lifestream."));
+
+        ImGui.Spacing();
         var locked = config.CompactLocked;
         if (ModernUi.ToggleRow(Loc.T("Fenster sperren (Position & Größe)", "Lock window (position & size)"), ref locked))
         {
@@ -655,6 +717,20 @@ public class MainWindow : Window
             "Also walks through already-unlocked crystals (without losing real progress) - to check " +
             "whether the walking order works correctly across a city's districts, without having to " +
             "reset your own progress. Not saved - resets to off after a restart."));
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (ImGui.Button(Loc.T("Hunting-Log-Debug-Dump ins Log schreiben", "Write hunting log debug dump to log")))
+            Plugin.DumpHuntingLogDebugInfo();
+        TextDisabledWrapped(Loc.T(
+            "Für den geplanten Hunting-Log-Zonenfilter: schreibt die aktuelle Klasse plus die rohen " +
+            "MonsterNoteManager-Rohdaten (Rang/Zähler je der 12 internen Slots) ins Dalamud-Log " +
+            "(/xllog) - wird zum Abgleichen gebraucht, welcher Slot zu welcher Klasse gehört.",
+            "For the planned hunting log zone filter: writes the current class plus the raw " +
+            "MonsterNoteManager data (rank/counters for each of the 12 internal slots) to the Dalamud " +
+            "log (/xllog) - needed to figure out which slot belongs to which class."));
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
