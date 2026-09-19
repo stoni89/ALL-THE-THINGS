@@ -18,8 +18,13 @@ public class CollectibleEntry
     public string Name { get; init; } = string.Empty;
     public CollectibleType Type { get; init; }
     public string Category { get; init; } = string.Empty; // Beschaffungsart, z.B. "Quest", "Errungenschaft", "Echtgeld-Shop"
-    public uint TerritoryTypeId { get; init; } // Zone, siehe Lumina "TerritoryType" Sheet
+    public uint TerritoryTypeId { get; init; } // Zone, in der der Eintrag angezeigt wird (Lumina "TerritoryType" Sheet)
     public uint MapId { get; init; } // Lumina "Map" Sheet, für MapLinkPayload benötigt
+
+    // Für Kartenlinks, deren Flagge auf einer ANDEREN Karte liegt als die Zone, in der der Eintrag
+    // angezeigt wird (z.B. ein Aethernetz-Kristall, der laut Spiel auf der Nachbarkarte markiert
+    // wird) - null bedeutet "gleiche Zone wie TerritoryTypeId" (Normalfall).
+    public uint? FlagTerritoryTypeId { get; init; }
     public string Vendor { get; init; } = string.Empty; // Händler-/NPC-Name, falls per Kauf erhältlich
     public float VendorMapX { get; init; } // Kartenkoordinate des Händlers (0 = unbekannt)
     public float VendorMapY { get; init; }
@@ -42,6 +47,9 @@ public enum CollectibleType
     Facewear,
     FashionAccessory,
     TripleTriadCard,
+    FrameKit,
+    Aetheryte,
+    Quest,
 }
 
 public static class CollectionData
@@ -57,7 +65,7 @@ public static class CollectionData
     private static readonly string[] DataFiles =
     {
         "mounts.json", "minions.json", "orchestrions.json", "bardings.json",
-        "emotes.json", "facewear.json", "fashions.json", "triadcards.json",
+        "emotes.json", "facewear.json", "fashions.json", "triadcards.json", "frames.json",
     };
 
     public static List<CollectibleEntry> GetAllEntries()

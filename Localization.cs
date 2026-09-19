@@ -22,6 +22,9 @@ public static class Loc
         CollectibleType.Facewear => T("Brille", "Facewear"),
         CollectibleType.FashionAccessory => T("Accessoire", "Accessory"),
         CollectibleType.TripleTriadCard => T("Triple-Triad-Karte", "Triple Triad Card"),
+        CollectibleType.FrameKit => T("Portrait-Rahmen", "Portrait Frame"),
+        CollectibleType.Aetheryte => T("Aetheryte", "Aetheryte"),
+        CollectibleType.Quest => T("Quest", "Quest"),
         _ => type.ToString(),
     };
 }

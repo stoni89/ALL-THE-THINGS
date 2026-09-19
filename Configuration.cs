@@ -38,16 +38,22 @@ public class Configuration : IPluginConfiguration
     };
 
     // 0 = undurchsichtig, 1 = vollständig transparent
-    public float CompactTransparency { get; set; } = 0.1f;
+    public float CompactTransparency { get; set; } = 1f;
 
     // Kompaktes Overlay (nur aktuelle Zone)
     public bool ShowCompactOverlay { get; set; } = false;
-    public bool CompactOnlyAffordable { get; set; } = false;
     public bool ShowCurrencyWallet { get; set; } = true;
-    public float CompactFontScale { get; set; } = 1f;
+    public float CompactFontScale { get; set; } = 1.3f;
     public CompactFontMode CompactFontMode { get; set; } = CompactFontMode.Standard;
     public string CompactCustomFontPath { get; set; } = string.Empty;
     public string CompactCustomFontName { get; set; } = string.Empty;
+    public bool CompactLocked { get; set; } = false;
+
+    // QoL
+    public bool UseSprintOnCooldown { get; set; } = true;
+
+    // Debug
+    public bool ShowDebugInfo { get; set; } = false;
 
     public void Save()
     {

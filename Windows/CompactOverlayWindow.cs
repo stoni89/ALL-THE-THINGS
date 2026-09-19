@@ -17,9 +17,10 @@ public class CompactOverlayWindow : Window
 {
     private readonly Plugin plugin;
 
-    public CompactOverlayWindow(Plugin plugin) : base(
-        "##AllTheThingsCompact",
-        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing)
+    private const ImGuiWindowFlags BaseFlags =
+        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing;
+
+    public CompactOverlayWindow(Plugin plugin) : base("##AllTheThingsCompact", BaseFlags)
     {
         this.plugin = plugin;
         RespectCloseHotkey = false;
@@ -37,19 +38,35 @@ public class CompactOverlayWindow : Window
 
     public void Dispose() { }
 
+    // Bewusst FEST (nicht von CompactTransparency abhängig) - der Resize-Griff unten rechts soll
+    // auch bei voller Transparenz sichtbar bleiben, sonst sieht man gar nicht mehr, wo das Fenster
+    // endet bzw. wo man es zum Skalieren greifen kann.
+    private static readonly Vector4 ResizeGripColor = new(0.62f, 0.38f, 0.85f, 1f);
+    private static readonly Vector4 ResizeGripHoveredColor = new(0.74f, 0.48f, 0.98f, 1f);
+    private static readonly Vector4 ResizeGripActiveColor = new(0.82f, 0.58f, 1f, 1f);
+
     public override void PreDraw()
     {
-        var alpha = 1f - System.Math.Clamp(plugin.Configuration.CompactTransparency, 0f, 1f);
+        var config = plugin.Configuration;
+
+        // Gesperrt = weder verschiebbar noch skalierbar - ImGui blendet den Resize-Griff dann
+        // automatisch aus (kein zusätzlicher Farb-Trick nötig), macht also gleich beides.
+        Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize : BaseFlags;
+
+        var alpha = 1f - System.Math.Clamp(config.CompactTransparency, 0f, 1f);
 
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 10f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(12, 10));
         ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.09f, 0.09f, 0.11f, alpha));
+        ImGui.PushStyleColor(ImGuiCol.ResizeGrip, ResizeGripColor);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, ResizeGripHoveredColor);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, ResizeGripActiveColor);
     }
 
     public override void PostDraw()
     {
-        ImGui.PopStyleColor();
+        ImGui.PopStyleColor(4);
         ImGui.PopStyleVar(3);
     }
 
@@ -61,6 +78,11 @@ public class CompactOverlayWindow : Window
 
         var currentTerritoryId = Plugin.ClientState.TerritoryType;
 
+        // Manche Zonen gehören zu einer Stadt, haben aber ein eigenes TerritoryType (z.B. "Heart of
+        // the Sworn" -> Ul'dah) - dort sollen dieselben Daten wie in der zugeordneten Stadtzone
+        // verwendet werden. Nur für Datenabfragen, nicht für die angezeigte Zonenüberschrift unten.
+        var effectiveTerritoryId = Plugin.ResolveEffectiveTerritoryId(currentTerritoryId);
+
         OutlineText("All The Things", TitleColor);
         if (ImGui.IsItemHovered())
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
@@ -70,23 +92,65 @@ public class CompactOverlayWindow : Window
 
         if (DrawCloseButtonTopRight())
         {
+            IsOpen = false;
             config.ShowCompactOverlay = false;
             config.Save();
         }
 
         OutlineText($"{plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
 
-        if (ImGui.Button(Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter"))
-            ImGui.OpenPopup("CompactTypeFilterPopup");
+        // In geteilten Hauptstädten (Ul'dah, Limsa, Gridania, Ishgard) sollen Sammelobjekte aus
+        // JEDEM Bezirk angezeigt werden, egal in welchem man gerade steht - jeder Eintrag verlinkt
+        // trotzdem auf seinen tatsächlichen Bezirk (siehe FlagTerritoryTypeId/MapId je Eintrag).
+        var siblingTerritories = Plugin.GetSplitCityTerritories(effectiveTerritoryId);
+        var allForZone = CollectionData.GetAllEntries()
+            .Concat(plugin.GetLiveZoneEntries(effectiveTerritoryId))
+            .Where(e => siblingTerritories.Contains(e.TerritoryTypeId))
+            .ToList();
 
+        var afterTypeFilter = allForZone
+            .Where(e => config.ShowType.GetValueOrDefault(e.Type, true))
+            .ToList();
+
+        var entries = afterTypeFilter
+            .Where(e => !plugin.IsOwned(e))
+            .OrderBy(e => config.TypeOrder.IndexOf(e.Type))
+            .ThenBy(e => e.Name)
+            .ToList();
+
+        // Bewusst aus "allForZone" (nicht "entries") - die Automation soll unabhängig vom
+        // Typen-Filter laufen, auch wenn Quests im Overlay z.B. ausgeblendet sind.
+        var missingQuests = allForZone
+            .Where(e => e.Type == CollectibleType.Quest && !plugin.IsOwned(e))
+            .ToList();
+        plugin.QuestAutomation.Update(missingQuests);
+
+        // Bewusst die ganze Stadt (inkl. Kristalle aus Nachbarbezirken einer geteilten Hauptstadt,
+        // siehe allForZone) - die Automation reist bei Bedarf selbst mit Lifestream zwischen den
+        // Bezirken hin und her (siehe AetheryteAutomation.cs). Im Debug-Simulationsmodus werden
+        // bewusst auch schon freigeschaltete Kristalle mitgenommen, um den Laufweg/die Reihenfolge
+        // ohne Fortschrittsverlust zu überprüfen.
+        var missingAetherytesCity = allForZone
+            .Where(e => e.Type == CollectibleType.Aetheryte
+                        && (plugin.AetheryteAutomation.SimulateAllCrystals || !plugin.IsOwned(e)))
+            .ToList();
+        plugin.AetheryteAutomation.Update(missingAetherytesCity);
+
+        // "Unterstützt" heißt hier: noch nicht als von Questionable abgelehnt bekannt (siehe
+        // QuestAutomation.IsKnownUnsupported) - erst nach einem Versuch bekannt, siehe dort.
+        var hasActionableQuests = missingQuests.Any(q => !plugin.QuestAutomation.IsKnownUnsupported(q.Id));
+        var hasActionableAetherytes = missingAetherytesCity.Count > 0;
+
+        DrawQuestAutomationButton(hasActionableQuests);
         ImGui.SameLine();
+        DrawAetheryteAutomationButton(hasActionableAetherytes);
 
-        var onlyAffordable = config.CompactOnlyAffordable;
-        if (ImGui.Checkbox(Loc.T("Nur leistbare Käufe", "Only affordable purchases") + "##Compact", ref onlyAffordable))
-        {
-            config.CompactOnlyAffordable = onlyAffordable;
-            config.Save();
-        }
+        // Ganz rechts an den Fensterrand.
+        var filterLabel = Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter";
+        var filterButtonWidth = ImGui.CalcTextSize(Loc.T("Typen filtern", "Filter types")).X + ImGui.GetStyle().FramePadding.X * 2f;
+        ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - filterButtonWidth);
+        if (ImGui.Button(filterLabel))
+            ImGui.OpenPopup("CompactTypeFilterPopup");
 
         if (ImGui.BeginPopup("CompactTypeFilterPopup"))
         {
@@ -107,31 +171,42 @@ public class CompactOverlayWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
-        var entries = CollectionData.GetAllEntries()
-            .Where(e => e.TerritoryTypeId == currentTerritoryId)
-            .Where(e => config.ShowType.GetValueOrDefault(e.Type, true))
-            .Where(e => !plugin.IsOwned(e))
-            .Where(e => !onlyAffordable || plugin.CanAfford(e))
-            .OrderBy(e => config.TypeOrder.IndexOf(e.Type))
-            .ThenBy(e => e.Name)
-            .ToList();
+        if (plugin.QuestAutomation.ShouldShowStatusText)
+            OutlineText(plugin.QuestAutomation.StatusText, plugin.QuestAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.AetheryteAutomation.ShouldShowStatusText)
+            OutlineText(plugin.AetheryteAutomation.StatusText, plugin.AetheryteAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (config.ShowDebugInfo)
+            OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
 
         if (entries.Count == 0)
         {
-            OutlineText(onlyAffordable
-                ? Loc.T("Nichts Leistbares in dieser Zone.", "Nothing affordable in this zone.")
-                : Loc.T("Nichts Fehlendes in dieser Zone.", "Nothing missing in this zone."), MutedColor);
+            OutlineText(Loc.T("Nichts Fehlendes in dieser Zone.", "Nothing missing in this zone."), MutedColor);
             return;
         }
 
+        OutlineText($"[{entries.Count}]", TitleColor);
+
         if (config.ShowCurrencyWallet)
             DrawCurrencyWallet(entries);
+
+        // Nur dieser Teil (die eigentliche Liste) soll scrollen - alles darüber (Titel, Knöpfe,
+        // Status, Währungen) bleibt beim Scrollen fest stehen, size.Y=0 füllt dafür einfach den
+        // Rest des (frei durch den Spieler skalierbaren) Fensters.
+        ImGui.BeginChild("##CompactEntryList", new Vector2(0, 0), false);
 
         foreach (var entry in entries)
         {
             OutlineText("•", MutedColor);
             ImGui.SameLine();
-            OutlineText($"[{Loc.TypeName(entry.Type)}]", TypeColors.GetValueOrDefault(entry.Type, NormalColor));
+
+            var isUnsupportedQuest = entry.Type == CollectibleType.Quest && plugin.QuestAutomation.IsKnownUnsupported(entry.Id);
+            var typeColor = isUnsupportedQuest ? UnsupportedColor : TypeColors.GetValueOrDefault(entry.Type, NormalColor);
+            OutlineText($"[{Loc.TypeName(entry.Type)}]", typeColor);
+            if (isUnsupportedQuest && ImGui.IsItemHovered())
+                ImGui.SetTooltip("Not supported with Questionable");
+
             ImGui.SameLine();
             DrawClickableName(entry);
 
@@ -154,6 +229,8 @@ public class CompactOverlayWindow : Window
                 OutlineText(entry.Currency, color);
             }
         }
+
+        ImGui.EndChild();
     }
 
     /// <summary>
@@ -200,15 +277,150 @@ public class CompactOverlayWindow : Window
         return t.Trim();
     }
 
+    /// <summary>
+    /// Färbt einen Automation-Knopf passend zum Typ-Tag seiner Kategorie (leicht abgedunkelt, damit
+    /// der Knopf nicht zu grell wirkt), oder rot, solange die Automation aktiv ist ("zum Stoppen").
+    /// Muss von der Aufrufstelle immer mit ImGui.PopStyleColor(2) beendet werden.
+    /// </summary>
+    private static void PushAutomationButtonColors(bool isActive, Vector4 typeColor)
+    {
+        if (isActive)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.55f, 0.2f, 0.2f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.7f, 0.25f, 0.25f, 1f));
+        }
+        else
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(typeColor.X * 0.6f, typeColor.Y * 0.6f, typeColor.Z * 0.6f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(typeColor.X * 0.75f, typeColor.Y * 0.75f, typeColor.Z * 0.75f, 1f));
+        }
+    }
+
+    /// <summary>
+    /// Knopf, der die Questionable-Automation (siehe QuestAutomation.cs) für die aktuell
+    /// fehlenden Quests dieser Zone an-/ausschaltet. Questionable ist ein separates Fremdplugin -
+    /// ist es nicht installiert/geladen, wird das per Tooltip erklärt statt der Knopf einfach
+    /// nichts zu tun.
+    /// </summary>
+    private void DrawQuestAutomationButton(bool hasActionableQuests)
+    {
+        var automation = plugin.QuestAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Quest-Automation", "Quest automation");
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
+        var isDisabled = !automation.IsActive && !hasActionableQuests;
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Quest]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactQuestAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(isDisabled
+                ? Loc.T(
+                    "Keine von Questionable unterstützten Quests in dieser Zone.",
+                    "No quests supported by Questionable in this zone.")
+                : automation.IsActive
+                    ? Loc.T(
+                        "Schiebt keine weiteren Quests mehr nach. Questionable selbst kennt keine Stopp-IPC - " +
+                        "eine bereits laufende Quest läuft dort weiter, bis sie fertig ist oder du sie in " +
+                        "Questionables eigenem Fenster abbrichst.",
+                        "Stops queueing further quests. Questionable itself has no stop IPC - a quest it has " +
+                        "already started keeps running there until it finishes, or until you cancel it in " +
+                        "Questionable's own window.")
+                    : Loc.T(
+                        "Lässt Questionable nacheinander alle fehlenden Quests dieser Zone annehmen und abschließen.",
+                        "Has Questionable pick up and complete all missing quests in this zone, one by one."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (automation.IsQuestionableAvailable())
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
+    /// <summary>
+    /// Knopf, der die Aetheryten-Automation (siehe AetheryteAutomation.cs) für die aktuell
+    /// fehlenden Aetheryten/Kristalle dieser Zone an-/ausschaltet. Nutzt das Fremdplugin
+    /// "vnavmesh" zum Laufen - fehlt es, wird das per Tooltip erklärt statt der Knopf einfach
+    /// nichts zu tun.
+    /// </summary>
+    private void DrawAetheryteAutomationButton(bool hasActionableAetherytes)
+    {
+        var automation = plugin.AetheryteAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Aetheryten-Automation", "Aetheryte automation");
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
+        var isDisabled = !automation.IsActive && !hasActionableAetherytes;
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Aetheryte]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactAetheryteAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(isDisabled
+                ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
+                : automation.IsActive
+                    ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                    : Loc.T(
+                        "Läuft mit vnavmesh nacheinander alle fehlenden Aetheryten/Kristalle ab und interagiert mit ihnen.",
+                        "Uses vnavmesh to walk to and interact with all missing aetherytes/crystals, one by one."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (automation.IsVNavmeshAvailable())
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
     private void DrawClickableName(CollectibleEntry entry)
     {
+        var affordable = plugin.CanAfford(entry);
+
         if (!entry.HasVendorLocation)
         {
-            OutlineText(entry.Name, NormalColor);
+            OutlineText(entry.Name, affordable ? AffordableColor : NormalColor);
             return;
         }
 
-        OutlineText(entry.Name, VendorLinkColor);
+        OutlineText(entry.Name, affordable ? AffordableColor : VendorLinkColor);
         if (ImGui.IsItemHovered())
         {
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
@@ -218,7 +430,7 @@ public class CompactOverlayWindow : Window
         }
 
         if (ImGui.IsItemClicked())
-            plugin.OpenVendorMap(entry);
+            Plugin.OpenVendorMap(entry);
     }
 
     /// <summary>
@@ -250,10 +462,11 @@ public class CompactOverlayWindow : Window
     private static readonly Vector4 NormalColor = new(0.92f, 0.92f, 0.92f, 1f);
     private static readonly Vector4 VendorLinkColor = new(0.5f, 0.8f, 1f, 1f);
     private static readonly Vector4 AffordableColor = new(0.55f, 0.95f, 0.55f, 1f);
+    private static readonly Vector4 UnsupportedColor = new(1f, 0.3f, 0.3f, 1f);
 
     private static readonly Dictionary<CollectibleType, Vector4> TypeColors = new()
     {
-        [CollectibleType.Mount] = new(1f, 0.75f, 0.35f, 1f),
+        [CollectibleType.Mount] = new(0.85f, 0.45f, 0.05f, 1f),
         [CollectibleType.Minion] = new(0.75f, 0.6f, 1f, 1f),
         [CollectibleType.Orchestrion] = new(0.4f, 0.9f, 0.85f, 1f),
         [CollectibleType.Barding] = new(0.85f, 0.65f, 0.45f, 1f),
@@ -261,6 +474,9 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Facewear] = new(0.55f, 0.75f, 1f, 1f),
         [CollectibleType.FashionAccessory] = new(0.75f, 0.9f, 0.45f, 1f),
         [CollectibleType.TripleTriadCard] = new(1f, 0.5f, 0.5f, 1f),
+        [CollectibleType.FrameKit] = new(0.6f, 0.85f, 1f, 1f),
+        [CollectibleType.Aetheryte] = new(0.6f, 1f, 0.75f, 1f),
+        [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
     };
     private static readonly Vector2[] ShadowOffsets =
     {
