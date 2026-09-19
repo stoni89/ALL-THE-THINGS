@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Plugin.Ipc;
 
@@ -19,13 +20,25 @@ public sealed class AetheryteAutomation
     private enum State
     {
         Idle,
+        Mounting,
         MovingTo,
         Interacting,
         TravelingToDistrict,
     }
 
+    // Wie lange maximal aufs Aufsteigen gewartet wird (Ruf-Animation), bevor trotzdem
+    // weitergemacht wird (dann eben zu Fuß, siehe UpdateMounting) - falls Rufen aus irgendeinem
+    // Grund nicht klappt (z.B. gerade nicht erlaubt), soll die Automation nicht ewig hängen bleiben.
+    private static readonly TimeSpan MountWaitTimeout = TimeSpan.FromSeconds(6);
+
     // Ab dieser Entfernung (Yalms) zum Kristall wird die Bewegung gestoppt und interagiert.
     private const float InteractDistance = 3.5f;
+
+    // Für den gezielten Nachlauf zum echten Weltobjekt (siehe UpdateInteracting) - bewusst
+    // identisch zu InteractDistance, NICHT enger: ein Test mit 1.5 führte dazu, dass der Charakter
+    // endlos gegen den (kollidierenden) Aetheryten-Sockel gelaufen ist, weil vnavmesh diese
+    // Distanz gar nicht erst physisch erreichen kann (der Sockel blockiert vorher).
+    private const float FinalApproachDistance = InteractDistance;
 
     // Innerhalb dieser Entfernung (Yalms) zum Ziel wird kein Sprint mehr benutzt - wird Sprint
     // genau in dem Moment aktiviert, in dem vnavmesh eigentlich anhalten und den Aetheryten
@@ -40,16 +53,10 @@ public sealed class AetheryteAutomation
     // komplett ab, statt wenigstens bis zur Tür zu laufen.
     private const float PathTolerance = 10f;
 
-    // Wie lange ohne messbaren Fortschritt (Distanz zum Ziel wird nicht kleiner) gewartet wird,
-    // bevor der aktuelle Kristall als "festgefahren" übersprungen wird. Bewusst NICHT als feste
-    // Gesamt-Laufzeit gedacht - manche Ziele liegen 200+ Yalm entfernt und brauchen dafür allein
-    // schon deutlich mehr als 30s, obwohl vnavmesh die ganze Zeit sichtbar vorwärtskommt.
-    private static readonly TimeSpan StepStallTimeout = TimeSpan.FromSeconds(15);
-
-    // Absolute Notbremse für einen einzelnen Laufweg, falls Fortschritt zwar (minimal) gemessen
-    // wird, das Ziel aber trotzdem nie in vertretbarer Zeit erreicht wird (z.B. vnavmesh pendelt
-    // um ein Hindernis).
-    private static readonly TimeSpan StepMaxDuration = TimeSpan.FromMinutes(3);
+    // Absolute Notbremse für einen einzelnen Laufweg - solange Path.IsRunning true bleibt, vertraut
+    // die Automation vnavmesh (siehe UpdateMoving), auch auf langen/verwinkelten Wegen (z.B. große
+    // Zonen wie Mor Dhona). Nur wenn selbst das viel zu lange dauert, wird abgebrochen.
+    private static readonly TimeSpan StepMaxDuration = TimeSpan.FromMinutes(10);
 
     // Wie lange nach der Interaktion auf den tatsächlichen Freischalt-Abschluss gewartet wird
     // (der "Entdecken"-Cast braucht ein paar Sekunden) - danach gilt der Versuch als gescheitert.
@@ -102,13 +109,13 @@ public sealed class AetheryteAutomation
 
     private State state = State.Idle;
     private uint? currentTargetId;
+    private string currentTargetName = string.Empty;
     private Vector3 currentTargetPosition;
     private float currentArrivalTolerance = InteractDistance;
     private DateTime stateEnteredAt;
     private bool hasInteractedThisCycle;
+    private bool didFinalApproach;
     private bool hasSeenPathRunning;
-    private float lastProgressDistance;
-    private DateTime lastProgressAtUtc;
     private DateTime? interactObjectNotFoundSince;
     private DateTime? districtTravelFinishedAt;
     private readonly HashSet<uint> skippedIds = new();
@@ -266,6 +273,10 @@ public sealed class AetheryteAutomation
             {
                 case State.Idle:
                     TryStartNext(missingAetherytesInZone);
+                    break;
+
+                case State.Mounting:
+                    UpdateMounting();
                     break;
 
                 case State.MovingTo:
@@ -442,24 +453,78 @@ public sealed class AetheryteAutomation
             return;
         }
 
-        var accepted = pathfindAndMoveCloseTo.InvokeFunc(floorPoint.Value, false, tolerance);
-        Plugin.Log.Info($"[AetheryteAutomation] StartMovingTo({next.Name}): pathfindAndMoveCloseTo({floorPoint.Value}, tolerance={tolerance}) accepted={accepted}");
-        if (!accepted)
+        currentTargetId = next.Id;
+        currentTargetName = next.Name;
+        currentTargetPosition = floorPoint.Value;
+        currentArrivalTolerance = tolerance;
+        didFinalApproach = false;
+
+        // Mount rufen (falls in den QoL-Einstellungen ausgewählt und noch nicht beritten) - der
+        // eigentliche Laufauftrag an vnavmesh geht erst raus, nachdem entweder aufgestiegen wurde
+        // oder das Aufsteigen aufgegeben wurde (siehe UpdateMounting), sonst würde vnavmesh mitten
+        // in der Aufstiegs-Animation losschicken wollen.
+        if (Plugin.TryRequestAetheryteMount())
         {
-            skippedIds.Add(next.Id);
-            StatusText = Loc.T($"Übersprungen (vnavmesh lehnt Laufweg ab): {next.Name}", $"Skipped (vnavmesh rejected the path): {next.Name}");
+            state = State.Mounting;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T($"Rufe Mount, dann: {next.Name}...", $"Summoning mount, then: {next.Name}...");
             return;
         }
 
-        currentTargetId = next.Id;
-        currentTargetPosition = floorPoint.Value;
-        currentArrivalTolerance = tolerance;
+        BeginPathfind();
+    }
+
+    /// <summary>
+    /// Stößt den eigentlichen Laufauftrag an vnavmesh an - beritten wird zuerst Fliegen versucht
+    /// (schneller, sofern die Zone/das Mount es erlaubt), lehnt vnavmesh das ab, mit demselben Mount
+    /// stattdessen am Boden geritten. Ohne Mount (aus, oder das Aufsteigen hat nicht geklappt) ganz
+    /// normal zu Fuß wie bisher (siehe SprintDisableDistance/TryUseSprint in UpdateMoving).
+    /// </summary>
+    private void BeginPathfind()
+    {
+        var mounted = Plugin.Condition[ConditionFlag.Mounted];
+        var accepted = false;
+
+        if (mounted)
+        {
+            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, currentArrivalTolerance);
+            Plugin.Log.Info($"[AetheryteAutomation] BeginPathfind({currentTargetName}): pathfindAndMoveCloseTo(fly=true, tolerance={currentArrivalTolerance}) accepted={accepted}");
+        }
+
+        if (!accepted)
+        {
+            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, currentArrivalTolerance);
+            Plugin.Log.Info($"[AetheryteAutomation] BeginPathfind({currentTargetName}): pathfindAndMoveCloseTo(fly=false, tolerance={currentArrivalTolerance}) accepted={accepted}, mounted={mounted}");
+        }
+
+        if (!accepted)
+        {
+            SkipCurrent(Loc.T("vnavmesh lehnt Laufweg ab", "vnavmesh rejected the path"));
+            return;
+        }
+
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
-        lastProgressDistance = Vector3.Distance(Plugin.ObjectTable.LocalPlayer?.Position ?? floorPoint.Value, floorPoint.Value);
-        lastProgressAtUtc = DateTime.UtcNow;
-        StatusText = Loc.T($"Laufe zu: {next.Name}...", $"Walking to: {next.Name}...");
+        StatusText = Loc.T($"Laufe zu: {currentTargetName}...", $"Walking to: {currentTargetName}...");
+    }
+
+    private void UpdateMounting()
+    {
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            BeginPathfind();
+            return;
+        }
+
+        if (DateTime.UtcNow - stateEnteredAt > MountWaitTimeout)
+        {
+            // Aufsteigen hat nicht geklappt (z.B. gerade nicht erlaubt) - nicht endlos warten,
+            // sondern stattdessen normal zu Fuß weiter (BeginPathfind erkennt "nicht beritten"
+            // selbst und nutzt dann den Fußweg-Pfad).
+            Plugin.Log.Info($"[AetheryteAutomation] UpdateMounting(#{currentTargetId}): nach {MountWaitTimeout.TotalSeconds}s nicht aufgestiegen - laufe stattdessen zu Fuß.");
+            BeginPathfind();
+        }
     }
 
     /// <summary>
@@ -586,23 +651,12 @@ public sealed class AetheryteAutomation
             if (movingDistance > SprintDisableDistance)
                 Plugin.TryUseSprint();
 
-            // Läuft noch - aber kommt es tatsächlich voran? Ein fester Gesamt-Timeout wäre bei
-            // weit entfernten Zielen (200+ Yalm) falsch: der reine Fußweg dahin kann allein schon
-            // deutlich länger als 30s dauern, obwohl vnavmesh die ganze Zeit sichtbar läuft. Statt
-            // die Gesamtzeit zu begrenzen, wird daher nur geprüft, ob die Distanz zum Ziel
-            // überhaupt noch kleiner wird - bleibt sie zu lange gleich (feststeckend/Hindernis),
-            // wird abgebrochen.
-            if (movingDistance <= lastProgressDistance - 1f)
-            {
-                lastProgressDistance = movingDistance;
-                lastProgressAtUtc = DateTime.UtcNow;
-            }
-            else if (DateTime.UtcNow - lastProgressAtUtc > StepStallTimeout)
-            {
-                Plugin.Log.Info($"[AetheryteAutomation] UpdateMoving(#{currentTargetId}): kein Fortschritt seit {StepStallTimeout.TotalSeconds}s (distance={movingDistance}, bisher bester={lastProgressDistance}).");
-                SkipCurrent(Loc.T("Laufweg abgebrochen (kein Fortschritt)", "movement stopped (no progress)"));
-                return;
-            }
+            // Bewusst KEIN "kein Fortschritt seit X Sekunden"-Abbruch mehr: Die geradlinige Distanz
+            // zum Ziel ist auf verwinkelten/langen Wegen (z.B. große Zonen wie Mor Dhona mit Seen/
+            // Bergen dazwischen) kein verlässliches Fortschrittsmaß - vnavmesh kann streckenweise
+            // sogar kurz weiter weg vom Ziel laufen müssen, um überhaupt herumzukommen, obwohl es
+            // sichtbar weiter aktiv unterwegs ist. Solange Path.IsRunning true bleibt, gilt das als
+            // "noch dabei" - einzige Bremse ist die absolute Notbremse (StepMaxDuration) unten.
         }
         else if (hasSeenPathRunning)
         {
@@ -654,7 +708,6 @@ public sealed class AetheryteAutomation
         // Positionsnähe) - da wir gerade exakt an dieser Position angekommen sind, ist das
         // nächstgelegene Aetheryte-Objekt zuverlässig der richtige Kristall.
         var gameObject = FindNearestAetheryteObject(currentTargetPosition, 15f);
-        Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): target={currentTargetPosition}, gefundenes Objekt: BaseId={gameObject?.BaseId}, Position={gameObject?.Position}, hasInteractedThisCycle={hasInteractedThisCycle}");
         if (gameObject == null)
         {
             // Jetzt am Ziel angekommen sollte das Objekt eigentlich sofort geladen sein - eine
@@ -665,6 +718,47 @@ public sealed class AetheryteAutomation
 
             SkipCurrent(Loc.T("Objekt trotz Ankunft nicht gefunden", "object not found despite arriving"));
             return;
+        }
+
+        // Manche Feld-Aetheryten scheinen sich schon durch reine Nähe selbst zu entdecken, noch
+        // bevor überhaupt interagiert wurde - dann direkt fertig, statt trotzdem noch zu versuchen
+        // zu interagieren (und ggf. dabei gegen den Sockel zu laufen, siehe FinalApproachDistance).
+        if (Plugin.IsAetheryteUnlocked(currentTargetId.Value))
+        {
+            Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): bereits durch Nähe freigeschaltet, ohne explizite Interaktion.");
+            currentTargetId = null;
+            state = State.Idle;
+            return;
+        }
+
+        if (!hasInteractedThisCycle && !didFinalApproach)
+        {
+            // Die lockere PathTolerance (siehe StartMovingTo) reicht vnavmesh zum "Ankommen", ist
+            // aber oft zu großzügig für die tatsächliche Spiel-Interaktion/den Entdecken-Sensor
+            // (der einen deutlich engeren Radius braucht, siehe FinalApproachDistance) - jetzt, wo
+            // das echte Weltobjekt bekannt ist, gezielt näher heranlaufen, statt aus zu großer
+            // Entfernung erfolglos zu interagieren und nur auf den Freischalt-Timeout zu warten.
+            var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
+            var distanceToObject = Vector3.Distance(playerPos, gameObject.Position);
+            if (distanceToObject > FinalApproachDistance)
+            {
+                didFinalApproach = true;
+                currentTargetPosition = gameObject.Position;
+                currentArrivalTolerance = FinalApproachDistance;
+
+                var accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, false, FinalApproachDistance);
+                Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): zu weit vom echten Objekt entfernt (distance={distanceToObject}, BaseId={gameObject.BaseId} @ {gameObject.Position}) - laufe gezielt näher heran, accepted={accepted}.");
+                if (!accepted)
+                {
+                    SkipCurrent(Loc.T("Laufweg zum Objekt abgelehnt", "vnavmesh rejected the approach"));
+                    return;
+                }
+
+                state = State.MovingTo;
+                stateEnteredAt = DateTime.UtcNow;
+                hasSeenPathRunning = false;
+                return;
+            }
         }
 
         if (!hasInteractedThisCycle)
@@ -680,6 +774,7 @@ public sealed class AetheryteAutomation
             Plugin.InteractWithGameObject(gameObject);
             hasInteractedThisCycle = true;
             stateEnteredAt = DateTime.UtcNow;
+            Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): interagiert mit BaseId={gameObject.BaseId} @ {gameObject.Position}, warte auf Freischaltung...");
             return;
         }
 
@@ -688,6 +783,7 @@ public sealed class AetheryteAutomation
         // Wartezeit einfach anzunehmen, dass es geklappt hat.
         if (Plugin.IsAetheryteUnlocked(currentTargetId.Value))
         {
+            Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): freigeschaltet.");
             currentTargetId = null;
             state = State.Idle;
             return;

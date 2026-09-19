@@ -21,6 +21,7 @@ public sealed class QuestAutomation
         Idle,
         WaitingForPickup,
         Running,
+        TravelingHome,
     }
 
     // Wie lange nach dem Start einer Quest gewartet wird, bis Questionable sie tatsächlich
@@ -32,12 +33,52 @@ public sealed class QuestAutomation
     // dieselbe Quest überspringen.
     private const int MaxAttemptsPerQuest = 2;
 
+    // Wie lange IsRunning DURCHGEHEND false sein muss, bevor eine laufende Quest als "fertig" gilt
+    // (siehe State.Running in Update) - kurze, einzelne false-Meldungen (z.B. während eines quest-
+    // internen Ladebildschirms bei einem Zonenwechsel mitten in der Quest) sollen nicht sofort als
+    // Abschluss gewertet werden.
+    private static readonly TimeSpan RunningFalseGracePeriod = TimeSpan.FromSeconds(6);
+
+    // Wie lange maximal auf die Rückreise per Lifestream zur Startzone gewartet wird (siehe
+    // TryTravelHome), bevor die Automation aufgibt statt endlos zu warten.
+    private static readonly TimeSpan TravelHomeTimeout = TimeSpan.FromSeconds(60);
+
+    // Nach "Lifestream.IsBusy() == false" kann es noch einen Moment dauern, bis Plugin.ClientState.
+    // TerritoryType tatsächlich auf die neue Zone aktualisiert ist - ohne diese kurze Verzögerung
+    // hält der nächste Update-Aufruf die Zone noch für die alte und stößt eine erneute (unnötige)
+    // Rückreise an (siehe auch AetheryteAutomation.DistrictTravelSettleDelay).
+    private static readonly TimeSpan TravelHomeSettleDelay = TimeSpan.FromSeconds(2);
+
     private readonly ICallGateSubscriber<string, bool> startSingleQuest;
     private readonly ICallGateSubscriber<bool> isRunning;
 
+    // questId -> "gesperrt"? Prüft nur (ohne Nebenwirkung), ob Questionable eine Quest aktuell
+    // bearbeiten könnte - für die proaktive Support-Markierung im Overlay direkt beim Betreten
+    // einer Zone (siehe RefreshSupportStatus), statt erst nach einem echten Start-Versuch.
+    private readonly ICallGateSubscriber<string, bool> isQuestLocked;
+
+    // aetheryteId, subIndex(0 = großer Aetheryte) -> angenommen? Volle (kostenpflichtige) Teleport-
+    // Aktion für die Rückreise zur Startzone (siehe TryTravelHome) - nötig, wenn eine Quest quer
+    // über die Karte (oder in eine andere Stadt) führt, wo ein Aethernetz-Sprung nicht ausreicht.
+    private readonly ICallGateSubscriber<uint, byte, bool> lifestreamTeleport;
+
+    // Aetheryte-RowId -> angenommen? Kostenloser Aethernetz-Sprung (kein Ladebildschirm, kein Gil) -
+    // wird bei der Rückreise IMMER zuerst versucht (siehe TryTravelHome), bevor auf die
+    // kostenpflichtige Teleport-Aktion zurückgegriffen wird. Funktioniert nur, wenn man sich noch
+    // in Aethernetz-Reichweite dergleichen Stadt befindet (z.B. Quest hat nur in einen Nachbarbezirk
+    // geführt), nicht von komplett anderswo auf der Karte.
+    private readonly ICallGateSubscriber<uint, bool> lifestreamAethernetTeleportById;
+
+    private readonly ICallGateSubscriber<bool> lifestreamIsBusy;
+    private readonly ICallGateSubscriber<object> lifestreamAbort;
+
     private State state = State.Idle;
     private uint? currentQuestId;
+    private string currentQuestName = string.Empty;
+    private uint? homeTerritoryId;
     private DateTime stateEnteredAt;
+    private DateTime? travelHomeFinishedAt;
+    private DateTime? runningWentFalseAt;
     private readonly HashSet<uint> skippedQuestIds = new();
     private readonly Dictionary<uint, int> attemptCounts = new();
 
@@ -46,6 +87,10 @@ public sealed class QuestAutomation
     // nicht"), keine Buchhaltung für den aktuellen Automation-Durchlauf. Für die rote
     // "Nicht unterstützt"-Markierung im Overlay, auch außerhalb einer laufenden Automation.
     private readonly HashSet<uint> notSupportedQuestIds = new();
+
+    // Welche Quest-IDs bereits per IsQuestLocked geprüft wurden (unabhängig vom Ergebnis) - auch
+    // das bleibt dauerhaft bestehen, damit nicht jeden Frame erneut per IPC nachgefragt wird.
+    private readonly HashSet<uint> checkedSupportQuestIds = new();
 
     public bool IsKnownUnsupported(uint questId) => notSupportedQuestIds.Contains(questId);
 
@@ -74,6 +119,12 @@ public sealed class QuestAutomation
     {
         startSingleQuest = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.StartSingleQuest");
         isRunning = Plugin.PluginInterface.GetIpcSubscriber<bool>("Questionable.IsRunning");
+        isQuestLocked = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.IsQuestLocked");
+
+        lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
+        lifestreamAethernetTeleportById = Plugin.PluginInterface.GetIpcSubscriber<uint, bool>("Lifestream.AethernetTeleportById");
+        lifestreamIsBusy = Plugin.PluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
+        lifestreamAbort = Plugin.PluginInterface.GetIpcSubscriber<object>("Lifestream.Abort");
 
         Plugin.ChatGui.ChatMessage += OnChatMessage;
     }
@@ -121,11 +172,65 @@ public sealed class QuestAutomation
         }
     }
 
-    public void Start()
+    /// <summary>
+    /// Prüft für alle noch nicht geprüften Quests der Zone (unabhängig davon, ob die Automation
+    /// gerade läuft), ob Questionable sie unterstützt - über IsQuestLocked, das (anders als
+    /// StartSingleQuest) rein lesend ist und nichts anstößt. So kann die rote "Nicht unterstützt"-
+    /// Markierung im Overlay schon beim Betreten der Zone erscheinen, statt erst nachdem man die
+    /// Automation einmal gestartet und einen echten Start-Versuch pro Quest abgewartet hat. Muss
+    /// jeden Frame aufgerufen werden (wie Update) - geprüfte Quests werden übersprungen, es wird
+    /// also nicht wiederholt nachgefragt.
+    /// </summary>
+    public void RefreshSupportStatus(IReadOnlyList<CollectibleEntry> missingQuestsInZone)
+    {
+        if (!IsQuestionableAvailable())
+            return;
+
+        try
+        {
+            if (!isQuestLocked.HasFunction)
+                return;
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var quest in missingQuestsInZone)
+        {
+            if (checkedSupportQuestIds.Contains(quest.Id))
+                continue;
+
+            try
+            {
+                // Gleiche ID-Umrechnung wie beim echten Start (siehe TryStartNext) - Questionable
+                // erwartet überall die 16-Bit-Quest-ID des Spielclients, nicht die volle RowId.
+                var locked = isQuestLocked.InvokeFunc(((ushort)quest.Id).ToString());
+                checkedSupportQuestIds.Add(quest.Id);
+                if (locked)
+                    notSupportedQuestIds.Add(quest.Id);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.Error(ex, $"Fehler beim Prüfen des Support-Status von Quest {quest.Id} ({quest.Name}).");
+            }
+        }
+    }
+
+    /// <summary>
+    /// homeTerritoryId ist die (aufgelöste, siehe Plugin.ResolveEffectiveTerritoryId) Zone, in der
+    /// die Automation gestartet wurde - führt eine Quest den Charakter anderswohin und endet dort
+    /// auch (siehe TryTravelHome), reist die Automation danach automatisch per Lifestream wieder
+    /// hierher zurück, statt einfach dort weiterzumachen, wo die Quest zufällig endete.
+    /// </summary>
+    public void Start(uint homeTerritoryId)
     {
         IsActive = true;
         state = State.Idle;
         currentQuestId = null;
+        this.homeTerritoryId = homeTerritoryId;
+        travelHomeFinishedAt = null;
+        runningWentFalseAt = null;
         skippedQuestIds.Clear();
         attemptCounts.Clear();
         StatusText = Loc.T("Automation gestartet...", "Automation started...");
@@ -141,6 +246,8 @@ public sealed class QuestAutomation
         IsActive = false;
         state = State.Idle;
         currentQuestId = null;
+        homeTerritoryId = null;
+        StopLifestream();
 
         try
         {
@@ -152,18 +259,45 @@ public sealed class QuestAutomation
         }
     }
 
+    private bool IsLifestreamAvailable()
+    {
+        try
+        {
+            return lifestreamTeleport.HasFunction && lifestreamIsBusy.HasFunction;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void StopLifestream()
+    {
+        try
+        {
+            if (lifestreamAbort.HasAction)
+                lifestreamAbort.InvokeAction();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error(ex, "Fehler beim Abbrechen von Lifestream.");
+        }
+    }
+
     public void MarkUnavailable()
     {
         StatusText = Loc.T("Questionable nicht gefunden - bitte installieren.", "Questionable not found - please install it.");
     }
 
     /// <summary>
-    /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Quests der
-    /// Zone aufgerufen werden. Startet nach und nach jede Quest per Questionable-IPC und wartet
-    /// jeweils, bis Questionable sie abgeschlossen hat (oder nicht unterstützt), bevor die
-    /// nächste angestoßen wird.
+    /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Quests DER
+    /// STARTZONE (siehe Start) und der aktuell aufgelösten Zone des Spielers aufgerufen werden.
+    /// Startet nach und nach jede Quest per Questionable-IPC und wartet jeweils, bis Questionable
+    /// sie abgeschlossen hat (oder nicht unterstützt), bevor die nächste angestoßen wird. Landet
+    /// der Charakter zwischendurch (durch eine Quest) in einer anderen Zone, wird zwischen zwei
+    /// Quests automatisch zur Startzone zurückgereist (siehe TryTravelHome), bevor es weitergeht.
     /// </summary>
-    public void Update(IReadOnlyList<CollectibleEntry> missingQuestsInZone)
+    public void Update(IReadOnlyList<CollectibleEntry> missingQuestsInZone, uint currentEffectiveTerritoryId)
     {
         if (!IsActive)
             return;
@@ -173,14 +307,22 @@ public sealed class QuestAutomation
             switch (state)
             {
                 case State.Idle:
-                    TryStartNext(missingQuestsInZone);
+                    // Split-Hauptstädte (Ul'dah etc.) zählen als EIN Zuhause, egal in welchem
+                    // Bezirk man gerade steht (siehe Plugin.GetSplitCityTerritories) - konsistent
+                    // damit, wie missingQuestsInZone selbst zonenübergreifend zusammengestellt wird.
+                    var isHome = !homeTerritoryId.HasValue
+                                 || Plugin.GetSplitCityTerritories(homeTerritoryId.Value).Contains(currentEffectiveTerritoryId);
+                    if (isHome)
+                        TryStartNext(missingQuestsInZone);
+                    else
+                        TryTravelHome(currentEffectiveTerritoryId);
                     break;
 
                 case State.WaitingForPickup:
                     if (isRunning.InvokeFunc())
                     {
                         state = State.Running;
-                        StatusText = Loc.T("Questionable arbeitet an der Quest...", "Questionable is working on the quest...");
+                        StatusText = Loc.T($"Bearbeite: {currentQuestName}...", $"Processing: {currentQuestName}...");
                     }
                     else if (DateTime.UtcNow - stateEnteredAt > PickupTimeout)
                     {
@@ -189,14 +331,40 @@ public sealed class QuestAutomation
                     break;
 
                 case State.Running:
-                    if (!isRunning.InvokeFunc())
+                    if (isRunning.InvokeFunc())
                     {
-                        // Fertig (erledigt, abgebrochen oder Questionable ist von selbst gestoppt) -
-                        // ob die Quest jetzt tatsächlich abgeschlossen ist, entscheidet die Liste
-                        // beim nächsten Update: taucht sie noch auf, wird es (bis MaxAttemptsPerQuest) erneut versucht.
-                        state = State.Idle;
-                        currentQuestId = null;
+                        runningWentFalseAt = null;
                     }
+                    else
+                    {
+                        // Erst nach ein paar Sekunden DURCHGEHEND false als "fertig" werten, nicht
+                        // schon beim ersten Mal: Bei quest-internen Zonenwechseln (z.B. "Tougher
+                        // Than Leather" führt von Ul'dah nach Central Thanalan) meldet Questionable
+                        // während des Ladebildschirms teils kurz IsRunning==false, obwohl die Quest
+                        // gleich danach ganz normal weiterläuft. Ohne diese Gnadenfrist hätte das
+                        // hier fälschlich "fertig" ausgelöst - und im nächsten Idle-Durchlauf, weil
+                        // die aktuelle Zone dann nicht mehr die Startzone ist, eine Rückreise per
+                        // Lifestream, die die laufende Quest komplett durcheinanderbringt (Charakter
+                        // wird mitten aus der Quest herausteleportiert, während Questionable selbst
+                        // munter weitermacht) und im schlimmsten Fall die ganze Automation stoppt.
+                        runningWentFalseAt ??= DateTime.UtcNow;
+                        if (DateTime.UtcNow - runningWentFalseAt.Value > RunningFalseGracePeriod)
+                        {
+                            // Fertig (erledigt, abgebrochen oder Questionable ist von selbst gestoppt) -
+                            // ob die Quest jetzt tatsächlich abgeschlossen ist, entscheidet die Liste
+                            // beim nächsten Update: taucht sie noch auf, wird es (bis MaxAttemptsPerQuest) erneut versucht.
+                            // Die Zonen-Prüfung (siehe oben) passiert erst im NÄCHSTEN Update-Aufruf im
+                            // Idle-Zweig - nicht hier mitten in der Quest, sonst würde eine gerade von
+                            // Questionable selbst durchgeführte Reise unterbrochen.
+                            runningWentFalseAt = null;
+                            state = State.Idle;
+                            currentQuestId = null;
+                        }
+                    }
+                    break;
+
+                case State.TravelingHome:
+                    UpdateTravelingHome();
                     break;
             }
         }
@@ -205,6 +373,111 @@ public sealed class QuestAutomation
             Plugin.Log.Error(ex, "Fehler bei der Questionable-Automation - wird gestoppt.");
             StatusText = Loc.T("Fehler bei Questionable - Automation gestoppt.", "Error talking to Questionable - automation stopped.");
             Stop();
+        }
+    }
+
+    /// <summary>
+    /// Reist zurück zur Zone, in der die Automation gestartet wurde - zuerst per kostenlosem
+    /// Aethernetz-Sprung (funktioniert nur in Reichweite derselben Stadt), sonst per kostenpflichtiger
+    /// Lifestream-Teleport-Aktion. Schlägt auch die ab (z.B. "Insufficient gil"), wird NICHT gewartet
+    /// und die Rückreise nicht wiederholt: die aktuelle Zone wird stattdessen einfach zur neuen
+    /// "Startzone", und es geht direkt mit den dortigen fehlenden Quests weiter (falls keine mehr da
+    /// sind, endet die Automation dann ganz regulär über "Keine Quests mehr übrig"). Nur ohne
+    /// Lifestream selbst wird sofort gestoppt, da dann auch kein Aethernetz-Sprung möglich wäre.
+    /// </summary>
+    private void TryTravelHome(uint currentEffectiveTerritoryId)
+    {
+        if (!homeTerritoryId.HasValue)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (!IsLifestreamAvailable())
+        {
+            StatusText = Loc.T(
+                "Kann nicht zur Startzone zurückreisen (Lifestream nicht gefunden) - Automation gestoppt.",
+                "Can't travel back to the starting zone (Lifestream not found) - automation stopped.");
+            Stop();
+            return;
+        }
+
+        var homeDistrictIds = Plugin.GetSplitCityTerritories(homeTerritoryId.Value);
+
+        // Erst kostenlos per Aethernetz versuchen - klappt nur, wenn man noch in Reichweite
+        // desselben Stadtnetzwerks ist (z.B. die Quest hat nur in einen Nachbarbezirk geführt),
+        // kostet aber im Erfolgsfall kein Gil und keinen Ladebildschirm.
+        foreach (var territory in homeDistrictIds)
+        {
+            var anyUnlockedId = Plugin.FindAnyUnlockedAetheryteInTerritory(territory);
+            if (anyUnlockedId == null)
+                continue;
+
+            if (lifestreamAethernetTeleportById.InvokeFunc(anyUnlockedId.Value))
+            {
+                state = State.TravelingHome;
+                stateEnteredAt = DateTime.UtcNow;
+                travelHomeFinishedAt = null;
+                StatusText = Loc.T("Reise zurück zur Startzone (Aethernetz)...", "Traveling back to the starting zone (aethernet)...");
+                return;
+            }
+        }
+
+        // Manche geteilte Hauptstädte (z.B. Ul'dah) haben nur EINEN großen Aetheryten für die ganze
+        // Stadt, physisch in nur einem Bezirk - daher über alle Bezirke der Startzone suchen, nicht
+        // nur exakt den, in dem gestartet wurde.
+        uint? mainAetheryteId = null;
+        foreach (var territory in homeDistrictIds)
+        {
+            mainAetheryteId = Plugin.FindUnlockedMainAetheryteId(territory);
+            if (mainAetheryteId != null)
+                break;
+        }
+
+        // Weder Aethernetz noch bezahlter Teleport möglich (kein Aetheryte dort freigeschaltet, oder
+        // der Teleport wurde abgelehnt, z.B. "Insufficient gil") - statt endlos zu warten oder ganz
+        // zu stoppen, wird die aktuelle Zone einfach zur neuen "Startzone": die Automation macht
+        // direkt hier mit den dortigen fehlenden Quests weiter (gibt es dort keine mehr, beendet sie
+        // sich gleich danach ganz regulär über "Keine Quests mehr übrig").
+        var accepted = mainAetheryteId.HasValue && lifestreamTeleport.InvokeFunc(mainAetheryteId.Value, (byte)0);
+        if (!accepted)
+        {
+            homeTerritoryId = currentEffectiveTerritoryId;
+            state = State.Idle;
+            StatusText = Loc.T(
+                "Rückreise nicht möglich (z.B. zu wenig Gil) - mache stattdessen hier weiter.",
+                "Trip back not possible (e.g. not enough gil) - continuing from here instead.");
+            return;
+        }
+
+        state = State.TravelingHome;
+        stateEnteredAt = DateTime.UtcNow;
+        travelHomeFinishedAt = null;
+        StatusText = Loc.T("Reise zurück zur Startzone...", "Traveling back to the starting zone...");
+    }
+
+    private void UpdateTravelingHome()
+    {
+        if (!lifestreamIsBusy.InvokeFunc())
+        {
+            // Kurz warten, bis sich Plugin.ClientState.TerritoryType tatsächlich auf die neue Zone
+            // aktualisiert hat (siehe TravelHomeSettleDelay) - sonst hält der nächste Update-Aufruf
+            // die Zone noch für die alte und reist prompt wieder los.
+            travelHomeFinishedAt ??= DateTime.UtcNow;
+            if (DateTime.UtcNow - travelHomeFinishedAt.Value < TravelHomeSettleDelay)
+                return;
+
+            travelHomeFinishedAt = null;
+            state = State.Idle;
+            return;
+        }
+
+        travelHomeFinishedAt = null;
+        if (DateTime.UtcNow - stateEnteredAt > TravelHomeTimeout)
+        {
+            StopLifestream();
+            state = State.Idle;
+            StatusText = Loc.T("Rückreise dauert zu lange - abgebrochen", "Trip back took too long - aborted");
         }
     }
 
@@ -240,8 +513,10 @@ public sealed class QuestAutomation
         }
 
         currentQuestId = next.Id;
+        currentQuestName = next.Name;
         state = State.WaitingForPickup;
         stateEnteredAt = DateTime.UtcNow;
+        runningWentFalseAt = null;
         StatusText = Loc.T($"Starte: {next.Name}...", $"Starting: {next.Name}...");
     }
 
@@ -253,5 +528,6 @@ public sealed class QuestAutomation
         StatusText = Loc.T($"Übersprungen ({reason})", $"Skipped ({reason})");
         state = State.Idle;
         currentQuestId = null;
+        runningWentFalseAt = null;
     }
 }

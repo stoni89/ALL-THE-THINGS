@@ -58,7 +58,9 @@ public class CompactOverlayWindow : Window
         ImGui.PushStyleVar(ImGuiStyleVar.WindowRounding, 10f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new Vector2(12, 10));
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.09f, 0.09f, 0.11f, alpha));
+        // Dieselbe Grundfarbe wie das Optionsfenster (siehe ModernUi.PushStyle) - bei Transparenz=0
+        // (voll undurchsichtig) sehen beide Fenster damit identisch aus.
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.055f, 0.063f, 0.098f, alpha));
         ImGui.PushStyleColor(ImGuiCol.ResizeGrip, ResizeGripColor);
         ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, ResizeGripHoveredColor);
         ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, ResizeGripActiveColor);
@@ -123,7 +125,11 @@ public class CompactOverlayWindow : Window
         var missingQuests = allForZone
             .Where(e => e.Type == CollectibleType.Quest && !plugin.IsOwned(e))
             .ToList();
-        plugin.QuestAutomation.Update(missingQuests);
+
+        // Unabhängig davon, ob die Automation läuft - damit die rote "Nicht unterstützt"-Markierung
+        // schon beim Betreten der Zone erscheint, statt erst nach einem gestarteten Automation-Lauf.
+        plugin.QuestAutomation.RefreshSupportStatus(missingQuests);
+        plugin.QuestAutomation.Update(missingQuests, effectiveTerritoryId);
 
         // Bewusst die ganze Stadt (inkl. Kristalle aus Nachbarbezirken einer geteilten Hauptstadt,
         // siehe allForZone) - die Automation reist bei Bedarf selbst mit Lifestream zwischen den
@@ -141,7 +147,7 @@ public class CompactOverlayWindow : Window
         var hasActionableQuests = missingQuests.Any(q => !plugin.QuestAutomation.IsKnownUnsupported(q.Id));
         var hasActionableAetherytes = missingAetherytesCity.Count > 0;
 
-        DrawQuestAutomationButton(hasActionableQuests);
+        DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
         ImGui.SameLine();
         DrawAetheryteAutomationButton(hasActionableAetherytes);
 
@@ -302,7 +308,7 @@ public class CompactOverlayWindow : Window
     /// ist es nicht installiert/geladen, wird das per Tooltip erklärt statt der Knopf einfach
     /// nichts zu tun.
     /// </summary>
-    private void DrawQuestAutomationButton(bool hasActionableQuests)
+    private void DrawQuestAutomationButton(bool hasActionableQuests, uint effectiveTerritoryId)
     {
         var automation = plugin.QuestAutomation;
         var label = automation.IsActive
@@ -349,7 +355,7 @@ public class CompactOverlayWindow : Window
         }
         else if (automation.IsQuestionableAvailable())
         {
-            automation.Start();
+            automation.Start(effectiveTerritoryId);
         }
         else
         {
