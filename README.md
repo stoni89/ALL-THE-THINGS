@@ -6,7 +6,8 @@ missing in the current zone – inspired by "All the Things" from World of Warcr
 ## Features
 
 - **Supported categories:** Mounts, minions, orchestrion rolls, bardings,
-  emotes, facewear (glasses), fashion accessories, and Triple Triad cards.
+  emotes, facewear (glasses), fashion accessories, Triple Triad cards, and
+  portrait frames.
 - **Compact overlay** – a slim, borderless companion window that shows only
   missing collectibles for the current zone. Freely movable, resizable, and
   adjustable in transparency.
