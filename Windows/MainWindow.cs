@@ -18,6 +18,7 @@ public class MainWindow : Window
     private enum RailPage
     {
         Settings,
+        Dependencies,
         About,
     }
 
@@ -38,10 +39,16 @@ public class MainWindow : Window
     // Kopfzeilen-Bandhöhe und Titel-Skalierung je Zustand (siehe DrawCustomHeader) - eingeklappt
     // bewusst kleiner, damit die Titelleiste dann wirklich kompakt wirkt, statt (wie zuvor) immer
     // gleich hoch zu bleiben und nur das Fenster darunter wegzuschneiden.
-    private const float HeaderBandHeightExpanded = 60f;
+    private const float HeaderBandHeightExpanded = 52f;
     private const float HeaderBandHeightCollapsed = 16f;
-    private const float TitleScaleExpanded = 2.4f;
+    private const float TitleScaleExpanded = 2.0f;
     private const float TitleScaleCollapsed = 0.9f;
+
+    // Eigener, vom Titeltext entkoppelter Skalierungsfaktor fürs Icon - entspricht bewusst dem
+    // ALTEN TitleScaleExpanded-Wert, damit das Icon exakt gleich groß bleibt, obwohl der Titeltext
+    // jetzt kleiner skaliert wird (das Icon war vorher an die gerenderte Texthöhe gekoppelt, siehe
+    // DrawCustomHeader-Kommentar dort).
+    private const float IconSizeScale = 2.4f;
 
     // WindowPadding bleibt in beiden Zuständen identisch (siehe PreDraw) - genau das war der Grund
     // für das gemeldete "Verschieben" der Titelleiste beim Ein-/Ausklappen: Ein unterschiedliches
@@ -83,7 +90,6 @@ public class MainWindow : Window
             (FontAwesomeIcon.Cog, Loc.T("Allgemein", "General"), DrawGeneralTab),
             (FontAwesomeIcon.Desktop, Loc.T("Anzeige", "Display"), DrawDisplayTab),
             (FontAwesomeIcon.Bolt, "QoL", DrawQoLTab),
-            (FontAwesomeIcon.Plug, Loc.T("Abhängigkeiten", "Dependencies"), DrawDependenciesTab),
             (FontAwesomeIcon.Bug, Loc.T("Debug", "Debug"), DrawDebugTab),
         };
 
@@ -208,23 +214,41 @@ public class MainWindow : Window
         if (!usingTitleFont)
             ImGui.SetWindowFontScale(collapsed ? TitleScaleCollapsed : TitleScaleExpanded);
 
-        // Höhe direkt am tatsächlich gerenderten Titeltext gemessen (statt nur an der generischen
-        // Zeilenhöhe) - so ist das Icon garantiert exakt so groß wie der Text daneben, unabhängig
-        // davon, welche Schrift/welcher Skalierungsfaktor gerade aktiv ist.
+        // Texthöhe direkt am tatsächlich gerenderten Titeltext gemessen (statt nur an der
+        // generischen Zeilenhöhe), damit die Zentrierung stimmt, unabhängig davon, welche Schrift/
+        // welcher Skalierungsfaktor gerade aktiv ist. Icon-Größe bewusst NICHT mehr daran gekoppelt
+        // (siehe IconSizeScale) - eingeklappt bleibt es dagegen weiterhin an den Text gekoppelt,
+        // da dort ohnehin alles gemeinsam einfach skaliert wird.
         const string titleText = "All The Things";
         var titleLineHeight = ImGui.CalcTextSize(titleText).Y;
-        var rowStartY = bandStartY + (headerBandHeight - titleLineHeight) * 0.5f;
-        ImGui.SetCursorPosY(rowStartY);
+        var iconSize = collapsed ? titleLineHeight : Plugin.PluginInterface.UiBuilder.FontDefaultSizePx * IconSizeScale;
+        var rowHeight = MathF.Max(titleLineHeight, iconSize);
+        var rowStartY = bandStartY + (headerBandHeight - rowHeight) * 0.5f;
+        ImGui.SetCursorPosY(rowStartY + (rowHeight - iconSize) * 0.5f);
 
         var headerIcon = Plugin.TextureProvider.GetFromFile(IconPath).GetWrapOrEmpty();
-        ImGui.Image(headerIcon.Handle, new Vector2(titleLineHeight, titleLineHeight));
+        ImGui.Image(headerIcon.Handle, new Vector2(iconSize, iconSize));
 
         ImGui.SameLine();
+        ImGui.SetCursorPosY(rowStartY + (rowHeight - titleLineHeight) * 0.5f);
         ImGui.TextUnformatted(titleText);
 
         if (!usingTitleFont)
             ImGui.SetWindowFontScale(1f);
         titleFontPush?.Dispose();
+
+        // Warnhinweis mittig in der Titelleiste (horizontal UND vertikal), statt neben dem Titeltext
+        // zu kleben - in normaler (nicht der großen Titel-) Schriftgröße, daher erst NACH dem
+        // Dispose des Titelschrift-Handles gezeichnet.
+        if (!collapsed && HasMissingRequiredDependency())
+        {
+            var badgeText = Loc.T("Plugin benötigt", "Plugin needed");
+            var badgeSize = MeasureDotBadgeSize(badgeText);
+            ImGui.SetCursorPos(new Vector2(
+                bandStartX + (regionMaxXEarly - bandStartX - badgeSize.X) * 0.5f,
+                bandStartY + (headerBandHeight - badgeSize.Y) * 0.5f));
+            DrawDotBadge(badgeText, new Vector4(0.95f, 0.35f, 0.55f, 1f), new Vector4(0.95f, 0.35f, 0.55f, 0.15f), new Vector4(0.95f, 0.35f, 0.55f, 0.6f), new Vector4(1f, 0.75f, 0.85f, 1f));
+        }
 
         var regionMaxX = ImGui.GetWindowContentRegionMax().X;
         var spacing = ImGui.GetStyle().ItemSpacing.X;
@@ -235,7 +259,7 @@ public class MainWindow : Window
             // Icon-Schriftgröße ohne Innenabstand - ohne diesen Ausgleich würden die Buttons zu
             // weit oben in der (jetzt höheren) Kopfzeile kleben statt mittig zu sitzen.
             var buttonLineHeight = ImGui.GetTextLineHeight();
-            var buttonYOffset = (titleLineHeight - buttonLineHeight) * 0.5f;
+            var buttonYOffset = (rowHeight - buttonLineHeight) * 0.5f;
             var buttonWidth = ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X + ImGui.GetStyle().FramePadding.X * 2f;
 
             // Im Ruhezustand transparent (verschmilzt mit dem normalen Fensterhintergrund) - nur
@@ -283,25 +307,46 @@ public class MainWindow : Window
 
         if (!collapsed)
         {
-            const float railWidth = 40f;
-            const float sidebarWidth = 160f;
+            const float railWidth = 48f;
+            const float sidebarWidth = 200f;
 
             ImGui.BeginChild("##OptionsRail", new Vector2(railWidth, 0f), false, ImGuiWindowFlags.NoScrollbar);
             ImGui.Spacing();
             if (ModernUi.RailButton(FontAwesomeIcon.SlidersH, railPage == RailPage.Settings, Loc.T("Einstellungen", "Settings")))
                 railPage = RailPage.Settings;
             ImGui.Spacing();
+            if (ModernUi.RailButton(FontAwesomeIcon.Plug, railPage == RailPage.Dependencies, Loc.T("Plugins", "Plugins"), HasMissingRequiredDependency()))
+                railPage = RailPage.Dependencies;
+            ImGui.Spacing();
             if (ModernUi.RailButton(FontAwesomeIcon.InfoCircle, railPage == RailPage.About, Loc.T("Über", "About")))
                 railPage = RailPage.About;
             ImGui.EndChild();
 
-            ImGui.SameLine();
+            // Vertikale Trennlinie über die volle Höhe der Icon-Leiste (siehe Referenzbild) - von
+            // Hand in die Draw-List gezeichnet, statt Separator() zu benutzen: das erkennt "zwischen
+            // zwei per SameLine() verbundenen Elementen" nur bei normalen Widgets als vertikal, NICHT
+            // zwischen zwei Child-Fenstern (hätte sonst fälschlich eine horizontale Linie oberhalb
+            // des nächsten Inhalts gezeichnet, statt neben den Icons zu stehen). Die Icon-Leiste hat
+            // Höhe 0 (= "volle verfügbare Höhe") bekommen, ihr Item-Rect reicht deshalb bereits von
+            // ganz oben bis ganz unten im Inhaltsbereich.
+            // Getrennte Abstände statt eines gemeinsamen Werts - die Linie soll nah an den Icons
+            // bleiben, während zwischen ihr und "Settings"/den Tab-Knöpfen deutlich mehr Luft ist.
+            const float railToDividerGap = 10f;
+            const float dividerToSidebarGap = 26f;
+            var railMin = ImGui.GetItemRectMin();
+            var railMax = ImGui.GetItemRectMax();
+            var dividerX = railMax.X + railToDividerGap;
+            ImGui.GetWindowDrawList().AddLine(new Vector2(dividerX, railMin.Y), new Vector2(dividerX, railMax.Y), ImGui.GetColorU32(ImGuiCol.Separator));
+
+            // Bewusst etwas Abstand zur Trennlinie (statt direkt SameLine()) - im Referenzbild
+            // beginnt "Settings" sichtbar rechts von der Linie, nicht direkt daran klebend.
+            ImGui.SameLine(0f, railToDividerGap + dividerToSidebarGap);
 
             if (railPage == RailPage.Settings)
             {
                 ImGui.BeginChild("##OptionsSidebar", new Vector2(sidebarWidth, 0f), false, ImGuiWindowFlags.NoScrollbar);
                 ImGui.Spacing();
-                ImGui.SetWindowFontScale(1.1f);
+                ImGui.SetWindowFontScale(1.5f);
                 ImGui.TextUnformatted(Loc.T("Einstellungen", "Settings"));
                 ImGui.SetWindowFontScale(1f);
                 ImGui.Spacing();
@@ -326,6 +371,15 @@ public class MainWindow : Window
                 ImGui.Unindent(4f);
                 ImGui.EndChild();
             }
+            else if (railPage == RailPage.Dependencies)
+            {
+                ImGui.BeginChild("##DependenciesContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.Spacing();
+                ImGui.Indent(4f);
+                DrawDependenciesPage();
+                ImGui.Unindent(4f);
+                ImGui.EndChild();
+            }
             else
             {
                 ImGui.BeginChild("##AboutContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
@@ -340,10 +394,6 @@ public class MainWindow : Window
 
     private void DrawAboutPage()
     {
-        ModernUi.SectionHeader(
-            Loc.T("Über", "About"),
-            Loc.T("Sammel-Tracker pro Karte, inspiriert von \"All the Things\".", "Per-map collectible tracker, inspired by \"All the Things\"."));
-
         // Bewusst OHNE Karte drumherum - nur das Icon selbst, groß und horizontal zentriert.
         const float aboutIconSize = 160f;
         var aboutIcon = Plugin.TextureProvider.GetFromFile(IconPath).GetWrapOrEmpty();
@@ -366,33 +416,188 @@ public class MainWindow : Window
         ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
         ImGui.TextUnformatted(versionText);
         ImGui.PopStyleColor();
+
+        // Deutlich mehr Luft zur Versionsnummer, statt der Karte direkt darunter kleben zu lassen.
+        ImGui.Dummy(new Vector2(0f, 28f));
+
+        DrawSupportCard(availWidth);
+        DrawConnectSection();
+    }
+
+    /// <summary>
+    /// Unterstützungs-Karte: Herz-Icon in einem umrandeten Kreis, zentrierter Titel, links-
+    /// bündiger Absatz und ein über die volle Kartenbreite gehender Ko-fi-Knopf, mit eigenfarbigem
+    /// (statt dem sonst überall gedämpften grauen) Kartenrand, damit die Karte bewusst heraussticht.
+    /// Bewusst schmaler als der restliche Inhaltsbereich, mit demselben Abstand links (zur
+    /// Trennlinie der Icon-Leiste) wie rechts (zum Fensterrand) - <paramref name="outerAvailWidth"/>
+    /// ist die volle Breite des Inhaltsbereichs, gemessen VOR jedem kartenspezifischen Einzug.
+    /// </summary>
+    private static void DrawSupportCard(float outerAvailWidth)
+    {
+        // EndCard() legt am Ende noch einmal denselben CardMargin außen an - daher wird zusätzlich
+        // zum eigenen, größeren Rand auch 2x CardMargin abgezogen, damit die Karte am Ende exakt
+        // outerMargin von der Trennlinie UND vom Fensterrand entfernt landet (siehe Herleitung in
+        // den Commit-Notizen: Indent(outerMargin) VOR BeginCard(), Unindent(outerMargin) NACH
+        // EndCard(), symmetrisch).
+        const float outerMargin = 40f;
+        ImGui.Indent(outerMargin);
+        ModernUi.BeginCard();
+        var innerAvail = outerAvailWidth - outerMargin * 2f - ModernUi.CardMargin * 2f;
+        var drawList = ImGui.GetWindowDrawList();
+        var accent = ModernUi.Accent;
+
+        const float iconDiameter = 52f;
+        var iconTopLeft = ImGui.GetCursorScreenPos() + new Vector2((innerAvail - iconDiameter) * 0.5f, 0f);
+        var iconCenter = iconTopLeft + new Vector2(iconDiameter * 0.5f, iconDiameter * 0.5f);
+        drawList.AddCircleFilled(iconCenter, iconDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(new Vector4(accent.X, accent.Y, accent.Z, 0.18f)), 32);
+        drawList.AddCircle(iconCenter, iconDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(accent), 32, 1.5f);
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            var glyph = FontAwesomeIcon.Heart.ToIconString();
+            var glyphSize = ImGui.CalcTextSize(glyph);
+            drawList.AddText(iconCenter - glyphSize * 0.5f, ImGui.ColorConvertFloat4ToU32(accent), glyph);
+        }
+        ImGui.Dummy(new Vector2(innerAvail, iconDiameter));
         ImGui.Spacing();
 
-        ModernUi.GroupLabel(Loc.T("Beschreibung", "Description"));
-        ModernUi.BeginCard();
-        TextDisabledWrapped(Loc.T(
-            "Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion " +
-            "Accessories, Triple-Triad-Karten und Portrait-Rahmen in der aktuellen Zone noch fehlen. " +
-            "Die Quest- und Aetheryten-Automation können zusätzlich Questionable bzw. vnavmesh/Lifestream " +
-            "steuern, um fehlende Quests und Aetheryten/Kristalle automatisch abzuarbeiten.",
-            "Shows which mounts, minions, orchestrion rolls, bardings, emotes, facewear, fashion " +
-            "accessories, Triple Triad cards, and portrait frames are still missing in the current zone. " +
-            "The quest and aetheryte automations can additionally drive Questionable and vnavmesh/" +
-            "Lifestream to automatically work through missing quests and aetherytes/crystals."));
-        ModernUi.EndCard();
-
-        ModernUi.GroupLabel(Loc.T("Unterstützung", "Support"));
-        ModernUi.BeginCard();
-        TextDisabledWrapped(Loc.T(
-            "Gefällt dir das Plugin? Über eine kleine Unterstützung auf Ko-fi freue ich mich sehr.",
-            "Enjoying the plugin? A small tip on Ko-fi is very appreciated."));
+        var title = Loc.T("Aus Leidenschaft entwickelt", "Built with passion");
+        ImGui.SetWindowFontScale(1.1f);
+        var titleWidth = ImGui.CalcTextSize(title).X;
+        if (innerAvail > titleWidth)
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (innerAvail - titleWidth) * 0.5f);
+        ImGui.TextUnformatted(title);
+        ImGui.SetWindowFontScale(1f);
         ImGui.Spacing();
-        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.6f, 0.42f, 0.15f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.75f, 0.52f, 0.2f, 1f));
-        if (ImGui.Button(Loc.T("Auf Ko-fi unterstützen", "Support on Ko-fi") + "##AboutKofi"))
+
+        // Eigener Textumbruch statt des gemeinsamen TextDisabledWrapped-Helfers: der Helfer
+        // berechnet die Umbruchbreite aus dem LIVE ImGui-Inhaltsbereich, der hier (wegen des
+        // zusätzlichen outerMargin-Einzugs) breiter wäre als innerAvail - der Text würde sonst über
+        // den sichtbaren Kartenrand hinauslaufen.
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.PushTextWrapPos(ImGui.GetCursorPosX() + innerAvail);
+        ImGui.TextWrapped(Loc.T(
+            "Dieses Plugin entsteht Update für Update in meiner Freizeit. Falls es dir das Spiel etwas " +
+            "leichter macht, ist eine kleine Spende auf Ko-fi eine schöne Geste - ganz ohne Verpflichtung. " +
+            "Danke, dass du dabei bist!",
+            "This plugin is built update by update in my free time. If it's made your playtime a little " +
+            "easier, a small Ko-fi donation is a nice gesture - never expected. Thanks for being part of this!"));
+        ImGui.PopTextWrapPos();
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+
+        ImGui.PushStyleColor(ImGuiCol.Button, accent);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ModernUi.AccentHover);
+        if (IconTextButton("AboutKofi", FontAwesomeIcon.MugHot, Loc.T("Auf Ko-fi unterstützen", "Support on Ko-fi"), new Vector2(innerAvail, 0f)))
             Util.OpenLink("https://ko-fi.com/horstbrot");
         ImGui.PopStyleColor(2);
-        ModernUi.EndCard();
+
+        ModernUi.EndCard(borderColor: new Vector4(accent.X, accent.Y, accent.Z, 0.55f));
+        ImGui.Unindent(outerMargin);
+    }
+
+    /// <summary>
+    /// Button, dessen sichtbarer Inhalt (Icon + Text) komplett manuell in die Draw-List gezeichnet
+    /// wird, statt einen kombinierten "Icon Text"-String direkt an ImGui.Button zu übergeben - ein
+    /// einzelner String kann nur in EINER Schrift gerendert werden, die Icon-Schrift enthält aber
+    /// keine normalen Buchstaben (Text wäre unlesbar) und die Standardschrift enthält nicht jedes
+    /// Icon-Glyph (führte dazu, dass z.B. MugHot/CodeBranch als leere Fläche statt als Symbol
+    /// erschienen). ImGui.Button bekommt daher ein unsichtbares Label ("##id") und übernimmt nur
+    /// Größe/Klick/Hover-Optik, der eigentliche Inhalt kommt hinterher on top.
+    /// </summary>
+    private static bool IconTextButton(string id, FontAwesomeIcon icon, string text, Vector2 size)
+    {
+        var clicked = ImGui.Button($"##{id}", size);
+        var min = ImGui.GetItemRectMin();
+        var max = ImGui.GetItemRectMax();
+        var drawList = ImGui.GetWindowDrawList();
+        var textColor = ImGui.GetColorU32(ImGuiCol.Text);
+
+        const float gap = 8f;
+        string iconGlyph;
+        Vector2 iconSize;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            iconGlyph = icon.ToIconString();
+            iconSize = ImGui.CalcTextSize(iconGlyph);
+        }
+        var textSize = ImGui.CalcTextSize(text);
+        var contentWidth = iconSize.X + gap + textSize.X;
+        var contentStartX = min.X + (max.X - min.X - contentWidth) * 0.5f;
+
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            drawList.AddText(new Vector2(contentStartX, min.Y + (max.Y - min.Y - iconSize.Y) * 0.5f), textColor, iconGlyph);
+        drawList.AddText(new Vector2(contentStartX + iconSize.X + gap, min.Y + (max.Y - min.Y - textSize.Y) * 0.5f), textColor, text);
+
+        return clicked;
+    }
+
+    /// <summary>Größe, die ein per IconTextButton gezeichneter Button für Icon+Text+Innenabstand braucht.</summary>
+    private static Vector2 MeasureIconTextButtonSize(FontAwesomeIcon icon, string text, Vector2 padding)
+    {
+        float iconWidth;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            iconWidth = ImGui.CalcTextSize(icon.ToIconString()).X;
+        var textSize = ImGui.CalcTextSize(text);
+        const float gap = 8f;
+        return new Vector2(iconWidth + gap + textSize.X + padding.X * 2f, textSize.Y + padding.Y * 2f);
+    }
+
+    /// <summary>
+    /// "CONNECT"-Trenner (Linie-Text-Linie, wie im Vorgabe-Screenshot) gefolgt vom GitHub-Knopf.
+    /// </summary>
+    private static void DrawConnectSection()
+    {
+        var avail = ImGui.GetContentRegionAvail().X;
+        var label = Loc.T("VERBINDEN", "CONNECT");
+
+        string linkGlyph;
+        float linkGlyphWidth;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            linkGlyph = FontAwesomeIcon.Link.ToIconString();
+            linkGlyphWidth = ImGui.CalcTextSize(linkGlyph).X;
+        }
+        var labelWidth = ImGui.CalcTextSize(label).X;
+
+        const float iconToLabelGap = 6f;
+        const float lineGap = 10f;
+        var centerWidth = linkGlyphWidth + iconToLabelGap + labelWidth;
+        var lineWidth = MathF.Max(0f, (avail - centerWidth - lineGap * 2f) * 0.5f);
+
+        var drawList = ImGui.GetWindowDrawList();
+        var lineY = ImGui.GetCursorScreenPos().Y + ImGui.GetTextLineHeight() * 0.5f;
+        var startX = ImGui.GetCursorScreenPos().X;
+        var lineColor = ImGui.ColorConvertFloat4ToU32(ModernUi.CardBorder);
+        drawList.AddLine(new Vector2(startX, lineY), new Vector2(startX + lineWidth, lineY), lineColor);
+        drawList.AddLine(new Vector2(startX + avail - lineWidth, lineY), new Vector2(startX + avail, lineY), lineColor);
+
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + lineWidth + lineGap);
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            ImGui.TextUnformatted(linkGlyph);
+        ImGui.SameLine(0f, iconToLabelGap);
+        ImGui.TextUnformatted(label);
+        ImGui.PopStyleColor();
+
+        ImGui.Spacing();
+        ImGui.Spacing();
+
+        // Dalamuds FontAwesomeIcon-Enum enthält nur die "Solid"-Icons, keine Marken-/Brand-Icons -
+        // daher CodeBranch statt eines echten GitHub-Logos als naheliegender Ersatz für einen
+        // Quellcode-Link.
+        var githubText = Loc.T("GitHub", "GitHub");
+        var buttonSize = MeasureIconTextButtonSize(FontAwesomeIcon.CodeBranch, githubText, new Vector2(14f, 7f));
+        if (avail > buttonSize.X)
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - buttonSize.X) * 0.5f);
+
+        // Dunkles GitHub-Grau statt des sonst transparent/dezenten Knopf-Stils, damit der Knopf als
+        // eigene, erkennbare Marke heraussticht statt mit dem Hintergrund zu verschmelzen.
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.14f, 0.16f, 0.18f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.20f, 0.22f, 0.25f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.10f, 0.11f, 0.13f, 1f));
+        if (IconTextButton("AboutGitHub", FontAwesomeIcon.CodeBranch, githubText, buttonSize))
+            Util.OpenLink("https://github.com/stoni89/ALL-THE-THINGS");
+        ImGui.PopStyleColor(3);
     }
 
     private void DrawGeneralTab()
@@ -433,6 +638,8 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
         var fontScale = config.CompactFontScale;
         ModernUi.LabelRow(Loc.T("Textgröße", "Text size"), 280f);
         if (ImGui.SliderFloat("##FontScale", ref fontScale, 0.7f, 2f, "%.2f"))
@@ -441,6 +648,8 @@ public class MainWindow : Window
             config.Save();
         }
 
+        ImGui.Spacing();
+        ImGui.Separator();
         ImGui.Spacing();
         var monoLabel = Loc.T("Monospace", "Monospace");
         var standardLabel = Loc.T("Standard", "Standard");
@@ -493,6 +702,8 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
         var showWallet = config.ShowCurrencyWallet;
         if (ModernUi.ToggleRow(Loc.T("Währungen anzeigen", "Show currencies"), ref showWallet))
         {
@@ -501,16 +712,16 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
         var showGoToIcon = config.ShowGoToIcon;
         if (ModernUi.ToggleRow(Loc.T("\"Hinlaufen\"-Icon anzeigen", "Show \"go to\" icon"), ref showGoToIcon))
         {
             config.ShowGoToIcon = showGoToIcon;
             config.Save();
         }
-        TextDisabledWrapped(Loc.T(
-            "Icon neben verlinkten Einträgen, um automatisch per vnavmesh/Lifestream dorthin zu laufen.",
-            "Icon next to linked entries to automatically walk there via vnavmesh/Lifestream."));
-
+        ImGui.Spacing();
+        ImGui.Separator();
         ImGui.Spacing();
         var locked = config.CompactLocked;
         if (ModernUi.ToggleRow(Loc.T("Fenster sperren (Position & Größe)", "Lock window (position & size)"), ref locked))
@@ -527,8 +738,11 @@ public class MainWindow : Window
             var type = config.TypeOrder[i];
             ImGui.PushID(i);
 
+            // Bewusst in der ursprünglichen (kleineren) Größe belassen, nicht im per ToggleRow
+            // genutzten ToggleHeightScale - hier stehen viele Zeilen dicht untereinander, größere
+            // Schalter würden die Liste unnötig aufblähen.
             var enabled = config.ShowType.GetValueOrDefault(type, true);
-            if (ModernUi.ToggleSwitch("##TypeEnabled", ref enabled))
+            if (ModernUi.ToggleSwitch("##TypeEnabled", ref enabled, 0.8f))
             {
                 config.ShowType[type] = enabled;
                 config.Save();
@@ -575,12 +789,7 @@ public class MainWindow : Window
 
         ModernUi.SectionHeader("QoL", Loc.T("Komfortfunktionen für die Automationen.", "Convenience features for the automations."));
 
-        ModernUi.GroupLabel(Loc.T("Quest-Automation", "Quest automation"));
-        ModernUi.BeginCard();
-        TextDisabledWrapped(Loc.T("Keine Einstellungen.", "No settings."));
-        ModernUi.EndCard();
-
-        ModernUi.GroupLabel(Loc.T("Aetheryten-Automation", "Aetheryte automation"));
+        ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
         ModernUi.BeginCard();
         var useSprint = config.UseSprintOnCooldown;
         if (ModernUi.ToggleRow(Loc.T("Sprint auf Cooldown nutzen", "Use Sprint on cooldown"), ref useSprint))
@@ -590,6 +799,9 @@ public class MainWindow : Window
         }
 
         ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         DrawAetheryteMountPicker(config);
         ModernUi.EndCard();
     }
@@ -682,21 +894,12 @@ public class MainWindow : Window
             config.ShowDebugInfo = showDebug;
             config.Save();
         }
-        TextDisabledWrapped(Loc.T(
-            "Zeigt Rohzahlen (Zone/Filter/Fehlend) über der Liste im kompakten Overlay.",
-            "Shows raw counts (zone/filter/missing) above the list in the compact overlay."));
-
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
 
         if (ImGui.Button(Loc.T("Aetheryten-/Quest-Cache zurücksetzen", "Reset aetheryte/quest cache")))
             plugin.ResetLiveEntriesCache();
-        TextDisabledWrapped(Loc.T(
-            "Aetheryten und Quests werden pro Zone zwischengespeichert. Nötig, falls sich der " +
-            "Fortschritt (z.B. Questabschluss) ändert, während das Overlay in derselben Zone offen ist.",
-            "Aetherytes and quests are cached per zone. Needed if progress (e.g. completing a quest) " +
-            "changes while the overlay stays open in the same zone."));
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -709,14 +912,6 @@ public class MainWindow : Window
         {
             plugin.AetheryteAutomation.SimulateAllCrystals = simulateAll;
         }
-        TextDisabledWrapped(Loc.T(
-            "Läuft auch bereits freigeschaltete Kristalle mit ab (ohne echten Fortschrittsverlust) - " +
-            "zum Überprüfen, ob Laufweg und Reihenfolge über alle Bezirke einer Stadt hinweg korrekt " +
-            "funktionieren, ohne den eigenen Fortschritt zurücksetzen zu müssen. Nicht gespeichert - " +
-            "steht nach einem Neustart wieder aus.",
-            "Also walks through already-unlocked crystals (without losing real progress) - to check " +
-            "whether the walking order works correctly across a city's districts, without having to " +
-            "reset your own progress. Not saved - resets to off after a restart."));
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -724,13 +919,6 @@ public class MainWindow : Window
 
         if (ImGui.Button(Loc.T("Hunting-Log-Debug-Dump ins Log schreiben", "Write hunting log debug dump to log")))
             Plugin.DumpHuntingLogDebugInfo();
-        TextDisabledWrapped(Loc.T(
-            "Für den geplanten Hunting-Log-Zonenfilter: schreibt die aktuelle Klasse plus die rohen " +
-            "MonsterNoteManager-Rohdaten (Rang/Zähler je der 12 internen Slots) ins Dalamud-Log " +
-            "(/xllog) - wird zum Abgleichen gebraucht, welcher Slot zu welcher Klasse gehört.",
-            "For the planned hunting log zone filter: writes the current class plus the raw " +
-            "MonsterNoteManager data (rank/counters for each of the 12 internal slots) to the Dalamud " +
-            "log (/xllog) - needed to figure out which slot belongs to which class."));
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
@@ -743,11 +931,6 @@ public class MainWindow : Window
             ? $"{playerPos.Value.X:F3}, {playerPos.Value.Y:F3}, {playerPos.Value.Z:F3}"
             : Loc.T("nicht verfügbar", "not available");
         ImGui.TextUnformatted($"{Loc.T("Eigene Weltposition", "Own world position")}: {posText}");
-        TextDisabledWrapped(Loc.T(
-            "Zum Herausfinden begehbarer Koordinaten für die manuelle Aetheryten-Tabelle " +
-            "(ManualAetheryteWorldPositions in Plugin.cs) - einfach zum Kristall hinlaufen und hier ablesen.",
-            "To find walkable coordinates for the manual aetheryte table " +
-            "(ManualAetheryteWorldPositions in Plugin.cs) - just walk to the crystal and read it off here."));
 
         if (playerPos.HasValue && ImGui.Button(Loc.T("In Zwischenablage kopieren", "Copy to clipboard") + "##CopyPlayerPos"))
         {
@@ -758,32 +941,223 @@ public class MainWindow : Window
         ModernUi.EndCard();
     }
 
-    private static void DrawDependenciesTab()
+    private static readonly (string InternalName, string DisplayName, string DescriptionDe, string DescriptionEn, bool Required)[] Dependencies =
     {
-        ModernUi.SectionHeader(
-            Loc.T("Abhängigkeiten", "Dependencies"),
-            Loc.T("Für die Automation-Funktionen benötigte Fremdplugins.", "Third-party plugins needed for the automation features."));
+        ("vnavmesh", "vnavmesh",
+            "Für das Laufen bei allen Automationen (Aetheryte, Quest, Hunting Log, \"Hinlaufen\").",
+            "For pathfinding/walking in every automation (aetheryte, quest, hunting log, \"go to\").",
+            true),
+        ("Questionable", "Questionable",
+            "Lässt die Quest-Automation Quests automatisch annehmen und abschließen.",
+            "Drives the quest automation to accept and complete quests automatically.",
+            true),
+        ("Lifestream", "Lifestream",
+            "Für Reisen zwischen Bezirken einer geteilten Hauptstadt während der Automation.",
+            "For traveling between districts of a split capital city during automation.",
+            true),
+        ("RotationSolver", "RotationSolver Reborn",
+            "Übernimmt den Kampf bei der Hunting-Log-Kill-Automation.",
+            "Drives combat for the hunting log kill automation.",
+            true),
+    };
 
+    /// <summary>
+    /// Ob mindestens ein als "Required" markiertes Plugin aktuell nicht installiert/geladen ist -
+    /// wird sowohl für den Warn-Badge im Fenstertitel als auch den roten Punkt am Plugins-Icon in
+    /// der Seitenleiste gebraucht (siehe DrawCustomHeader/Draw).
+    /// </summary>
+    private static bool HasMissingRequiredDependency() =>
+        Dependencies.Any(d => d.Required && !Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded));
+
+    private static void DrawDependenciesPage()
+    {
+        var installed = Dependencies
+            .Select(d => Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded))
+            .ToArray();
+        var missingRequired = Dependencies.Where((d, i) => d.Required && !installed[i]).Count();
+
+        ImGui.SetWindowFontScale(1.25f);
+        ImGui.TextUnformatted(Loc.T("Plugins", "Plugins"));
+        ImGui.SetWindowFontScale(1f);
+
+        if (missingRequired > 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.95f, 0.35f, 0.4f, 1f));
+            ImGui.TextUnformatted(missingRequired == 1
+                ? Loc.T("1 benötigtes Plugin fehlt.", "1 required plugin is missing.")
+                : Loc.T($"{missingRequired} benötigte Plugins fehlen.", $"{missingRequired} required plugins are missing."));
+            ImGui.PopStyleColor();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        for (var i = 0; i < Dependencies.Length; i++)
+        {
+            var dep = Dependencies[i];
+            DrawDependencyCard(dep.InternalName, dep.DisplayName, Loc.T(dep.DescriptionDe, dep.DescriptionEn), dep.Required, installed[i]);
+            ImGui.Spacing();
+        }
+    }
+
+    /// <summary>
+    /// Eine einzelne Abhängigkeit als abgerundete Karte: kreisförmiges Status-Icon links, Name +
+    /// "BENÖTIGT"/"OPTIONAL"-Badge und Beschreibung in der Mitte, Installiert-Haken bzw.
+    /// "Installieren"-Knopf rechtsbündig.
+    /// </summary>
+    private static void DrawDependencyCard(string internalName, string displayName, string description, bool required, bool isInstalled)
+    {
         ModernUi.BeginCard();
-        DrawPluginStatus("Questionable", "Questionable");
-        TextDisabledWrapped(Loc.T(
-            "Für die Quest-Automation. Questionable hat selbst weitere Abhängigkeiten " +
-            "(z.B. je nach Quest eigene Kampf-/Bewegungs-Plugins) - siehe dessen eigene Dokumentation.",
-            "For quest automation. Questionable itself has further dependencies of its own " +
-            "(e.g. combat/movement plugins depending on the quest) - see its own documentation."));
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        const float iconDiameter = 36f;
+        var rowStart = ImGui.GetCursorScreenPos();
+        // CardMargin abziehen, genau wie bei LabelRow/ToggleRow: EndCard() legt außen noch einmal
+        // denselben Rand um den Karteninhalt, ohne den Abzug würde die Karte um CardMargin breiter
+        // werden als der restliche Inhalt (z.B. die Trennlinie über den Karten).
+        var availWidth = ImGui.GetContentRegionAvail().X - ModernUi.CardMargin;
+        var drawList = ImGui.GetWindowDrawList();
 
-        DrawPluginStatus("vnavmesh", "vnavmesh");
+        var iconColor = isInstalled ? new Vector4(0.3f, 0.75f, 0.45f, 1f) : new Vector4(0.85f, 0.3f, 0.35f, 1f);
+        var iconCenter = rowStart + new Vector2(iconDiameter * 0.5f, iconDiameter * 0.5f);
+        drawList.AddCircleFilled(iconCenter, iconDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(iconColor), 24);
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            var glyph = (isInstalled ? FontAwesomeIcon.Check : FontAwesomeIcon.Times).ToIconString();
+            var glyphSize = ImGui.CalcTextSize(glyph);
+            drawList.AddText(iconCenter - glyphSize * 0.5f, ImGui.ColorConvertFloat4ToU32(Vector4.One), glyph);
+        }
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        // Rechtsbündiger Status/Knopf - Größe zuerst berechnen, mit demselben Schriftkontext wie
+        // beim tatsächlichen Zeichnen weiter unten (Haken-Icon unter IconFontHandle, der restliche
+        // Text/Knopf in der Standardschrift), damit die Ausrichtung exakt an den rechten Rand passt.
+        var installedLabel = Loc.T("Installiert", "Installed");
+        var installLabel = Loc.T("Installieren", "Install");
 
-        DrawPluginStatus("Lifestream", "Lifestream");
+        float statusWidth;
+        if (isInstalled)
+        {
+            float checkIconWidth;
+            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                checkIconWidth = ImGui.CalcTextSize(FontAwesomeIcon.Check.ToIconString()).X;
+            statusWidth = checkIconWidth + ImGui.GetStyle().ItemSpacing.X + ImGui.CalcTextSize(installedLabel).X;
+        }
+        else
+        {
+            statusWidth = MeasureIconTextButtonSize(FontAwesomeIcon.Download, installLabel, ImGui.GetStyle().FramePadding).X;
+        }
+        var statusHeight = isInstalled ? ImGui.GetTextLineHeight() : ImGui.GetFrameHeight();
+
+        ImGui.SetCursorScreenPos(rowStart + new Vector2(iconDiameter + 12f, 0f));
+        ImGui.PushTextWrapPos(rowStart.X + availWidth - statusWidth - 20f);
+        ImGui.BeginGroup();
+
+        ImGui.TextUnformatted(displayName);
+        ImGui.SameLine();
+        DrawBadge(required ? Loc.T("BENÖTIGT", "REQUIRED") : Loc.T("OPTIONAL", "OPTIONAL"), required);
+
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextWrapped(description);
+        ImGui.PopStyleColor();
+
+        ImGui.EndGroup();
+        ImGui.PopTextWrapPos();
+
+        // Vertikal mittig über die GESAMTE Zeilenhöhe (Icon-Kreis ODER Name+Beschreibung-Block,
+        // je nachdem was höher ist) statt nur gegen den Icon-Kreis - sonst hinge der Status bei
+        // mehrzeiligen Beschreibungen zu weit oben statt mittig in der Karte.
+        var nameBlockHeight = ImGui.GetItemRectSize().Y;
+        var rowHeight = MathF.Max(iconDiameter, nameBlockHeight);
+        var statusY = rowStart.Y + (rowHeight - statusHeight) * 0.5f;
+        ImGui.SetCursorScreenPos(new Vector2(rowStart.X + availWidth - statusWidth, MathF.Max(rowStart.Y, statusY)));
+        if (isInstalled)
+        {
+            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                ImGui.TextColored(new Vector4(0.45f, 0.9f, 0.45f, 1f), FontAwesomeIcon.Check.ToIconString());
+            ImGui.SameLine();
+            ImGui.TextUnformatted(installedLabel);
+        }
+        else
+        {
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.25f, 0.45f, 0.9f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.32f, 0.53f, 0.98f, 1f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.2f, 0.38f, 0.8f, 1f));
+            var installButtonSize = new Vector2(statusWidth, ImGui.GetFrameHeight());
+            if (IconTextButton($"install_{internalName}", FontAwesomeIcon.Download, installLabel, installButtonSize))
+                Plugin.PluginInterface.OpenPluginInstallerTo(PluginInstallerOpenKind.AllPlugins, displayName);
+            ImGui.PopStyleColor(3);
+        }
+
+        // Unsichtbarer Punkt ganz rechts, damit die Karte IMMER exakt bis availWidth reicht -
+        // ohne das würde die Kartenbreite vom tatsächlich gerenderten Inhalt abhängen (Installiert-
+        // Text vs. Installieren-Knopf sind unterschiedlich breit), wodurch die Karten je nach
+        // Installationsstatus unterschiedlich breit wirkten.
+        ImGui.SetCursorScreenPos(new Vector2(rowStart.X + availWidth, rowStart.Y));
+        ImGui.Dummy(Vector2.Zero);
+
         ModernUi.EndCard();
+    }
+
+    /// <summary>Kleine abgerundete Pille mit Rahmen für "BENÖTIGT"/"OPTIONAL" neben einem Namen.</summary>
+    private static void DrawBadge(string text, bool emphasized)
+    {
+        var textSize = ImGui.CalcTextSize(text);
+        var padding = new Vector2(8f, 3f);
+        var size = textSize + padding * 2f;
+        var pos = ImGui.GetCursorScreenPos();
+        var drawList = ImGui.GetWindowDrawList();
+
+        var bg = emphasized ? new Vector4(0.25f, 0.4f, 0.85f, 0.35f) : new Vector4(1f, 1f, 1f, 0.08f);
+        var border = emphasized ? new Vector4(0.4f, 0.55f, 0.95f, 0.9f) : new Vector4(1f, 1f, 1f, 0.25f);
+        var textColor = emphasized ? new Vector4(0.7f, 0.8f, 1f, 1f) : ModernUi.TextMuted;
+
+        drawList.AddRectFilled(pos, pos + size, ImGui.ColorConvertFloat4ToU32(bg), size.Y * 0.5f);
+        drawList.AddRect(pos, pos + size, ImGui.ColorConvertFloat4ToU32(border), size.Y * 0.5f);
+        drawList.AddText(pos + padding, ImGui.ColorConvertFloat4ToU32(textColor), text);
+
+        ImGui.Dummy(size);
+    }
+
+    // Vertikales Innenpolster der Punkt-Pille (siehe DrawDotBadge) - eigene Konstante, damit der
+    // Aufrufer (Fenstertitel) dieselbe Höhe schon VOR dem Zeichnen kennt, um die Pille korrekt
+    // vertikal zu zentrieren.
+    private const float DotBadgePaddingY = 3f;
+
+    /// <summary>
+    /// Abgerundete Pille mit farbigem Punkt + Text davor, z.B. "Plugin needed" neben dem Fenster-
+    /// titel, wenn ein benötigtes Plugin fehlt (siehe HasMissingRequiredDependency).
+    /// </summary>
+    private const float DotBadgeDotDiameter = 6f;
+    private const float DotBadgeDotToTextGap = 6f;
+    private static readonly Vector2 DotBadgePadding = new(10f, DotBadgePaddingY);
+
+    /// <summary>Größe, die DrawDotBadge für den gegebenen Text zeichnen wird - zum Zentrieren VOR dem Zeichnen.</summary>
+    private static Vector2 MeasureDotBadgeSize(string text)
+    {
+        var textSize = ImGui.CalcTextSize(text);
+        return new Vector2(DotBadgeDotDiameter + DotBadgeDotToTextGap + textSize.X + DotBadgePadding.X * 2f, textSize.Y + DotBadgePadding.Y * 2f);
+    }
+
+    private static void DrawDotBadge(string text, Vector4 dotColor, Vector4 bgColor, Vector4 borderColor, Vector4 textColor)
+    {
+        const float dotDiameter = DotBadgeDotDiameter;
+        const float dotToTextGap = DotBadgeDotToTextGap;
+        var padding = DotBadgePadding;
+        var textSize = ImGui.CalcTextSize(text);
+        var size = MeasureDotBadgeSize(text);
+        var pos = ImGui.GetCursorScreenPos();
+        var drawList = ImGui.GetWindowDrawList();
+
+        drawList.AddRectFilled(pos, pos + size, ImGui.ColorConvertFloat4ToU32(bgColor), size.Y * 0.5f);
+        drawList.AddRect(pos, pos + size, ImGui.ColorConvertFloat4ToU32(borderColor), size.Y * 0.5f);
+
+        var dotCenter = pos + new Vector2(padding.X + dotDiameter * 0.5f, size.Y * 0.5f);
+        drawList.AddCircleFilled(dotCenter, dotDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(dotColor), 12);
+
+        var textPos = pos + new Vector2(padding.X + dotDiameter + dotToTextGap, padding.Y);
+        drawList.AddText(textPos, ImGui.ColorConvertFloat4ToU32(textColor), text);
+
+        ImGui.Dummy(size);
     }
 
     /// <summary>
@@ -799,27 +1173,4 @@ public class MainWindow : Window
         ImGui.PopStyleColor();
     }
 
-    /// <summary>
-    /// Zeigt Name + grüner Haken/rotes X, ob das Fremdplugin installiert UND geladen ist. Nutzt
-    /// Dalamuds eigene Plugin-Liste (InternalName), nicht IPC-Verfügbarkeit - so ist die Anzeige
-    /// unabhängig davon, ob das jeweilige Plugin überhaupt eine IPC anbietet.
-    /// </summary>
-    private static void DrawPluginStatus(string internalName, string displayName)
-    {
-        var isInstalled = Plugin.PluginInterface.InstalledPlugins
-            .Any(p => p.InternalName == internalName && p.IsLoaded);
-
-        // Unicode-Haken/Kreuz (✓/✗) fehlen in Dalamuds Standardschrift und werden als "?"
-        // dargestellt - stattdessen FontAwesome-Icons nutzen, die garantiert geladen sind.
-        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-        {
-            if (isInstalled)
-                ImGui.TextColored(new Vector4(0.45f, 0.9f, 0.45f, 1f), FontAwesomeIcon.Check.ToIconString());
-            else
-                ImGui.TextColored(new Vector4(0.9f, 0.35f, 0.35f, 1f), FontAwesomeIcon.Times.ToIconString());
-        }
-
-        ImGui.SameLine();
-        ImGui.TextUnformatted(displayName);
-    }
 }

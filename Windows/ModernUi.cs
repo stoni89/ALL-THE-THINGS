@@ -1,5 +1,7 @@
+using System;
 using System.Numerics;
 using Dalamud.Interface;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Bindings.ImGui;
 
 namespace AllTheThings.Windows;
@@ -22,6 +24,7 @@ public static class ModernUi
     public static readonly Vector4 ToggleOffHover = new(0.30f, 0.32f, 0.41f, 1f);
     public static readonly Vector4 SidebarHover = new(1f, 1f, 1f, 0.06f);
     public static readonly Vector4 SidebarSelected = new(0.32f, 0.56f, 0.95f, 0.16f);
+    public static readonly Vector4 WindowBg = new(0.055f, 0.063f, 0.098f, 1f);
 
     // Card-Innenabstand links (per ImGui.Indent in BeginCard) UND rechts - rechts gibt es dafür
     // keine ImGui-Bordfunktion, daher müssen alle rechtsbündigen Helfer hier (LabelRow, ToggleRow,
@@ -42,11 +45,18 @@ public static class ModernUi
         ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.GrabRounding, 8f);
         ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarRounding, 8f);
-        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(10f, 10f));
+        // Standardmäßig ein schmaler "Griff", der auf der Schiene schwimmt - das ließ Slider neben
+        // den (voll ausgefüllten) Dropdown-Boxen kleiner/dünner wirken, obwohl die Box selbst exakt
+        // gleich hoch ist (beide nutzen dasselbe FramePadding). Ein breiterer Griff gleicht das an.
+        ImGui.PushStyleVar(ImGuiStyleVar.GrabMinSize, 24f);
+        // Y-Anteile bewusst knapper als X (10/8) - die X-Werte betreffen den horizontalen Abstand
+        // z.B. zwischen Beschriftung und Regler in derselben Zeile, die Y-Werte die Zeilenhöhe -
+        // hier klein zu gehen macht JEDEN Einstellungspunkt (Toggle, Slider, Dropdown, ...) niedriger.
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(10f, 9f));
         ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, windowPadding ?? new Vector2(12f, 12f));
-        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(8f, 5f));
+        ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, new Vector2(10f, 5f));
 
-        ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.055f, 0.063f, 0.098f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.WindowBg, WindowBg);
         ImGui.PushStyleColor(ImGuiCol.ChildBg, new Vector4(0f, 0f, 0f, 0f));
         ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.93f, 0.94f, 0.97f, 1f));
         ImGui.PushStyleColor(ImGuiCol.FrameBg, new Vector4(0.16f, 0.18f, 0.25f, 1f));
@@ -66,16 +76,39 @@ public static class ModernUi
     public static void PopStyle()
     {
         ImGui.PopStyleColor(13);
-        ImGui.PopStyleVar(7);
+        ImGui.PopStyleVar(8);
     }
 
     /// <summary>
     /// Einzelner, quadratischer Icon-Button für die schmale äußere Navigationsleiste (wie im
     /// Referenzdesign links außen) - horizontal zentriert in der verfügbaren Breite.
     /// </summary>
-    public static bool RailButton(FontAwesomeIcon icon, bool selected, string? tooltip = null)
+    // Icon-Schriftart hätte in normaler Größe sonst viel Luft um ein recht kleines Glyph -
+    // Hochskalieren macht das Icon selbst größer, statt nur den (gleich großen) Button drumherum.
+    private const float RailIconScale = 1.7f;
+
+    private static IFontHandle? railIconFontHandle;
+
+    /// <summary>
+    /// Eigene, in nativer Pixelgröße gebaute Variante der Icon-Schrift für die Rail-Buttons -
+    /// vorher wurde die normale (kleine) Icon-Schrift per SetWindowFontScale hochskaliert, was
+    /// sichtbar verschwommen aussah (Texturvergrößerung statt echter Schriftgröße), genau wie beim
+    /// Titeltext im Fensterkopf (siehe MainWindow.GetTitleFontHandle).
+    /// </summary>
+    private static IFontHandle GetRailIconFontHandle()
     {
-        const float size = 34f;
+        railIconFontHandle ??= Plugin.PluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(e => e.OnPreBuild(tk =>
+            tk.AddFontAwesomeIconFont(new SafeFontConfig
+            {
+                SizePx = Plugin.PluginInterface.UiBuilder.FontDefaultSizePx * RailIconScale,
+            })));
+        return railIconFontHandle;
+    }
+
+    public static bool RailButton(FontAwesomeIcon icon, bool selected, string? tooltip = null, bool showDot = false)
+    {
+        const float size = 42f;
+
         var avail = ImGui.GetContentRegionAvail().X;
         var offsetX = (avail - size) * 0.5f;
         if (offsetX > 0f)
@@ -84,12 +117,44 @@ public static class ModernUi
         ImGui.PushStyleColor(ImGuiCol.Button, selected ? Accent : new Vector4(0f, 0f, 0f, 0f));
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, selected ? AccentHover : SidebarHover);
         ImGui.PushStyleColor(ImGuiCol.ButtonActive, AccentHover);
+        // Icon selbst gedämpfter grau statt des globalen (fast weißen) Text-Standards, solange
+        // nicht ausgewählt - im ausgewählten Zustand bleibt es dagegen kräftig weiß.
+        ImGui.PushStyleColor(ImGuiCol.Text, selected ? Vector4.One : TextMuted);
 
         bool clicked;
-        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-            clicked = ImGui.Button($"{icon.ToIconString()}##rail_{icon}", new Vector2(size, size));
+        var railFontHandle = GetRailIconFontHandle();
+        if (railFontHandle is { Available: true })
+        {
+            using (railFontHandle.Push())
+                clicked = ImGui.Button($"{icon.ToIconString()}##rail_{icon}", new Vector2(size, size));
+        }
+        else
+        {
+            // Schrift noch nicht fertig gebaut (z.B. kurz nach dem Start) - übergangsweise die alte
+            // Hochskalierungs-Methode, damit trotzdem sofort ein Icon zu sehen ist.
+            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            {
+                ImGui.SetWindowFontScale(RailIconScale);
+                clicked = ImGui.Button($"{icon.ToIconString()}##rail_{icon}", new Vector2(size, size));
+                ImGui.SetWindowFontScale(1f);
+            }
+        }
 
-        ImGui.PopStyleColor(3);
+        ImGui.PopStyleColor(4);
+
+        // Roter Punkt oben rechts am Button, z.B. für "hier fehlt etwas" (fehlendes benötigtes
+        // Plugin) - bewusst NACH PopStyleColor auf dem Item-Rect des schon fertig gezeichneten
+        // Buttons plaziert, statt selbst ein eigenes Item zu sein.
+        if (showDot)
+        {
+            const float dotDiameter = 10f;
+            var buttonMin = ImGui.GetItemRectMin();
+            var buttonMax = ImGui.GetItemRectMax();
+            var dotCenter = new Vector2(buttonMax.X, buttonMin.Y) + new Vector2(-dotDiameter * 0.35f, dotDiameter * 0.35f);
+            var drawList = ImGui.GetWindowDrawList();
+            drawList.AddCircleFilled(dotCenter, dotDiameter * 0.5f + 1.5f, ImGui.ColorConvertFloat4ToU32(WindowBg), 12);
+            drawList.AddCircleFilled(dotCenter, dotDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(new Vector4(0.95f, 0.3f, 0.35f, 1f)), 12);
+        }
 
         if (tooltip != null && ImGui.IsItemHovered())
             ImGui.SetTooltip(tooltip);
@@ -109,25 +174,34 @@ public static class ModernUi
         ImGui.BeginGroup();
         ImGui.GetWindowDrawList().ChannelsSplit(2);
         ImGui.GetWindowDrawList().ChannelsSetCurrent(1);
-        ImGui.Dummy(new Vector2(0f, 2f));
     }
 
-    public static void EndCard(float padding = CardMargin)
+    // Deutlich knapper als CardMargin (14, für links/rechts nötig, damit der Kartenhintergrund mit
+    // dem eingerückten Inhalt UND der GroupLabel-Überschrift darüber fluchtet) - nur oben/unten gab
+    // es keinen Grund für denselben großzügigen Wert, das ließ jede Karte unnötig hoch wirken.
+    private const float CardVerticalPadding = 10f;
+
+    // Abstand NACH einer Karte (bis zur nächsten Überschrift/Karte) - bewusst eigener, größerer Wert
+    // statt CardVerticalPadding wiederzuverwenden: CardVerticalPadding bestimmt zusätzlich die
+    // Karten-INNENhöhe, das hier soll nur den Außenabstand danach vergrößern, ohne die Karte selbst
+    // wieder aufzublähen.
+    private const float CardTrailingGap = 26f;
+
+    public static void EndCard(float paddingX = CardMargin, float paddingY = CardVerticalPadding, Vector4? borderColor = null)
     {
-        ImGui.Dummy(new Vector2(0f, 2f));
         ImGui.EndGroup();
 
-        var min = ImGui.GetItemRectMin() - new Vector2(padding, padding);
-        var max = ImGui.GetItemRectMax() + new Vector2(padding, padding);
+        var min = ImGui.GetItemRectMin() - new Vector2(paddingX, paddingY);
+        var max = ImGui.GetItemRectMax() + new Vector2(paddingX, paddingY);
 
         var drawList = ImGui.GetWindowDrawList();
         drawList.ChannelsSetCurrent(0);
         drawList.AddRectFilled(min, max, ImGui.ColorConvertFloat4ToU32(CardBg), 12f);
-        drawList.AddRect(min, max, ImGui.ColorConvertFloat4ToU32(CardBorder), 12f);
+        drawList.AddRect(min, max, ImGui.ColorConvertFloat4ToU32(borderColor ?? CardBorder), 12f);
         drawList.ChannelsMerge();
 
         ImGui.Unindent(CardMargin);
-        ImGui.Dummy(new Vector2(0f, padding));
+        ImGui.Dummy(new Vector2(0f, CardTrailingGap));
     }
 
     /// <summary>
@@ -138,9 +212,11 @@ public static class ModernUi
     public static void GroupLabel(string text)
     {
         ImGui.Indent(CardMargin);
+        ImGui.SetWindowFontScale(1.2f);
         ImGui.TextUnformatted(text);
+        ImGui.SetWindowFontScale(1f);
         ImGui.Unindent(CardMargin);
-        ImGui.Spacing();
+        ImGui.Dummy(new Vector2(0f, 14f));
     }
 
     /// <summary>
@@ -149,6 +225,10 @@ public static class ModernUi
     /// </summary>
     public static void SectionHeader(string title, string? subtitle = null)
     {
+        // Etwas Abstand nach oben, damit Titel/Hilfstext nicht ganz oben kleben, sondern ungefähr
+        // auf Höhe des "Settings"-Texts in der Sidebar daneben sitzen.
+        ImGui.Dummy(new Vector2(0f, 10f));
+
         ImGui.SetWindowFontScale(1.25f);
         ImGui.TextUnformatted(title);
         ImGui.SetWindowFontScale(1f);
@@ -160,7 +240,12 @@ public static class ModernUi
             ImGui.PopStyleColor();
         }
 
-        ImGui.Dummy(new Vector2(0f, 6f));
+        // Trennlinie zwischen Titel/Hilfstext und den eigentlichen Einstellungen darunter, mit
+        // etwas mehr Luft danach als ein einzelnes Spacing() geben würde - sonst säße die erste
+        // GroupLabel/Karte eines Tabs sichtbar zu knapp unter der Linie.
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
     }
 
     /// <summary>
@@ -171,6 +256,10 @@ public static class ModernUi
     /// </summary>
     public static void LabelRow(string label, float controlWidth)
     {
+        // Richtet die Textgrundlinie an der eines Standard-Widgets (Slider/Dropdown/Button) aus -
+        // ohne das säße der (niedrigere) reine Text sichtbar zu weit oben, während das danach per
+        // SameLine() gezeichnete, durch FramePadding höhere Widget die restliche Zeilenhöhe füllt.
+        ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(label);
         ImGui.SameLine();
         var avail = ImGui.GetContentRegionAvail().X - CardMargin;
@@ -179,19 +268,40 @@ public static class ModernUi
         ImGui.SetNextItemWidth(controlWidth);
     }
 
+    // Von ToggleRow UND ToggleSwitch genutzt, damit beide immer dieselbe Höhe annehmen - größer
+    // als die Standard-Framehöhe (1.15x), damit der Schalter sichtbar größer als ein Textfeld wirkt.
+    private const float ToggleHeightScale = 1.05f;
+
     /// <summary>
     /// Zeile "Beschriftung ..................... Toggle" - Kombination aus LabelRow und
     /// ToggleSwitch für den häufigsten Fall (ein Bool-Setting pro Zeile).
     /// </summary>
     public static bool ToggleRow(string label, ref bool value)
     {
+        // Bewusst mit von Hand berechneten Positionen statt AlignTextToFramePadding() (das nimmt
+        // die volle Standard-Framehöhe an) - der Toggle weicht davon ab (siehe ToggleHeightScale),
+        // dagegen hätte AlignTextToFramePadding den Text falsch positioniert. Beide Elemente werden
+        // hier gegen dieselbe Zeilenhöhe zentriert, unabhängig davon, welches der beiden (Text oder
+        // Toggle) gerade höher ist.
+        var toggleHeight = ImGui.GetFrameHeight() * ToggleHeightScale;
+        var toggleWidth = toggleHeight * 1.8f;
+        var textHeight = ImGui.GetTextLineHeight();
+        var rowHeight = MathF.Max(toggleHeight, textHeight);
+        var rowStart = ImGui.GetCursorPos();
+
+        // VOR jeder Cursor-Bewegung gemessen - liefert die Breite von rowStart.X bis zum rechten
+        // Kartenrand, unabhängig davon, wie breit das Label ist.
+        var totalAvail = ImGui.GetContentRegionAvail().X - CardMargin;
+
+        ImGui.SetCursorPos(rowStart + new Vector2(0f, (rowHeight - textHeight) * 0.5f));
         ImGui.TextUnformatted(label);
-        ImGui.SameLine();
-        var toggleWidth = ImGui.GetFrameHeight() * 0.8f * 1.8f;
-        var avail = ImGui.GetContentRegionAvail().X - CardMargin;
-        if (avail > toggleWidth)
-            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + avail - toggleWidth);
-        return ToggleSwitch($"##toggle_{label}", ref value);
+
+        var toggleX = totalAvail > toggleWidth ? rowStart.X + totalAvail - toggleWidth : rowStart.X;
+        ImGui.SetCursorPos(new Vector2(toggleX, rowStart.Y + (rowHeight - toggleHeight) * 0.5f));
+        var changed = ToggleSwitch($"##toggle_{label}", ref value);
+
+        ImGui.SetCursorPos(rowStart + new Vector2(0f, rowHeight));
+        return changed;
     }
 
     /// <summary>
@@ -199,9 +309,9 @@ public static class ModernUi
     /// Settings-UIs üblich (siehe Referenzbild). Verhält sich wie ImGui.Checkbox: gibt true zurück,
     /// wenn der Wert sich durch einen Klick geändert hat, und schreibt den neuen Wert in value.
     /// </summary>
-    public static bool ToggleSwitch(string id, ref bool value)
+    public static bool ToggleSwitch(string id, ref bool value, float heightScale = ToggleHeightScale)
     {
-        var height = ImGui.GetFrameHeight() * 0.8f;
+        var height = ImGui.GetFrameHeight() * heightScale;
         var width = height * 1.8f;
         var pos = ImGui.GetCursorScreenPos();
 
@@ -238,20 +348,39 @@ public static class ModernUi
         var height = 38f;
         var startPos = ImGui.GetCursorScreenPos();
 
-        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, SidebarHover);
-        ImGui.PushStyleColor(ImGuiCol.HeaderActive, SidebarSelected);
-        ImGui.PushStyleColor(ImGuiCol.Header, selected ? SidebarSelected : new Vector4(0f, 0f, 0f, 0f));
+        // Transparent - der sichtbare Hintergrund wird gleich von Hand mit echter Rundung
+        // gezeichnet. ImGui.Selectable rundet sein eigenes Hintergrundrechteck nicht zuverlässig
+        // (bleibt eckig, unabhängig vom global gesetzten FrameRounding), daher hier selbst gemacht,
+        // genau wie schon bei ModernUi.BeginCard/EndCard für die Karten.
+        ImGui.PushStyleColor(ImGuiCol.Header, new Vector4(0f, 0f, 0f, 0f));
+        ImGui.PushStyleColor(ImGuiCol.HeaderHovered, new Vector4(0f, 0f, 0f, 0f));
+        ImGui.PushStyleColor(ImGuiCol.HeaderActive, new Vector4(0f, 0f, 0f, 0f));
         var clicked = ImGui.Selectable($"##sidebar_{label}", selected, ImGuiSelectableFlags.None, new Vector2(width, height));
+        var hovered = ImGui.IsItemHovered();
         ImGui.PopStyleColor(3);
 
         var drawList = ImGui.GetWindowDrawList();
-        if (selected)
+        if (selected || hovered)
         {
             drawList.AddRectFilled(
                 startPos,
-                startPos + new Vector2(3f, height),
+                startPos + new Vector2(width, height),
+                ImGui.ColorConvertFloat4ToU32(selected ? SidebarSelected : SidebarHover),
+                10f);
+        }
+
+        if (selected)
+        {
+            // Breiterer Balken mit voller Kapsel-Rundung (Radius = halbe Breite) statt der vorher
+            // fast eckig wirkenden schmalen 3px-Linie - dafür oben/unten etwas eingerückt, sonst
+            // wäre bei voller Zeilenhöhe kaum noch etwas von der Rundung an den Enden zu sehen.
+            const float barWidth = 5f;
+            const float barMarginY = 8f;
+            drawList.AddRectFilled(
+                startPos + new Vector2(0f, barMarginY),
+                startPos + new Vector2(barWidth, height - barMarginY),
                 ImGui.ColorConvertFloat4ToU32(Accent),
-                2f);
+                barWidth * 0.5f);
         }
 
         var textColor = selected ? Vector4.One : TextMuted;
