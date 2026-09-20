@@ -48,6 +48,7 @@ public sealed class Plugin : IDalamudPlugin
     public AetheryteAutomation AetheryteAutomation { get; init; }
     public GoToAutomation GoToAutomation { get; init; }
     public HuntingLogAutomation HuntingLogAutomation { get; init; }
+    public AetherCurrentAutomation AetherCurrentAutomation { get; init; }
 
     public Plugin()
     {
@@ -60,6 +61,7 @@ public sealed class Plugin : IDalamudPlugin
         AetheryteAutomation = new AetheryteAutomation();
         GoToAutomation = new GoToAutomation();
         HuntingLogAutomation = new HuntingLogAutomation();
+        AetherCurrentAutomation = new AetherCurrentAutomation();
 
         MainWindow = new MainWindow(this);
         WindowSystem.AddWindow(MainWindow);
@@ -108,6 +110,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.TripleTriadCard => UIState.Instance()->IsTripleTriadCardUnlocked((ushort)entry.Id),
             CollectibleType.FrameKit => PlayerState.Instance()->IsFramersKitUnlocked(entry.Id),
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
+            CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id),
             _ => false,
         };
@@ -119,6 +122,13 @@ public sealed class Plugin : IDalamudPlugin
     /// (der Entdecken-Cast braucht ein paar Sekunden, bis er durchläuft).
     /// </summary>
     public static unsafe bool IsAetheryteUnlocked(uint aetheryteId) => UIState.Instance()->IsAetheryteUnlocked(aetheryteId);
+
+    /// <summary>
+    /// Ob eine einzelne Ätherströmung (Lumina "AetherCurrent"-Zeile) bereits entdeckt wurde -
+    /// Gegenstück zu IsAetheryteUnlocked, siehe DumpAetherCurrentDebugInfo für den aktuellen
+    /// Kalibrierungsstand dieses Features.
+    /// </summary>
+    public static unsafe bool IsAetherCurrentUnlocked(uint aetherCurrentId) => PlayerState.Instance()->IsAetherCurrentUnlocked(aetherCurrentId);
 
     /// <summary>
     /// Prüft, ob ein saisonales Event (Winterstern, Valentionstag, ...) aktuell läuft - für den
@@ -537,6 +547,13 @@ public sealed class Plugin : IDalamudPlugin
         [47] = new Vector3(91.03113f, 12f, 59.573563f),          // Ul'dah - Steps of Thal: Weavers' Guild
         [51] = new Vector3(6.3589315f, 30f, -22.86465f),         // Ul'dah - Steps of Thal (Hustings Strip): The Chamber of Rule
         [125] = new Vector3(133.29056f, 4f, -31.510649f),        // Ul'dah - Steps of Thal: Sapphire Avenue Exchange
+        [44] = new Vector3(-180.11044f, 4f, 181.18927f),         // Limsa Lominsa Lower Decks: Fishermen's Guild
+        [43] = new Vector3(-335.9449f, 11.999161f, 54.79267f),   // Limsa Lominsa Lower Decks: Arcanists' Guild
+        [49] = new Vector3(-212.68405f, 15.99901f, 50.275417f),  // Limsa Lominsa Lower Decks: Hawkers' Alley
+        [8] = new Vector3(-88.223946f, 18.900326f, 1.9207064f),  // Limsa Lominsa Lower Decks: Aetheryte Plaza (großer Aetheryte)
+        [42] = new Vector3(-58.275673f, 42f, -131.06003f),       // Limsa Lominsa Upper Decks: Culinarians' Guild
+        [48] = new Vector3(-3.3218017f, 43.999992f, -217.23248f), // Limsa Lominsa Upper Decks: Marauders' Guild
+        [41] = new Vector3(14.184732f, 40f, 70.58942f),          // Limsa Lominsa Upper Decks: The Aftcastle
     };
 
     /// <summary>
@@ -993,6 +1010,135 @@ public sealed class Plugin : IDalamudPlugin
                          $"PlaceNameZone(RowIds)=[{zoneIds}]");
             }
         }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump aller Aetheryten/Aethernetz-Kristalle der aktuellen Zone (inkl.
+    /// Nachbarbezirke einer geteilten Hauptstadt, siehe GetSplitCityTerritories) mit Name + RowId -
+    /// erspart das Mitschreiben der "-> nächstes Ziel: Name(#ID)"-Logzeile pro Kristall, wenn für
+    /// ManualAetheryteWorldPositions mehrere IDs auf einmal gebraucht werden (z.B. beim
+    /// systematischen Nachtragen einer ganzen Stadt).
+    /// </summary>
+    public void DumpAetheryteDebugInfo()
+    {
+        var effectiveTerritoryId = ResolveEffectiveTerritoryId(ClientState.TerritoryType);
+        var aetherytes = GetLiveZoneEntries(effectiveTerritoryId)
+            .Where(e => e.Type == CollectibleType.Aetheryte)
+            .OrderBy(e => e.Name)
+            .ToList();
+
+        Log.Info($"[AetheryteDebug] Zone {ClientState.TerritoryType} (effektiv {effectiveTerritoryId}): {aetherytes.Count} Aetheryten/Kristalle:");
+        foreach (var entry in aetherytes)
+        {
+            var manual = HasManualAetheryteWorldPosition(entry.Id) ? ", hat bereits manuelle Position" : "";
+            Log.Info($"[AetheryteDebug]   {entry.Name}(#{entry.Id}): unlocked={IsAetheryteUnlocked(entry.Id)}{manual}");
+        }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump zum Befüllen von aethercurrents.json. Der ursprüngliche Plan, die
+    /// Position ähnlich wie bei Aetheryten über einen MapMarker-DataType aufzulösen, hat sich
+    /// empirisch als Sackgasse erwiesen (über alle 47 Zonen hinweg kein einziger Treffer beim
+    /// Abgleich MapMarker.DataKey == AetherCurrent-RowId, siehe Git-Historie dieser Methode) -
+    /// Ätherströmungen bekommen anders als Aetheryten offenbar keinen dauerhaften Kartenpin. Der
+    /// Dump liefert stattdessen die für die Community-Recherche nötigen Ankerdaten direkt aus
+    /// Lumina: Zonenname, die echten AetherCurrent-RowIds (für IsAetherCurrentUnlocked) und - falls
+    /// vorhanden - den Namen der Quest, die die jeweilige Strömung freischaltet (Quest-Strömungen
+    /// haben keine begehbare Position, nur die "Feld"-Strömungen ohne Quest-Verknüpfung brauchen
+    /// Koordinaten aus einem Community-Guide).
+    /// </summary>
+    public static unsafe void DumpAetherCurrentDebugInfo()
+    {
+        var territoryId = ClientState.TerritoryType;
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null || !territorySheet.TryGetRow(territoryId, out var territory))
+        {
+            Log.Info($"[AetherCurrentDebug] TerritoryType-Zeile {territoryId} nicht gefunden.");
+            return;
+        }
+
+        DumpAetherCurrentDebugInfoForZone(territory, verbose: true);
+    }
+
+    /// <summary>
+    /// Wie DumpAetherCurrentDebugInfo, aber für ALLE Zonen im Spiel auf einmal, unabhängig davon,
+    /// ob der Charakter dort schon war/die Erweiterung freigeschaltet hat - TerritoryType,
+    /// AetherCurrentCompFlgSet und MapMarker sind statische, mit dem Spiel ausgelieferte Excel-
+    /// Sheets, kein Live-Spielstand, lassen sich also auch mit einem reinen ARR-Charakter komplett
+    /// auslesen. Nur IsAetherCurrentUnlocked (echter Spielstand) liefert dann überall "false"; für
+    /// die eigentlich gesuchte Positions-/DataType-Zuordnung spielt das keine Rolle.
+    /// </summary>
+    public static unsafe void DumpAetherCurrentDebugInfoAllZones()
+    {
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null)
+        {
+            Log.Info("[AetherCurrentDebug] TerritoryType-Sheet nicht gefunden.");
+            return;
+        }
+
+        Log.Info("[AetherCurrentDebug] Durchsuche ALLE Zonen (auch nicht besuchte) nach Ätherströmungen...");
+        var zoneCount = 0;
+        foreach (var territory in territorySheet)
+        {
+            if (territory.AetherCurrentCompFlgSet.RowId == 0)
+                continue;
+            zoneCount++;
+            DumpAetherCurrentDebugInfoForZone(territory, verbose: false);
+        }
+        Log.Info($"[AetherCurrentDebug] Fertig - {zoneCount} Zonen mit Ätherströmungen durchsucht.");
+    }
+
+    private static unsafe void DumpAetherCurrentDebugInfoForZone(TerritoryType territory, bool verbose)
+    {
+        var territoryId = territory.RowId;
+        var compFlgSet = territory.AetherCurrentCompFlgSet.ValueNullable;
+        if (compFlgSet == null)
+        {
+            if (verbose)
+                Log.Info($"[AetherCurrentDebug] Zone {territoryId} hat kein AetherCurrentCompFlgSet (keine Ätherströmungen in dieser Zone).");
+            return;
+        }
+
+        var currentIds = compFlgSet.Value.AetherCurrents
+            .Select(c => c.RowId)
+            .Where(id => id != 0)
+            .ToList();
+        if (currentIds.Count == 0)
+            return;
+
+        var zoneName = territory.PlaceName.ValueNullable?.Name.ToString() ?? "?";
+        var mapId = territory.Map.RowId;
+        var currentSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.AetherCurrent>();
+
+        // Ätherströmungen mit einer verknüpften Quest sind reine Quest-Belohnungen (keine begehbare
+        // Position, schalten sich automatisch beim Questabschluss frei) - nur die ohne Quest-
+        // Verknüpfung ("Feld"-Strömungen) müssen tatsächlich abgelaufen werden und brauchen daher
+        // Koordinaten aus einem Community-Guide.
+        var fieldIds = new List<uint>();
+        var questIds = new List<(uint Id, string QuestName)>();
+        foreach (var id in currentIds)
+        {
+            var questName = currentSheet != null && currentSheet.TryGetRow(id, out var row) && row.Quest.RowId != 0
+                ? row.Quest.ValueNullable?.Name.ToString() ?? $"Quest#{row.Quest.RowId}"
+                : null;
+
+            if (questName != null)
+                questIds.Add((id, questName));
+            else
+                fieldIds.Add(id);
+        }
+
+        Log.Info($"[AetherCurrentDebug] Zone {territoryId} \"{zoneName}\" (MapId={mapId}): {currentIds.Count} Ätherströmungen gesamt, " +
+                 $"{fieldIds.Count} Feld-Strömungen (RowIds: [{string.Join(", ", fieldIds)}]), {questIds.Count} Quest-Strömungen.");
+
+        if (!verbose)
+            return;
+
+        foreach (var id in fieldIds)
+            Log.Info($"[AetherCurrentDebug]   Feld-Strömung #{id}: unlocked={IsAetherCurrentUnlocked(id)}");
+        foreach (var (id, questName) in questIds)
+            Log.Info($"[AetherCurrentDebug]   Quest-Strömung #{id}: Quest=\"{questName}\", unlocked={IsAetherCurrentUnlocked(id)}");
     }
 
     /// <summary>

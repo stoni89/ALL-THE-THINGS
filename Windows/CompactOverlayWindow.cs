@@ -154,6 +154,13 @@ public class CompactOverlayWindow : Window
             .ToList();
         plugin.HuntingLogAutomation.Update(missingHuntingLogInZone);
 
+        // Wie Hunting Log bewusst NICHT stadtweit - Ätherströmungen kommen aus aethercurrents.json
+        // mit exakter Zonen-Zuordnung, kein Bezirkswechsel nötig.
+        var missingAetherCurrentsInZone = allForZone
+            .Where(e => e.Type == CollectibleType.AetherCurrent && !plugin.IsOwned(e))
+            .ToList();
+        plugin.AetherCurrentAutomation.Update(missingAetherCurrentsInZone);
+
         // Unabhängig von den Automationen oben - das "Hinlaufen"-Icon (siehe DrawClickableName)
         // betrifft immer nur einen einzelnen Eintrag, egal ob gerade eine Automation läuft.
         plugin.GoToAutomation.Update();
@@ -163,12 +170,15 @@ public class CompactOverlayWindow : Window
         var hasActionableQuests = missingQuests.Any(q => !plugin.QuestAutomation.IsKnownUnsupported(q.Id));
         var hasActionableAetherytes = missingAetherytesCity.Count > 0;
         var hasActionableHuntingLog = missingHuntingLogInZone.Any(e => e.WorldPosition.HasValue);
+        var hasActionableAetherCurrents = missingAetherCurrentsInZone.Any(e => e.HasGoToTarget);
 
         DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
         ImGui.SameLine();
         DrawAetheryteAutomationButton(hasActionableAetherytes);
         ImGui.SameLine();
         DrawHuntingLogAutomationButton(hasActionableHuntingLog);
+        ImGui.SameLine();
+        DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -182,6 +192,9 @@ public class CompactOverlayWindow : Window
 
         if (plugin.HuntingLogAutomation.ShouldShowStatusText)
             OutlineText(plugin.HuntingLogAutomation.StatusText, plugin.HuntingLogAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.AetherCurrentAutomation.ShouldShowStatusText)
+            OutlineText(plugin.AetherCurrentAutomation.StatusText, plugin.AetherCurrentAutomation.IsActive ? AffordableColor : VendorLinkColor);
 
         if (config.ShowDebugInfo)
             OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
@@ -496,6 +509,60 @@ public class CompactOverlayWindow : Window
         }
     }
 
+    /// <summary>
+    /// Knopf, der die Ätherströmungs-Automation (siehe AetherCurrentAutomation.cs) für die aktuell
+    /// fehlenden Strömungen dieser Zone an-/ausschaltet. Braucht zum Laufen zwingend vnavmesh -
+    /// fehlt es, wird das per Tooltip erklärt statt der Knopf einfach nichts zu tun.
+    /// </summary>
+    private void DrawAetherCurrentAutomationButton(bool hasActionableAetherCurrents)
+    {
+        var automation = plugin.AetherCurrentAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Auto Ätherströmung", "Auto Aether Current");
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
+        var isDisabled = !automation.IsActive && !hasActionableAetherCurrents;
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.AetherCurrent]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactAetherCurrentAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(isDisabled
+                ? Loc.T(
+                    "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
+                    "No aether currents with a known position in this zone.")
+                : automation.IsActive
+                    ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                    : Loc.T(
+                        "Läuft mit vnavmesh nacheinander alle fehlenden Ätherströmungen ab und wartet auf die automatische Freischaltung.",
+                        "Uses vnavmesh to walk to all missing aether currents, one by one, and waits for them to unlock automatically."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (automation.IsVNavmeshAvailable())
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
     private void DrawClickableName(CollectibleEntry entry)
     {
         var affordable = plugin.CanAfford(entry);
@@ -652,6 +719,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Aetheryte] = new(0.6f, 1f, 0.75f, 1f),
         [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
         [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
+        [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
     };
     private static readonly Vector2[] ShadowOffsets =
     {

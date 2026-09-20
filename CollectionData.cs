@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
@@ -67,6 +68,7 @@ public enum CollectibleType
     Aetheryte,
     Quest,
     HuntingLog,
+    AetherCurrent,
 }
 
 public static class CollectionData
@@ -76,13 +78,14 @@ public static class CollectionData
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
-        Converters = { new JsonStringEnumConverter() },
+        Converters = { new JsonStringEnumConverter(), new Vector3JsonConverter() },
     };
 
     private static readonly string[] DataFiles =
     {
         "mounts.json", "minions.json", "orchestrions.json", "bardings.json",
         "emotes.json", "facewear.json", "fashions.json", "triadcards.json", "frames.json",
+        "aethercurrents.json",
     };
 
     public static List<CollectibleEntry> GetAllEntries()
@@ -107,5 +110,44 @@ public static class CollectionData
 
         cachedEntries = entries;
         return entries;
+    }
+}
+
+/// <summary>
+/// Erlaubt "WorldPosition": {"X":.., "Y":.., "Z":..} in JSON-Datendateien (siehe
+/// aethercurrents.json) - System.Text.Json kann Vector3 sonst nicht automatisch (de-)serialisieren,
+/// da X/Y/Z dort öffentliche FELDER statt Properties sind.
+/// </summary>
+public sealed class Vector3JsonConverter : JsonConverter<Vector3>
+{
+    public override Vector3 Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        float x = 0, y = 0, z = 0;
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+        {
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var propertyName = reader.GetString();
+            reader.Read();
+            var value = reader.GetSingle();
+            switch (propertyName?.ToUpperInvariant())
+            {
+                case "X": x = value; break;
+                case "Y": y = value; break;
+                case "Z": z = value; break;
+            }
+        }
+
+        return new Vector3(x, y, z);
+    }
+
+    public override void Write(Utf8JsonWriter writer, Vector3 value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WriteNumber("X", value.X);
+        writer.WriteNumber("Y", value.Y);
+        writer.WriteNumber("Z", value.Z);
+        writer.WriteEndObject();
     }
 }
