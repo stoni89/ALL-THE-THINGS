@@ -90,6 +90,7 @@ public enum CollectibleType
     HuntingLog,
     AetherCurrent,
     Sightseeing,
+    Chocobokeep,
 }
 
 /// <summary>
@@ -157,6 +158,7 @@ public static class CollectionData
         Plugin.EnrichEntriesWithZoneFromSource(entries);
 
         entries.AddRange(Plugin.GetFrameKitEntries());
+        entries.AddRange(Plugin.GetChocobokeepEntries());
 
         cachedEntries = entries;
         return entries;

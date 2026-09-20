@@ -19,6 +19,7 @@ public class MainWindow : Window
     private enum RailPage
     {
         Settings,
+        Statistics,
         Dependencies,
         About,
     }
@@ -330,6 +331,9 @@ public class MainWindow : Window
             if (ModernUi.RailButton(FontAwesomeIcon.SlidersH, railPage == RailPage.Settings, Loc.T("Einstellungen", "Settings")))
                 railPage = RailPage.Settings;
             ImGui.Spacing();
+            if (ModernUi.RailButton(FontAwesomeIcon.ChartBar, railPage == RailPage.Statistics, Loc.T("Statistik", "Statistics")))
+                railPage = RailPage.Statistics;
+            ImGui.Spacing();
             if (ModernUi.RailButton(FontAwesomeIcon.Plug, railPage == RailPage.Dependencies, Loc.T("Plugins", "Plugins"), HasMissingRequiredDependency()))
                 railPage = RailPage.Dependencies;
             ImGui.Spacing();
@@ -383,6 +387,15 @@ public class MainWindow : Window
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
+                ImGui.Unindent(4f);
+                ImGui.EndChild();
+            }
+            else if (railPage == RailPage.Statistics)
+            {
+                ImGui.BeginChild("##StatisticsContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.Spacing();
+                ImGui.Indent(4f);
+                DrawStatisticsPage();
                 ImGui.Unindent(4f);
                 ImGui.EndChild();
             }
@@ -960,6 +973,13 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
+        if (ImGui.Button(Loc.T("Chocobokeep-Debug-Dump ins Log schreiben", "Write chocobokeep debug dump to log")))
+            Plugin.DumpChocobokeepDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         if (ImGui.Button(Loc.T("Dungeon-Zonen-Debug-Dump ins Log schreiben", "Write dungeon zone debug dump to log")))
             Plugin.DumpZoneEnrichmentDebugInfo();
 
@@ -1039,6 +1059,88 @@ public class MainWindow : Window
     /// </summary>
     internal static bool HasMissingRequiredDependency() =>
         Dependencies.Any(d => d.Required && !Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded));
+
+    // Nur die Typen, die als globale (zonenunabhängige) Liste über CollectionData.GetAllEntries
+    // verfügbar sind - Quest/Aetheryte/HuntingLog/Sightseeing werden nur pro Zone live berechnet
+    // und haben deshalb keine sinnvolle "Gesamt"-Zahl.
+    private static readonly CollectibleType[] StatisticsTypes =
+    {
+        CollectibleType.Mount, CollectibleType.Minion, CollectibleType.Orchestrion, CollectibleType.Barding,
+        CollectibleType.Emote, CollectibleType.Facewear, CollectibleType.FashionAccessory, CollectibleType.TripleTriadCard,
+        CollectibleType.FrameKit, CollectibleType.AetherCurrent,
+    };
+
+    private static void DrawStatRow(string label, int owned, int total, float barHeight = 6f)
+    {
+        ImGui.TextUnformatted(label);
+        ImGui.SameLine(ImGui.GetContentRegionAvail().X + ImGui.GetCursorPosX() - ImGui.CalcTextSize($"{owned}/{total}").X);
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextUnformatted($"{owned}/{total}");
+        ImGui.PopStyleColor();
+
+        ImGui.PushStyleColor(ImGuiCol.PlotHistogram, ModernUi.Accent);
+        ImGui.ProgressBar(total == 0 ? 0f : owned / (float)total, new Vector2(-1f, barHeight), string.Empty);
+        ImGui.PopStyleColor();
+    }
+
+    private void DrawStatisticsPage()
+    {
+        ImGui.SetWindowFontScale(1.25f);
+        ImGui.TextUnformatted(Loc.T("Statistik", "Statistics"));
+        ImGui.SetWindowFontScale(1f);
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextWrapped(Loc.T(
+            "Enthält keine Erfolge (Achievements) o.ä., sondern nur die Kategorien, die dieses Plugin selbst verfolgt (siehe Overlay).",
+            "Doesn't include achievements etc. - only the categories this plugin itself tracks (see the overlay)."));
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        // Nur zonengebundene Einträge (TerritoryTypeId != 0) - Einträge ohne Zone tauchen im
+        // kompakten Overlay nie auf (siehe HasGoToTarget/siblingTerritories-Filter dort), zählen
+        // hier also absichtlich nicht mit, sonst würde die Statistik Dinge "mitrechnen", die das
+        // Plugin selbst gar nirgends anzeigt.
+        var entries = CollectionData.GetAllEntries().Where(e => e.TerritoryTypeId != 0).ToList();
+        var totalCount = 0;
+        var totalOwned = 0;
+
+        foreach (var type in StatisticsTypes)
+        {
+            var typeEntries = entries.Where(e => e.Type == type).ToList();
+            if (typeEntries.Count == 0)
+                continue;
+
+            var owned = typeEntries.Count(plugin.IsOwned);
+            totalCount += typeEntries.Count;
+            totalOwned += owned;
+
+            DrawStatRow(Loc.TypeName(type), owned, typeEntries.Count);
+            ImGui.Spacing();
+        }
+
+        // Quests laufen separat (siehe Plugin.GetAllTrackedQuestIds) - anders als die Typen oben
+        // gibt es dafür keine feste JSON-Liste, sondern eine live aus dem kompletten Lumina-Quest-
+        // Sheet berechnete, zonenunabhängige Annehmbarkeits-Prüfung.
+        var questIds = plugin.GetAllTrackedQuestIds();
+        if (questIds.Count > 0)
+        {
+            var questsOwned = questIds.Count(id => plugin.IsOwned(new CollectibleEntry { Id = id, Type = CollectibleType.Quest }));
+            totalCount += questIds.Count;
+            totalOwned += questsOwned;
+
+            DrawStatRow(Loc.TypeName(CollectibleType.Quest), questsOwned, questIds.Count);
+            ImGui.Spacing();
+        }
+
+        ImGui.Dummy(new Vector2(0f, 8f));
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        ImGui.SetWindowFontScale(1.1f);
+        DrawStatRow(Loc.T("Insgesamt", "Total"), totalOwned, totalCount, 8f);
+        ImGui.SetWindowFontScale(1f);
+    }
 
     private static void DrawDependenciesPage()
     {
