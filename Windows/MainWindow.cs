@@ -255,12 +255,15 @@ public class MainWindow : Window
 
         using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
         {
-            // SmallButton nutzt (anders als die vergrößerte Titelzeile) die normale, unskalierte
-            // Icon-Schriftgröße ohne Innenabstand - ohne diesen Ausgleich würden die Buttons zu
-            // weit oben in der (jetzt höheren) Kopfzeile kleben statt mittig zu sitzen.
-            var buttonLineHeight = ImGui.GetTextLineHeight();
-            var buttonYOffset = (rowHeight - buttonLineHeight) * 0.5f;
+            // Normale Button() mit fester, quadratischer Größe statt SmallButton: SmallButton
+            // erzwingt intern FramePadding.Y=0, wodurch der Hover-/Klick-Hintergrund viel breiter
+            // als hoch wirkte (nur an der Zeilenhöhe des Icons orientiert), statt wie ein richtiger
+            // Icon-Button quadratisch zu sein.
             var buttonWidth = ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X + ImGui.GetStyle().FramePadding.X * 2f;
+            const float buttonHeightScale = 0.9f;
+            var buttonHeight = buttonWidth * buttonHeightScale;
+            var buttonYOffset = (rowHeight - buttonHeight) * 0.5f;
+            var buttonSize = new Vector2(buttonWidth, buttonHeight);
 
             // Im Ruhezustand transparent (verschmilzt mit dem normalen Fensterhintergrund) - nur
             // beim Hovern/Klicken sichtbar hervorgehoben, statt permanent als eigener grauer Kasten.
@@ -268,13 +271,13 @@ public class MainWindow : Window
 
             ImGui.SameLine(regionMaxX - buttonWidth);
             ImGui.SetCursorPosY(rowStartY + buttonYOffset);
-            if (ImGui.SmallButton($"{FontAwesomeIcon.Times.ToIconString()}##HeaderClose"))
+            if (ImGui.Button($"{FontAwesomeIcon.Times.ToIconString()}##HeaderClose", buttonSize))
                 IsOpen = false;
 
             var collapseIcon = collapsed ? FontAwesomeIcon.ChevronDown : FontAwesomeIcon.ChevronUp;
             ImGui.SameLine(regionMaxX - buttonWidth * 2f - spacing);
             ImGui.SetCursorPosY(rowStartY + buttonYOffset);
-            if (ImGui.SmallButton($"{collapseIcon.ToIconString()}##HeaderCollapse"))
+            if (ImGui.Button($"{collapseIcon.ToIconString()}##HeaderCollapse", buttonSize))
                 collapsed = !collapsed;
 
             ImGui.PopStyleColor();
@@ -905,6 +908,13 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
+        if (ImGui.Button(Loc.T("Aetheryten-Debug-Dump ins Log schreiben", "Write aetheryte debug dump to log")))
+            plugin.DumpAetheryteDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         var simulateAll = plugin.AetheryteAutomation.SimulateAllCrystals;
         if (ModernUi.ToggleRow(
             Loc.T("Aetheryten-Automation: alle Kristalle simulieren", "Aetheryte automation: simulate all crystals"),
@@ -919,6 +929,20 @@ public class MainWindow : Window
 
         if (ImGui.Button(Loc.T("Hunting-Log-Debug-Dump ins Log schreiben", "Write hunting log debug dump to log")))
             Plugin.DumpHuntingLogDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (ImGui.Button(Loc.T("Ätherströmungs-Debug-Dump ins Log schreiben", "Write aether current debug dump to log")))
+            Plugin.DumpAetherCurrentDebugInfo();
+
+        ImGui.SameLine();
+        // Funktioniert auch mit einem reinen ARR-Charakter ohne freigeschaltete Erweiterung -
+        // TerritoryType/MapMarker sind statische Spieldaten, kein Live-Spielstand (siehe Kommentar
+        // an DumpAetherCurrentDebugInfoAllZones).
+        if (ImGui.Button(Loc.T("...für alle Zonen", "...for all zones")))
+            Plugin.DumpAetherCurrentDebugInfoAllZones();
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
