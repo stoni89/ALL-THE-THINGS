@@ -28,6 +28,7 @@ public static class Loc
         CollectibleType.HuntingLog => T("Hunting Log", "Hunting Log"),
         CollectibleType.AetherCurrent => T("Ätherströmung", "Aether Current"),
         CollectibleType.Sightseeing => T("Sightseeing", "Sightseeing"),
+        CollectibleType.Chocobokeep => T("Chocobokeep", "Chocobokeep"),
         _ => type.ToString(),
     };
 }

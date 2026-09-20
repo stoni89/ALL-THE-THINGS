@@ -55,9 +55,31 @@ public class CompactOverlayWindow : Window
     private Vector2? lastWindowMin;
     private Vector2? lastWindowMax;
 
-    // Vom aktuellen Frame - einmal in PreDraw ermittelt, dann sowohl in PreDraw (Flags) als auch in
-    // Draw (Alpha) verwendet, damit beide dieselbe Entscheidung für denselben Frame treffen.
-    private bool hiddenBehindNativeWindow;
+    // Vom aktuellen Frame - einmal in PreDraw ermittelt (auf Basis der Fensterposition vom LETZTEN
+    // Frame, siehe lastWindowMin/Max), dann in Draw benutzt, um dort per ImGuiP.SetWindowHitTestHole
+    // gezielt Mausklicks ans darunterliegende native Fenster durchzureichen, und über IsOccluded in
+    // praktisch jedem Zeichenaufruf in DrawContent, um NUR die davon betroffenen Zeilen/Knöpfe/Icons
+    // unsichtbar zu machen - der Rest des Overlays bleibt normal sichtbar/klickbar, auch wenn
+    // irgendwo ein natives Fenster überlappt.
+    private List<(Vector2 Min, Vector2 Max)> nativeOverlapRects = new();
+
+    /// <summary>
+    /// Ob das Element, das man an der AKTUELLEN Cursor-Position mit der übergebenen Größe zeichnen
+    /// würde, unter einem nativen Fenster liegen würde (siehe nativeOverlapRects) - jede
+    /// zeichnende Methode in dieser Klasse ruft das VOR dem eigentlichen Zeichnen auf und
+    /// zeichnet bei true stattdessen einen gleich großen ImGui.Dummy (siehe z.B. OutlineText),
+    /// damit Layout/SameLine-Reihenfolge unverändert bleiben, aber nichts Sichtbares/Klickbares
+    /// an dieser Stelle entsteht.
+    /// </summary>
+    private bool IsOccluded(Vector2 size)
+    {
+        if (nativeOverlapRects.Count == 0)
+            return false;
+
+        var min = ImGui.GetCursorScreenPos();
+        var max = min + size;
+        return nativeOverlapRects.Any(r => r.Min.X < max.X && r.Max.X > min.X && r.Min.Y < max.Y && r.Max.Y > min.Y);
+    }
 
     /// <summary>
     /// Verhindert, dass das Overlay schon am Titelbildschirm (vor dem Einloggen) oder während des
@@ -79,19 +101,18 @@ public class CompactOverlayWindow : Window
     {
         var config = plugin.Configuration;
 
-        // Liegt (laut letztem Frame) ein natives Fenster über uns, wird die Maus-Eingabe für
-        // dieses Fenster für den GESAMTEN Frame deaktiviert (NoMouseInputs) - ohne das würde unser
-        // (dann unsichtbares, siehe Draw) Fenster trotzdem weiterhin Klicks für sich beanspruchen,
-        // wodurch das eigentlich sichtbare native Fenster darüber nicht mehr klickbar wäre.
-        hiddenBehindNativeWindow = lastWindowMin.HasValue && lastWindowMax.HasValue &&
-            Plugin.IsOverlappedByVisibleNativeWindow(lastWindowMin.Value, lastWindowMax.Value);
+        // Auf Basis der Fensterposition vom LETZTEN Frame (siehe Draw, ganz unten aktualisiert) -
+        // erst NACH Begin() (also in Draw) wüsste man die aktuelle Position zwar noch genauer, eine
+        // Frame Verzögerung ist dafür unmerklich, da sich die Fensterposition normalerweise nicht
+        // jeden Frame ändert.
+        nativeOverlapRects = lastWindowMin.HasValue && lastWindowMax.HasValue
+            ? Plugin.GetOverlappingNativeWindowRects(lastWindowMin.Value, lastWindowMax.Value)
+            : new List<(Vector2 Min, Vector2 Max)>();
 
         // Gesperrt = nur die Position fixiert, nicht die Größe - das Fenster bleibt also auch im
         // gesperrten Zustand an der Ecke skalierbar (z.B. wenn ein Mount-Name nicht mehr in die
         // aktuelle Breite passt), nur das versehentliche Verschieben wird verhindert.
         Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove : BaseFlags;
-        if (hiddenBehindNativeWindow)
-            Flags |= ImGuiWindowFlags.NoMouseInputs;
 
         var alpha = 1f - System.Math.Clamp(config.CompactTransparency, 0f, 1f);
 
@@ -114,36 +135,42 @@ public class CompactOverlayWindow : Window
 
     public override void Draw()
     {
+        var window = ImGuiP.GetCurrentWindow();
+
         // Erzwingt JEDEN Frame aufs Neue, dass dieses Fenster ganz hinten im Anzeige-Stapel sitzt -
         // NoBringToFrontOnFocus (siehe BaseFlags) verhindert nur, dass es bei eigener Interaktion
         // wieder nach vorn rutscht, garantiert aber nicht, dass es ÜBERHAUPT hinten bleibt (z.B.
         // wenn ein anderes Fenster geschlossen und neu geöffnet wird). BringWindowToDisplayBack ist
         // intern in ImGui, aber über ImGuiP öffentlich zugänglich - genau dafür gedacht.
-        ImGuiP.BringWindowToDisplayBack(ImGuiP.GetCurrentWindow());
+        ImGuiP.BringWindowToDisplayBack(window);
 
-        // Für die Überlappungsprüfung im NÄCHSTEN Frame merken (siehe PreDraw/hiddenBehindNativeWindow).
+        // Für die Überlappungsprüfung im NÄCHSTEN Frame merken (siehe PreDraw/nativeOverlapRects).
         lastWindowMin = ImGui.GetWindowPos();
         lastWindowMax = lastWindowMin + ImGui.GetWindowSize();
 
-        // Dalamud/ImGui zeichnet grundsätzlich IMMER über dem nativen Spiel-UI (keine echte Z-
-        // Order zwischen beiden möglich, siehe Plugin.IsOverlappedByVisibleNativeWindow-Kommentar).
-        // Liegt gerade ein echtes natives Fenster (Währung, Inventar, ...) über uns (schon in
-        // PreDraw ermittelt, siehe dort), wird der gesamte Inhalt komplett unsichtbar gemacht
-        // (Alpha=0 für ALLES in diesem Fenster, nicht nur den Hintergrund) UND (siehe PreDraw/
-        // NoMouseInputs) fängt es selbst keine Klicks mehr ab - so verschwindet unser Overlay
-        // optisch UND für Eingaben "dahinter", auch wenn es technisch nur selbst ausgeblendet wird.
-        if (hiddenBehindNativeWindow)
-            ImGui.PushStyleVar(ImGuiStyleVar.Alpha, 0f);
+        // Dalamud/ImGui zeichnet grundsätzlich IMMER über dem nativen Spiel-UI (keine echte Z-Order
+        // zwischen beiden möglich, siehe Plugin.GetOverlappingNativeWindowRects-Kommentar) - echte
+        // Mausklicks würden ein darunter liegendes natives Fenster (Währung, Inventar, ...) sonst
+        // nie erreichen, obwohl es dort sichtbar ist. SetWindowHitTestHole "durchlöchert" unser
+        // Fenster gezielt an dieser Stelle, statt (wie früher) für den GESAMTEN Frame sämtliche
+        // Mauseingaben zu deaktivieren - der Rest des Overlays bleibt normal klickbar. ImGui
+        // unterstützt intern nur EIN Loch pro Fenster und Frame - bei mehreren gleichzeitig
+        // überlappenden nativen Fenstern (seltener Fall) wird deshalb die umschließende Hülle aller
+        // Überlappungen als ein einziges Loch benutzt, statt nur die letzte zu berücksichtigen.
+        if (nativeOverlapRects.Count > 0)
+        {
+            var holeMin = nativeOverlapRects[0].Min;
+            var holeMax = nativeOverlapRects[0].Max;
+            foreach (var (min, max) in nativeOverlapRects.Skip(1))
+            {
+                holeMin = Vector2.Min(holeMin, min);
+                holeMax = Vector2.Max(holeMax, max);
+            }
 
-        try
-        {
-            DrawContent();
+            ImGuiP.SetWindowHitTestHole(window, holeMin, holeMax - holeMin);
         }
-        finally
-        {
-            if (hiddenBehindNativeWindow)
-                ImGui.PopStyleVar();
-        }
+
+        DrawContent();
     }
 
     private void DrawContent()
@@ -245,6 +272,13 @@ public class CompactOverlayWindow : Window
             .ToList();
         plugin.SightseeingAutomation.Update(missingSightseeingInZone);
 
+        // Ebenfalls nicht stadtweit - Chocobokeep-Standorte kommen aus GetChocobokeepEntries mit
+        // exakter Zonen-Zuordnung, kein Bezirkswechsel nötig.
+        var missingChocobokeepsInZone = allForZone
+            .Where(e => e.Type == CollectibleType.Chocobokeep && !plugin.IsOwned(e))
+            .ToList();
+        plugin.ChocobokeepAutomation.Update(missingChocobokeepsInZone);
+
         // Unabhängig von den Automationen oben - das "Hinlaufen"-Icon (siehe DrawClickableName)
         // betrifft immer nur einen einzelnen Eintrag, egal ob gerade eine Automation läuft.
         plugin.GoToAutomation.Update();
@@ -256,6 +290,7 @@ public class CompactOverlayWindow : Window
         var hasActionableHuntingLog = missingHuntingLogInZone.Any(e => e.WorldPosition.HasValue);
         var hasActionableAetherCurrents = missingAetherCurrentsInZone.Any(e => e.HasGoToTarget);
         var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget);
+        var hasActionableChocobokeeps = missingChocobokeepsInZone.Any(e => e.HasGoToTarget);
 
         // Reihe der Automations-Knöpfe bricht bei Bedarf selbst in eine zweite Zeile um (statt über
         // den Fensterrand hinauszulaufen), wenn das kompakte Fenster nicht breit genug gezogen
@@ -282,6 +317,8 @@ public class CompactOverlayWindow : Window
         DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
         ContinueAutomationRow(plugin.SightseeingAutomation.IsActive, Loc.T("Auto Sightseeing", "Auto Sightseeing"));
         DrawSightseeingAutomationButton(hasActionableSightseeing);
+        ContinueAutomationRow(plugin.ChocobokeepAutomation.IsActive, Loc.T("Auto Chocobokeep", "Auto Chocobokeep"));
+        DrawChocobokeepAutomationButton(hasActionableChocobokeeps);
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -302,6 +339,9 @@ public class CompactOverlayWindow : Window
         if (plugin.SightseeingAutomation.ShouldShowStatusText)
             OutlineText(plugin.SightseeingAutomation.StatusText, plugin.SightseeingAutomation.IsActive ? AffordableColor : VendorLinkColor);
 
+        if (plugin.ChocobokeepAutomation.ShouldShowStatusText)
+            OutlineText(plugin.ChocobokeepAutomation.StatusText, plugin.ChocobokeepAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
         if (config.ShowDebugInfo)
             OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
 
@@ -313,7 +353,10 @@ public class CompactOverlayWindow : Window
         var filterLabel = Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter";
         var filterButtonWidth = ImGui.CalcTextSize(Loc.T("Typen filtern", "Filter types")).X + ImGui.GetStyle().FramePadding.X * 2f;
         ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - filterButtonWidth);
-        if (ImGui.Button(filterLabel))
+        var filterButtonSize = new Vector2(filterButtonWidth, ImGui.GetFrameHeight());
+        if (IsOccluded(filterButtonSize))
+            ImGui.Dummy(filterButtonSize);
+        else if (ImGui.Button(filterLabel))
             ImGui.OpenPopup("CompactTypeFilterPopup");
 
         // Derselbe Hintergrundton wie im Optionsfenster (siehe ModernUi.PushStyle/PopupBg) - ohne
@@ -352,6 +395,17 @@ public class CompactOverlayWindow : Window
 
         foreach (var entry in entries)
         {
+            // Liegt genau DIESE Zeile gerade unter einem nativen Fenster (siehe Draw/
+            // nativeOverlapRects/IsOccluded), wird nur sie durch eine leere, gleich hohe Dummy-Zeile
+            // ersetzt - der Rest der Liste bleibt normal sichtbar/klickbar, statt (wie früher) beim
+            // geringsten Kontakt mit einem nativen Fenster komplett zu verschwinden.
+            var rowSize = new Vector2(ImGui.GetContentRegionAvail().X, ImGui.GetTextLineHeightWithSpacing());
+            if (IsOccluded(rowSize))
+            {
+                ImGui.Dummy(rowSize);
+                continue;
+            }
+
             DrawGoToColumn(entry);
 
             var isUnsupportedQuest = entry.Type == CollectibleType.Quest && plugin.QuestAutomation.IsKnownUnsupported(entry.Id);
@@ -428,6 +482,12 @@ public class CompactOverlayWindow : Window
             }
             isFirst = false;
 
+            if (IsOccluded(new Vector2(itemWidth, iconSize)))
+            {
+                ImGui.Dummy(new Vector2(itemWidth, iconSize));
+                continue;
+            }
+
             if (hasIcon)
             {
                 var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(sample.CurrencyIconId)).GetWrapOrEmpty();
@@ -490,6 +550,14 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Quest", "Auto Quest");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
         var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
@@ -547,6 +615,14 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Aetheryte", "Auto Aetheryte");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
         var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
@@ -605,6 +681,14 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Hunting Log", "Auto Hunting Log");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
         var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
@@ -663,6 +747,14 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Ätherströmung", "Auto Aether Current");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
         var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
@@ -724,6 +816,13 @@ public class CompactOverlayWindow : Window
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Sightseeing", "Auto Sightseeing");
 
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
         // Kein Plugin-Thema - eigenständig VOR hasMissingPlugin geprüft (siehe Tooltip unten).
         var logUnlocked = Plugin.IsSightseeingLogUnlocked();
         var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
@@ -756,6 +855,72 @@ public class CompactOverlayWindow : Window
                             : Loc.T(
                                 "Läuft mit vnavmesh nacheinander alle fehlenden Sightseeing-Punkte ab und wartet auf die automatische Freischaltung.",
                                 "Uses vnavmesh to walk to all missing sightseeing points, one by one, and waits for them to unlock automatically."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (!hasMissingPlugin)
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
+    /// <summary>
+    /// Knopf, der die Chocobokeep-Automation (siehe ChocobokeepAutomation.cs) für die aktuell noch
+    /// nicht besuchten Chocobokeep-Standorte dieser Zone an-/ausschaltet. Braucht zum Laufen
+    /// zwingend vnavmesh - fehlt es, wird das per Tooltip erklärt statt der Knopf einfach nichts zu tun.
+    /// </summary>
+    private void DrawChocobokeepAutomationButton(bool hasActionableChocobokeeps)
+    {
+        var automation = plugin.ChocobokeepAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Auto Chocobokeep", "Auto Chocobokeep");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableChocobokeeps || hasMissingPlugin);
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Chocobokeep]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactChocobokeepAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(hasMissingPlugin
+                ? MissingPluginTooltip
+                : isDisabled
+                    ? Loc.T(
+                        "Keine noch nicht besuchten Chocobokeeps in dieser Zone.",
+                        "No unvisited chocobokeeps in this zone.")
+                    : automation.IsActive
+                        ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                        : Loc.T(
+                            "Läuft mit vnavmesh nacheinander alle noch nicht besuchten Chocobokeeps ab und interagiert mit ihnen.",
+                            "Uses vnavmesh to walk to all not-yet-visited chocobokeeps, one by one, and interacts with them."));
         }
 
         if (!clicked)
@@ -901,11 +1066,19 @@ public class CompactOverlayWindow : Window
         return handle is { Available: true } ? handle.Push() : null;
     }
 
-    private static bool DrawCloseButtonTopRight()
+    private bool DrawCloseButtonTopRight()
     {
         var buttonWidth = ImGui.CalcTextSize("x").X + ImGui.GetStyle().FramePadding.X * 2f;
         var regionMaxX = ImGui.GetWindowContentRegionMax().X;
         ImGui.SameLine(regionMaxX - buttonWidth);
+
+        var size = new Vector2(buttonWidth, ImGui.GetFrameHeight());
+        if (IsOccluded(size))
+        {
+            ImGui.Dummy(size);
+            return false;
+        }
+
         return ImGui.SmallButton("x##CloseCompact");
     }
 
@@ -933,6 +1106,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
         [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
         [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
+        [CollectibleType.Chocobokeep] = new(0.95f, 0.85f, 0.2f, 1f),
     };
     private static readonly Vector2[] ShadowOffsets =
     {
@@ -944,10 +1118,20 @@ public class CompactOverlayWindow : Window
     /// Zeichnet Text mit dunklem Rand, damit er bei voller Transparenz (kein Fensterhintergrund
     /// mehr) auf jedem beliebigen Ingame-Untergrund lesbar bleibt. Verhält sich wie ein normales
     /// Text-Widget (SameLine/IsItemHovered/IsItemClicked funktionieren danach wie gewohnt), da der
-    /// letzte Zeichenaufruf an der eigentlichen Cursor-Position passiert.
+    /// letzte Zeichenaufruf an der eigentlichen Cursor-Position passiert. Liegt die Stelle gerade
+    /// unter einem nativen Fenster (siehe IsOccluded), wird stattdessen ein gleich großer Dummy
+    /// gezeichnet - IsItemHovered/IsItemClicked danach liefern dann automatisch immer false, ein
+    /// verdeckter Text kann also nie mehr fälschlich als "angeklickt" gelten.
     /// </summary>
-    private static void OutlineText(string text, Vector4 color)
+    private void OutlineText(string text, Vector4 color)
     {
+        var size = ImGui.CalcTextSize(text);
+        if (IsOccluded(size))
+        {
+            ImGui.Dummy(size);
+            return;
+        }
+
         var origin = ImGui.GetCursorPos();
         var shadow = new Vector4(0f, 0f, 0f, 0.9f);
 

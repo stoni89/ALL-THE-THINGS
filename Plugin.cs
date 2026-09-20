@@ -54,6 +54,7 @@ public sealed class Plugin : IDalamudPlugin
     public HuntingLogAutomation HuntingLogAutomation { get; init; }
     public AetherCurrentAutomation AetherCurrentAutomation { get; init; }
     public SightseeingAutomation SightseeingAutomation { get; init; }
+    public ChocobokeepAutomation ChocobokeepAutomation { get; init; }
 
     public Plugin()
     {
@@ -68,6 +69,7 @@ public sealed class Plugin : IDalamudPlugin
         HuntingLogAutomation = new HuntingLogAutomation();
         AetherCurrentAutomation = new AetherCurrentAutomation();
         SightseeingAutomation = new SightseeingAutomation();
+        ChocobokeepAutomation = new ChocobokeepAutomation();
 
         MainWindow = new MainWindow(this);
         WindowSystem.AddWindow(MainWindow);
@@ -119,9 +121,19 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
             CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id),
+            CollectibleType.Chocobokeep => IsChocoboTaxiStandUnlocked(entry.Id),
             _ => false,
         };
     }
+
+    /// <summary>
+    /// Ob ein einzelner Chocobo-Reitstand (Lumina "ChocoboTaxiStand"-RowId, siehe
+    /// GetChocobokeepEntries) bereits freigeschaltet ist - doch ein echter Spielstand-Flag
+    /// (UIState.IsChocoboTaxiStandUnlocked), keine eigene Merkliste nötig. Eigenständig aufrufbar
+    /// (nicht nur über IsOwned), damit ChocobokeepAutomation nach dem Interagieren auf den
+    /// tatsächlichen Freischalt-Abschluss warten kann (analog zu IsAetheryteUnlocked).
+    /// </summary>
+    public static unsafe bool IsChocoboTaxiStandUnlocked(uint chocoboTaxiStandId) => UIState.Instance()->IsChocoboTaxiStandUnlocked(chocoboTaxiStandId);
 
     /// <summary>
     /// Eigenständig aufrufbar (nicht nur über IsOwned) - wird von der Aetheryten-Automation
@@ -814,6 +826,188 @@ public sealed class Plugin : IDalamudPlugin
         Log.Info($"[FrameKitDebug] Davon {unknownCount} mit unbekanntem Freischalt-Weg (FrameKitUnlockKind.Unknown).");
     }
 
+    private readonly record struct ChocobokeepLocation(uint ChocoboTaxiStandId, uint TerritoryId, Vector3 Position);
+
+    /// <summary>
+    /// Von Hand erfasste Chocobokeep-Standorte (Reitstand-RowId + Zone + rohe Weltposition) - anders
+    /// als z.B. Aetheryten/Sightseeing gibt es keine Lumina-Sheet-Spalte, die einen Chocobokeep-NPC
+    /// direkt mit seiner "ChocoboTaxiStand"-RowId (siehe UIState.IsChocoboTaxiStandUnlocked) UND
+    /// seiner Weltposition verknüpft - das Sheet selbst kennt nur Name + erreichbare Nachbarstände
+    /// (TargetLocations), keine Zone/Position. Übernommen aus dem etablierten, quelloffen im
+    /// installierten Dalamud-Plugin "Henchman" enthaltenen Datensatz (Data/ChocoboTaxiStands.json,
+    /// per ilspycmd/Dateibetrachtung geprüft) - dieselbe Herangehensweise wie schon bei den
+    /// Aetheryte-Pin-Kommentaren oben (ManualAetherytePositions), nur diesmal die GESAMTE Datenbasis,
+    /// nicht nur ein paar Korrekturen.
+    /// </summary>
+    private static readonly ChocobokeepLocation[] ChocobokeepLocations =
+    {
+        new(1179669, 129, new(45.82275f, 19.97406f, -8.097595f)),
+        new(1179658, 130, new(55.35967f, 4.124078f, -143.8992f)),
+        new(1179650, 132, new(32.32222f, -0.05002153f, 70.31564f)),
+        new(1179670, 134, new(187.9367f, 98.52471f, -193.1733f)),
+        new(1179676, 135, new(503.1389f, 79.17908f, -74.80962f)),
+        new(1179675, 135, new(49.29806f, 29.3155f, 605.2917f)),
+        new(1179673, 137, new(12.93436f, 69.64355f, 21.32637f)),
+        new(1179677, 137, new(423.7469f, 18.52183f, 448.5948f)),
+        new(1179671, 138, new(667.7173f, 9.882255f, 487.3286f)),
+        new(1179672, 138, new(298.6616f, -24.99786f, 233.1584f)),
+        new(1179674, 139, new(413.3674f, 4.109592f, 88.74062f)),
+        new(1179659, 140, new(63.65807f, 45.20808f, -193.5759f)),
+        new(1179660, 140, new(-415.7931f, 23.08685f, -335.7137f)),
+        new(1179661, 140, new(-246.0823f, 32.44361f, 383.8406f)),
+        new(1179662, 141, new(-2.704952f, -2.055626f, -158.4958f)),
+        new(1179663, 145, new(-423.2201f, -39.06165f, 112.2323f)),
+        new(1179667, 145, new(-532.0974f, -0.1068726f, -199.8474f)),
+        new(1179664, 146, new(-176.196f, 26.90161f, -411.6122f)),
+        new(1179665, 146, new(-309.2189f, 7.375896f, 417.8488f)),
+        new(1179666, 147, new(54.94769f, 3.999763f, 443.2287f)),
+        new(1179668, 147, new(-41.30378f, 48f, -52.91935f)),
+        new(1179657, 148, new(22.962f, -8.000056f, 84.98597f)),
+        new(1179651, 152, new(-194.2932f, 1.00334f, 278.0651f)),
+        new(1179653, 153, new(172.4772f, 8.347722f, -47.46599f)),
+        new(1179654, 153, new(-207.4933f, 20.79546f, 346.9381f)),
+        new(1179652, 153, new(-203.4791f, 8.960648f, -57.11456f)),
+        new(1179656, 154, new(1.233066f, -46.5248f, 238.5829f)),
+        new(1179655, 154, new(320.5818f, -6.272354f, -72.78946f)),
+        new(1179680, 155, new(195.8394f, 302.3493f, -167.8459f)),
+        new(1179679, 155, new(231.2523f, 222.1874f, 316.5895f)),
+        new(1179681, 155, new(-473.8978f, 211f, -221.7772f)),
+        new(1179683, 156, new(427.5927f, -5.293147f, -462.4678f)),
+        new(1179682, 156, new(59.3728f, 20.69333f, -659.968f)),
+        new(1179685, 397, new(483.1342f, 217.9514f, 751.0815f)),
+        new(1179686, 397, new(-266.2535f, 127.1339f, 16.17947f)),
+        new(1179687, 398, new(549.8383f, -51.27571f, 68.96717f)),
+        new(1179688, 398, new(-209.3486f, -35.4085f, 162.9337f)),
+        new(1179689, 399, new(-50.2f, 100.7f, -203f)),
+        new(1179690, 400, new(265.156f, -42.55743f, 565.6061f)),
+        new(1179691, 400, new(-50.4167f, -8.866f, 146.5618f)),
+        new(1179692, 400, new(-521.2197f, 50f, 362.0813f)),
+        new(1179694, 401, new(-630.5486f, -119.6461f, 484.3669f)),
+        new(1179693, 401, new(-621.5f, -58.5f, -319.4f)),
+        new(1179684, 418, new(-163.428f, 2.171433f, -5.487687f)),
+        new(1179696, 612, new(-603.357f, 130.1747f, -470.634f)),
+        new(1179697, 612, new(461.9973f, 114.211f, 230.1517f)),
+        new(1179703, 613, new(44.16141f, 0.7360184f, -563.2119f)),
+        new(1179704, 613, new(318.4404f, -119.3103f, -207.9042f)),
+        new(1179706, 614, new(276.1819f, 8.117543f, -404.079f)),
+        new(1179705, 614, new(468.5731f, 68.22892f, -76.64232f)),
+        new(1179698, 620, new(49.2458f, 118.3919f, -728.944f)),
+        new(1179699, 620, new(-258.75f, 257.7096f, 721.2443f)),
+        new(1179700, 621, new(-510.0633f, 8.682312f, 20.98108f)),
+        new(1179701, 621, new(635.8892f, 80f, 668.8181f)),
+        new(1179707, 622, new(569.0254f, -19.23943f, 269.9413f)),
+        new(1179708, 622, new(501.4787f, 39.57227f, -464.447f)),
+        new(1179709, 622, new(86.35071f, 116.043f, -37.39996f)),
+        new(1179702, 628, new(-108.0097f, -7f, -65.83353f)),
+        new(1179695, 635, new(42.6823f, -1.192093e-07f, 24.52322f)),
+        new(1179723, 813, new(663.6119f, 45.41374f, -60.42229f)),
+        new(1179722, 813, new(-589.0135f, 67.15491f, -173.8156f)),
+        new(1179712, 814, new(692.3943f, 28.11711f, 298.0428f)),
+        new(1179710, 814, new(-412.2312f, 417.1398f, -599.4796f)),
+        new(1179711, 814, new(-236.9573f, 21.46942f, 346.8223f)),
+        new(1179720, 815, new(281.8935f, 1.468582f, -265.3657f)),
+        new(1179724, 815, new(386.1906f, -26.84075f, 275.5016f)),
+        new(1179719, 815, new(-492.6681f, 45.12946f, -284.9623f)),
+        new(1179716, 816, new(-432.0865f, 64.2068f, 549.9009f)),
+        new(1179714, 816, new(50.3217f, 101.7473f, -850.6052f)),
+        new(1179715, 816, new(351.7007f, 84.1652f, -647.0517f)),
+        new(1179717, 817, new(506.543f, -6.594435f, -267.6097f)),
+        new(1179718, 817, new(-105.9113f, -18.24823f, 271.1359f)),
+        new(1179721, 819, new(57.9945f, 36.24769f, -177.0935f)),
+        new(1179713, 820, new(-106.7369f, -9.999162f, -54.8562f)),
+        new(1179732, 956, new(394.0336f, 166.2036f, -499.9312f)),
+        new(1179733, 956, new(-29.46515f, -31.53013f, 17.10529f)),
+        new(1179734, 956, new(-696.531f, -31.53043f, 272.3326f)),
+        new(1179726, 957, new(132.4606f, 5.387928f, 605.0671f)),
+        new(1179727, 957, new(-469.8183f, 5.53548f, 32.07308f)),
+        new(1179728, 957, new(432.5914f, 3.148673f, -209.653f)),
+        new(1179729, 958, new(-333.5149f, 22.37715f, 474.225f)),
+        new(1179730, 958, new(509.4448f, 10.87966f, -413.2814f)),
+        new(1179731, 962, new(-43.02722f, 18f, -322.7847f)),
+        new(1179725, 963, new(79.23245f, -31.97063f, 221.0616f)),
+        new(1179735, 1185, new(-282.6906f, -0.01531982f, 69.05442f)),
+        new(1179736, 1187, new(295.3087f, -170.8743f, -466.0935f)),
+        new(1179737, 1187, new(486.188f, 114.935f, 654.1801f)),
+        new(1179738, 1188, new(-201.6319f, 2.47811f, -404.8669f)),
+        new(1179739, 1188, new(491.2382f, 112.9984f, 192.9706f)),
+        new(1179740, 1188, new(-450.8124f, 121.6325f, 323.1461f)),
+    };
+
+    private static List<CollectibleEntry>? chocobokeepEntriesCache;
+
+    /// <summary>
+    /// Alle Chocobo-Reitstände im gesamten Spiel (zonenunabhängige Gesamtliste, wie GetFrameKitEntries),
+    /// aus ChocobokeepLocations - Entry.Id ist bewusst die "ChocoboTaxiStand"-RowId (nicht irgendeine
+    /// NPC-/Level-RowId), damit IsOwned/ChocobokeepAutomation direkt IsChocoboTaxiStandUnlocked
+    /// aufrufen können, exakt wie bei Aetheryten (siehe IsAetheryteUnlocked).
+    /// </summary>
+    public static List<CollectibleEntry> GetChocobokeepEntries()
+    {
+        if (chocobokeepEntriesCache != null)
+            return chocobokeepEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+        if (territorySheet == null || mapSheet == null)
+            return result;
+
+        foreach (var loc in ChocobokeepLocations)
+        {
+            try
+            {
+                if (!territorySheet.TryGetRow(loc.TerritoryId, out var territory))
+                    continue;
+
+                var mapId = territory.Map.RowId;
+                if (mapId == 0 || !mapSheet.TryGetRow(mapId, out var map))
+                    continue;
+
+                var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+                    new Vector2(loc.Position.X, loc.Position.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+
+                result.Add(new CollectibleEntry
+                {
+                    Id = loc.ChocoboTaxiStandId,
+                    Name = "Chocobokeep",
+                    Type = CollectibleType.Chocobokeep,
+                    Category = Loc.T("Chocobokeep", "Chocobokeep"),
+                    TerritoryTypeId = loc.TerritoryId,
+                    MapId = mapId,
+                    VendorMapX = mapCoords.X,
+                    VendorMapY = mapCoords.Y,
+                    // Für ChocobokeepAutomation (läuft direkt zur rohen Weltposition, statt wie
+                    // OpenEntryMap den Umweg über die Kartenkoordinate zu gehen).
+                    WorldPosition = loc.Position,
+                    Source = Loc.T("Chocobokeep", "Chocobokeep"),
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Fehler bei Chocobokeep-Standort (TaxiStandId={loc.ChocoboTaxiStandId}) - übersprungen.");
+            }
+        }
+
+        chocobokeepEntriesCache = result;
+        return result;
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump zur Kalibrierung von GetChocobokeepEntries - listet jeden Standort
+    /// mitsamt aufgelöster Zone/Karte und aktuellem Freischalt-Status.
+    /// </summary>
+    public static void DumpChocobokeepDebugInfo()
+    {
+        chocobokeepEntriesCache = null;
+        var entries = GetChocobokeepEntries();
+        Log.Info($"[ChocobokeepDebug] {entries.Count} Chocobokeep-Standorte gefunden:");
+        foreach (var entry in entries)
+        {
+            Log.Info($"[ChocobokeepDebug]   TaxiStandId={entry.Id}: Zone={entry.TerritoryTypeId}, MapId={entry.MapId}, " +
+                     $"Pos=({entry.VendorMapX:F1}, {entry.VendorMapY:F1}), unlocked={IsChocoboTaxiStandUnlocked(entry.Id)}");
+        }
+    }
+
     /// <summary>
     /// Prüft, ob ein saisonales Event (Winterstern, Valentionstag, ...) aktuell läuft - für den
     /// Ausschluss von Event-Quests, die laut Datenbank zwar existieren, aber gerade nicht
@@ -1053,6 +1247,158 @@ public sealed class Plugin : IDalamudPlugin
         return result;
     }
 
+    /// <summary>
+    /// Prüft alle Freischalt-/Annehmbarkeits-Bedingungen einer Quest AUSSER dem Vergabeort (den
+    /// prüft ComputeLiveZoneEntries zusätzlich selbst gegen acceptablePlaceNameIds der jeweiligen
+    /// Zone) - ausgelagert, damit dieselbe Logik auch zonenunabhängig für die globale Statistik
+    /// (siehe GetAllTrackedQuestIds/MainWindow.DrawStatisticsPage) genutzt werden kann, ohne sie
+    /// doppelt zu pflegen.
+    /// </summary>
+    private unsafe bool IsQuestCurrentlyAcceptable(Quest row, byte playerLevel)
+    {
+        if (row.IsRepeatable)
+            return false;
+        if (row.BeastTribe.RowId != 0)
+            return false;
+        if (row.JournalGenre.RowId == 0)
+            return false;
+
+        // Hauptquests (MSQ) gehören nicht in eine Sammelobjekt-Übersicht - erkannt über
+        // die JournalSection (0 = "Main Scenario" ARR-EW, 1 = "Main Scenario" Dawntrail).
+        var journalSection = row.JournalGenre.ValueNullable?.JournalCategory.ValueNullable?.JournalSection.RowId;
+        if (journalSection is 0 or 1)
+            return false;
+
+        // Saisonale Event-Quests (Winterstern, Valentionstag, etc.) nur zeigen, wenn das
+        // zugehörige Event aktuell auch wirklich läuft - sonst wären sie "annehmbar"
+        // laut Datenbank, aber im Spiel gerade gar nicht verfügbar.
+        if (row.Festival.RowId != 0 && !IsFestivalActive((ushort)row.Festival.RowId))
+            return false;
+
+        // An eine bestimmte Große Kompanie (Sturmgarde/Zweiter Adler/Unsterbliche
+        // Flammen) gebundene Quests (z.B. "My Little Chocobo (Maelstrom)") nur zeigen,
+        // wenn der Charakter tatsächlich dieser Kompanie angehört - sonst stünde die
+        // Quest laut Datenbank als "annehmbar" da, obwohl man einer anderen/gar keiner
+        // Kompanie beigetreten ist und sie im Spiel gar nicht annehmen kann.
+        if (row.GrandCompany.RowId != 0 && row.GrandCompany.RowId != PlayerState.Instance()->GrandCompany)
+            return false;
+
+        // Klassengebundene Quests bewusst ausklammern - aber nicht nur Kategorie 1 ("All
+        // Classes") akzeptieren, sondern jede Kategorie, deren Name mit "All" beginnt
+        // (z.B. Kategorie 130 "All classes and jobs (excluding limited jobs)"). Das
+        // deckt die meisten normalen Quests ab, die nur Limited Jobs wie Blue Mage ausschließen.
+        // WICHTIG: Der Name muss explizit auf Englisch abgefragt werden - row.ClassJobCategory0
+        // liefert sonst den Namen in der Spielclient-Sprache (z.B. Deutsch "Alle Klassen"),
+        // der nie mit "All" beginnt und dadurch ausnahmslos JEDE Quest ausgeschlossen hätte.
+        var categoryName = GetEnglishClassJobCategoryName(row.ClassJobCategory0.RowId);
+        if (!categoryName.StartsWith("All", StringComparison.Ordinal))
+            return false;
+        if (row.ClassJobLevel[0] > playerLevel)
+            return false;
+
+        var hasPrev = false;
+        var prevOk = false;
+        foreach (var prev in row.PreviousQuest)
+        {
+            if (prev.RowId == 0)
+                continue;
+
+            hasPrev = true;
+            if (QuestManager.IsQuestComplete((ushort)prev.RowId))
+            {
+                prevOk = true;
+                break;
+            }
+        }
+
+        if (hasPrev && !prevOk)
+            return false;
+
+        // Separate Sperre für Quests, die zwar keinen direkten Vorgänger in derselben
+        // Questreihe haben (PreviousQuest bleibt dafür leer), aber trotzdem erst nach
+        // Erreichen eines bestimmten Story-/Erweiterungsfortschritts angeboten werden
+        // (z.B. viele Nebenquests, die "irgendwann in Endwalker" freischalten) - ohne
+        // diesen Check standen solche Quests fälschlich als "annehmbar" da, obwohl sie
+        // auf der Karte noch gar kein Icon hatten (siehe "Wings of Hope").
+        var hasLock = false;
+        var lockOk = false;
+        foreach (var lockRef in row.QuestLock)
+        {
+            if (lockRef.RowId == 0)
+                continue;
+
+            hasLock = true;
+            if (QuestManager.IsQuestComplete((ushort)lockRef.RowId))
+            {
+                lockOk = true;
+                break;
+            }
+        }
+
+        if (hasLock && !lockOk)
+            return false;
+
+        // Manche Quests setzen zusätzlich (oder statt QuestLock) einen abgeschlossenen
+        // Dungeon/Trial voraus.
+        var hasInstanceLock = false;
+        var instanceLockOk = false;
+        foreach (var instanceRef in row.InstanceContent)
+        {
+            if (instanceRef.RowId == 0)
+                continue;
+
+            hasInstanceLock = true;
+            if (instanceRef.ValueNullable is { } instanceRow && UnlockState.IsInstanceContentUnlocked(instanceRow))
+            {
+                instanceLockOk = true;
+                break;
+            }
+        }
+
+        if (hasInstanceLock && !instanceLockOk)
+            return false;
+
+        return !string.IsNullOrEmpty(row.Name.ToString());
+    }
+
+    private static List<uint>? globalQuestIdsCache;
+
+    /// <summary>
+    /// Alle Quests, die der Charakter aktuell (unabhängig von der Zone) annehmen könnte oder
+    /// bereits abgeschlossen hat - für die globale Statistik (siehe MainWindow.DrawStatisticsPage).
+    /// Anders als ComputeLiveZoneEntries wird hier NICHT nach Vergabeort gefiltert, sondern einmal
+    /// über das komplette Quest-Sheet gegangen. Wird wie frameKitEntriesCache nur einmal pro
+    /// Plugin-Sitzung berechnet (nicht jeden Frame) - neu erreichte Story-/Level-Fortschritte, die
+    /// weitere Quests freischalten, tauchen erst nach einem Plugin-Neuladen in der Statistik auf.
+    /// </summary>
+    public unsafe List<uint> GetAllTrackedQuestIds()
+    {
+        if (globalQuestIdsCache != null)
+            return globalQuestIdsCache;
+
+        var result = new List<uint>();
+        var questSheet = DataManager.GetExcelSheet<Quest>();
+        var playerLevel = ObjectTable.LocalPlayer?.Level ?? 0;
+        if (questSheet != null && playerLevel > 0)
+        {
+            foreach (var row in questSheet)
+            {
+                try
+                {
+                    if (IsQuestCurrentlyAcceptable(row, playerLevel))
+                        result.Add(row.RowId);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler bei Quest-Zeile {row.RowId} (globale Statistik)");
+                }
+            }
+        }
+
+        globalQuestIdsCache = result;
+        return result;
+    }
+
     private unsafe List<CollectibleEntry> ComputeLiveZoneEntries(uint territoryId)
     {
         var result = new List<CollectibleEntry>();
@@ -1170,112 +1516,10 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     if (!acceptablePlaceNameIds.Contains(row.PlaceName.RowId))
                         continue;
-                    if (row.IsRepeatable)
-                        continue;
-                    if (row.BeastTribe.RowId != 0)
-                        continue;
-                    if (row.JournalGenre.RowId == 0)
-                        continue;
-
-                    // Hauptquests (MSQ) gehören nicht in eine Sammelobjekt-Übersicht - erkannt über
-                    // die JournalSection (0 = "Main Scenario" ARR-EW, 1 = "Main Scenario" Dawntrail).
-                    var journalSection = row.JournalGenre.ValueNullable?.JournalCategory.ValueNullable?.JournalSection.RowId;
-                    if (journalSection is 0 or 1)
-                        continue;
-
-                    // Saisonale Event-Quests (Winterstern, Valentionstag, etc.) nur zeigen, wenn das
-                    // zugehörige Event aktuell auch wirklich läuft - sonst wären sie "annehmbar"
-                    // laut Datenbank, aber im Spiel gerade gar nicht verfügbar.
-                    if (row.Festival.RowId != 0 && !IsFestivalActive((ushort)row.Festival.RowId))
-                        continue;
-
-                    // An eine bestimmte Große Kompanie (Sturmgarde/Zweiter Adler/Unsterbliche
-                    // Flammen) gebundene Quests (z.B. "My Little Chocobo (Maelstrom)") nur zeigen,
-                    // wenn der Charakter tatsächlich dieser Kompanie angehört - sonst stünde die
-                    // Quest laut Datenbank als "annehmbar" da, obwohl man einer anderen/gar keiner
-                    // Kompanie beigetreten ist und sie im Spiel gar nicht annehmen kann.
-                    if (row.GrandCompany.RowId != 0 && row.GrandCompany.RowId != PlayerState.Instance()->GrandCompany)
-                        continue;
-
-                    // Klassengebundene Quests bewusst ausklammern - aber nicht nur Kategorie 1 ("All
-                    // Classes") akzeptieren, sondern jede Kategorie, deren Name mit "All" beginnt
-                    // (z.B. Kategorie 130 "All classes and jobs (excluding limited jobs)"). Das
-                    // deckt die meisten normalen Quests ab, die nur Limited Jobs wie Blue Mage ausschließen.
-                    // WICHTIG: Der Name muss explizit auf Englisch abgefragt werden - row.ClassJobCategory0
-                    // liefert sonst den Namen in der Spielclient-Sprache (z.B. Deutsch "Alle Klassen"),
-                    // der nie mit "All" beginnt und dadurch ausnahmslos JEDE Quest ausgeschlossen hätte.
-                    var categoryName = GetEnglishClassJobCategoryName(row.ClassJobCategory0.RowId);
-                    if (!categoryName.StartsWith("All", StringComparison.Ordinal))
-                        continue;
-                    if (row.ClassJobLevel[0] > playerLevel)
-                        continue;
-
-                    var hasPrev = false;
-                    var prevOk = false;
-                    foreach (var prev in row.PreviousQuest)
-                    {
-                        if (prev.RowId == 0)
-                            continue;
-
-                        hasPrev = true;
-                        if (QuestManager.IsQuestComplete((ushort)prev.RowId))
-                        {
-                            prevOk = true;
-                            break;
-                        }
-                    }
-
-                    if (hasPrev && !prevOk)
-                        continue;
-
-                    // Separate Sperre für Quests, die zwar keinen direkten Vorgänger in derselben
-                    // Questreihe haben (PreviousQuest bleibt dafür leer), aber trotzdem erst nach
-                    // Erreichen eines bestimmten Story-/Erweiterungsfortschritts angeboten werden
-                    // (z.B. viele Nebenquests, die "irgendwann in Endwalker" freischalten) - ohne
-                    // diesen Check standen solche Quests fälschlich als "annehmbar" da, obwohl sie
-                    // auf der Karte noch gar kein Icon hatten (siehe "Wings of Hope").
-                    var hasLock = false;
-                    var lockOk = false;
-                    foreach (var lockRef in row.QuestLock)
-                    {
-                        if (lockRef.RowId == 0)
-                            continue;
-
-                        hasLock = true;
-                        if (QuestManager.IsQuestComplete((ushort)lockRef.RowId))
-                        {
-                            lockOk = true;
-                            break;
-                        }
-                    }
-
-                    if (hasLock && !lockOk)
-                        continue;
-
-                    // Manche Quests setzen zusätzlich (oder statt QuestLock) einen abgeschlossenen
-                    // Dungeon/Trial voraus.
-                    var hasInstanceLock = false;
-                    var instanceLockOk = false;
-                    foreach (var instanceRef in row.InstanceContent)
-                    {
-                        if (instanceRef.RowId == 0)
-                            continue;
-
-                        hasInstanceLock = true;
-                        if (instanceRef.ValueNullable is { } instanceRow && UnlockState.IsInstanceContentUnlocked(instanceRow))
-                        {
-                            instanceLockOk = true;
-                            break;
-                        }
-                    }
-
-                    if (hasInstanceLock && !instanceLockOk)
+                    if (!IsQuestCurrentlyAcceptable(row, playerLevel))
                         continue;
 
                     var name = row.Name.ToString();
-                    if (string.IsNullOrEmpty(name))
-                        continue;
-
                     var (mapId, issuerTerritoryId, mapX, mapY) = ResolveIssuerMapPosition(row);
 
                     result.Add(new CollectibleEntry
@@ -1572,21 +1816,24 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Ob mindestens ein sichtbares, echtes natives Spielfenster (z.B. Währungs-, Inventar- oder
+    /// Liefert für jedes sichtbare, echte native Spielfenster (z.B. Währungs-, Inventar- oder
     /// Charakterfenster - erkannt über AtkUnitBase.WindowNode != null, das nur bei tatsächlich
     /// beweglichen Fenstern mit Titelleiste gesetzt ist, nicht bei fest verankerten HUD-Elementen
-    /// wie Aktionsleisten) den übergebenen Bildschirmbereich überlappt. Dalamud/ImGui zeichnet
+    /// wie Aktionsleisten), das den übergebenen Bildschirmbereich überlappt, das jeweilige
+    /// Überlappungsrechteck (auf min/max dieses Bereichs begrenzt). Dalamud/ImGui zeichnet
     /// grundsätzlich IMMER nach (also über) dem nativen Spiel-UI in einem einzigen Rendering-
-    /// Durchgang - es gibt keine echte Z-Order zwischen beiden. Als einzig praktikabler Ersatz für
-    /// "unser Overlay soll hinter einem darüber gezogenen Spielfenster verschwinden" wird das
-    /// Overlay bei einer Überlappung deshalb selbst komplett unsichtbar gemacht (siehe
-    /// CompactOverlayWindow.Draw), nicht wirklich "dahinter" gezeichnet.
+    /// Durchgang - es gibt keine echte Z-Order zwischen beiden. CompactOverlayWindow nutzt die
+    /// zurückgegebenen Rechtecke deshalb, um dort gezielt (a) per ImGuiP.SetWindowHitTestHole
+    /// Mausklicks ans native Fenster durchzureichen und (b) nur die betroffenen Inhaltszeilen
+    /// unsichtbar zu machen, statt (wie früher) das gesamte Overlay bei jeder noch so kleinen
+    /// Überlappung komplett auszublenden.
     /// </summary>
-    public static unsafe bool IsOverlappedByVisibleNativeWindow(Vector2 min, Vector2 max)
+    public static unsafe List<(Vector2 Min, Vector2 Max)> GetOverlappingNativeWindowRects(Vector2 min, Vector2 max)
     {
+        var result = new List<(Vector2 Min, Vector2 Max)>();
         var unitManager = RaptureAtkUnitManager.Instance();
         if (unitManager == null)
-            return false;
+            return result;
 
         var list = unitManager->AllLoadedUnitsList;
         for (var i = 0; i < list.Count; i++)
@@ -1598,11 +1845,13 @@ public sealed class Plugin : IDalamudPlugin
             var unitMin = new Vector2(unit->X, unit->Y);
             var unitMax = unitMin + new Vector2(unit->GetScaledWidth(true), unit->GetScaledHeight(true));
 
-            if (unitMin.X < max.X && unitMax.X > min.X && unitMin.Y < max.Y && unitMax.Y > min.Y)
-                return true;
+            var overlapMin = new Vector2(System.Math.Max(unitMin.X, min.X), System.Math.Max(unitMin.Y, min.Y));
+            var overlapMax = new Vector2(System.Math.Min(unitMax.X, max.X), System.Math.Min(unitMax.Y, max.Y));
+            if (overlapMin.X < overlapMax.X && overlapMin.Y < overlapMax.Y)
+                result.Add((overlapMin, overlapMax));
         }
 
-        return false;
+        return result;
     }
 
     /// <summary>
