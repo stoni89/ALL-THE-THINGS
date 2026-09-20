@@ -69,12 +69,11 @@ public class CompactOverlayWindow : Window
     public override bool DrawConditions() =>
         Plugin.ClientState.IsLoggedIn && !Plugin.Condition[ConditionFlag.BetweenAreas] && !Plugin.Condition[ConditionFlag.BetweenAreas51];
 
-    // Bewusst FEST (nicht von CompactTransparency abhängig) - der Resize-Griff unten rechts soll
-    // auch bei voller Transparenz sichtbar bleiben, sonst sieht man gar nicht mehr, wo das Fenster
-    // endet bzw. wo man es zum Skalieren greifen kann.
-    private static readonly Vector4 ResizeGripColor = new(0.62f, 0.38f, 0.85f, 1f);
-    private static readonly Vector4 ResizeGripHoveredColor = new(0.74f, 0.48f, 0.98f, 1f);
-    private static readonly Vector4 ResizeGripActiveColor = new(0.82f, 0.58f, 1f, 1f);
+    // Dezentes Weiß-Grau statt der vorherigen lila Farbe - klein und unauffällig, zeigt aber
+    // weiterhin an, wo sich das Fenster zum Skalieren greifen lässt.
+    private static readonly Vector4 ResizeGripColor = new(1f, 1f, 1f, 0.25f);
+    private static readonly Vector4 ResizeGripHoveredColor = new(1f, 1f, 1f, 0.5f);
+    private static readonly Vector4 ResizeGripActiveColor = new(1f, 1f, 1f, 0.7f);
 
     public override void PreDraw()
     {
@@ -87,9 +86,10 @@ public class CompactOverlayWindow : Window
         hiddenBehindNativeWindow = lastWindowMin.HasValue && lastWindowMax.HasValue &&
             Plugin.IsOverlappedByVisibleNativeWindow(lastWindowMin.Value, lastWindowMax.Value);
 
-        // Gesperrt = weder verschiebbar noch skalierbar - ImGui blendet den Resize-Griff dann
-        // automatisch aus (kein zusätzlicher Farb-Trick nötig), macht also gleich beides.
-        Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize : BaseFlags;
+        // Gesperrt = nur die Position fixiert, nicht die Größe - das Fenster bleibt also auch im
+        // gesperrten Zustand an der Ecke skalierbar (z.B. wenn ein Mount-Name nicht mehr in die
+        // aktuelle Breite passt), nur das versehentliche Verschieben wird verhindert.
+        Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove : BaseFlags;
         if (hiddenBehindNativeWindow)
             Flags |= ImGuiWindowFlags.NoMouseInputs;
 

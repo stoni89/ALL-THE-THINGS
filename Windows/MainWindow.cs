@@ -739,7 +739,7 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
         var locked = config.CompactLocked;
-        if (ModernUi.ToggleRow(Loc.T("Fenster sperren (Position & Größe)", "Lock window (position & size)"), ref locked))
+        if (ModernUi.ToggleRow(Loc.T("Fenster sperren", "Lock window"), ref locked))
         {
             config.CompactLocked = locked;
             config.Save();
