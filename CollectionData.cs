@@ -20,21 +20,28 @@ public class CollectibleEntry
     public string Name { get; init; } = string.Empty;
     public CollectibleType Type { get; init; }
     public string Category { get; init; } = string.Empty; // Beschaffungsart, z.B. "Quest", "Errungenschaft", "Echtgeld-Shop"
-    public uint TerritoryTypeId { get; init; } // Zone, in der der Eintrag angezeigt wird (Lumina "TerritoryType" Sheet)
-    public uint MapId { get; init; } // Lumina "Map" Sheet, für MapLinkPayload benötigt
+    // Absichtlich set statt init - Plugin.EnrichEntriesWithZoneFromSource trägt diese beiden Felder
+    // nachträglich für Einträge nach, deren JSON-Datei nur den Fundort als Klartext (Source, z.B.
+    // ein Dungeon-Name) kennt, aber keine Zone.
+    public uint TerritoryTypeId { get; set; } // Zone, in der der Eintrag angezeigt wird (Lumina "TerritoryType" Sheet)
+    public uint MapId { get; set; } // Lumina "Map" Sheet, für MapLinkPayload benötigt
 
     // Für Kartenlinks, deren Flagge auf einer ANDEREN Karte liegt als die Zone, in der der Eintrag
     // angezeigt wird (z.B. ein Aethernetz-Kristall, der laut Spiel auf der Nachbarkarte markiert
     // wird) - null bedeutet "gleiche Zone wie TerritoryTypeId" (Normalfall).
     public uint? FlagTerritoryTypeId { get; init; }
-    public string Vendor { get; init; } = string.Empty; // Händler-/NPC-Name, falls per Kauf erhältlich
-    public float VendorMapX { get; init; } // Kartenkoordinate des Händlers (0 = unbekannt)
-    public float VendorMapY { get; init; }
-    public string Currency { get; init; } = string.Empty; // Preis/Währung, falls per Kauf erhältlich
-    public uint CurrencyIconId { get; init; } // Icon-ID der Währung (0 = unbekannt)
-    public uint CurrencyItemId { get; init; } // Item-ID der Währung, für Inventar-Abfrage (0 = unbekannt)
-    public uint CurrencyAmount { get; init; } // benötigte Menge der Währung
-    public string Source { get; init; } = string.Empty; // z.B. "Dungeon Drop", "Vendor", "Quest"
+
+    // Absichtlich set statt init (wie TerritoryTypeId/MapId oben) - Plugin.EnrichFrameKitVendors
+    // trägt Händler-Infos für Portrait-Rahmen nach, die als Framer's-Kit-Item bei einem NPC
+    // gekauft werden können (siehe GetFrameKitEntries - dort zunächst ohne Fundort angelegt).
+    public string Vendor { get; set; } = string.Empty; // Händler-/NPC-Name, falls per Kauf erhältlich
+    public float VendorMapX { get; set; } // Kartenkoordinate des Händlers (0 = unbekannt)
+    public float VendorMapY { get; set; }
+    public string Currency { get; set; } = string.Empty; // Preis/Währung, falls per Kauf erhältlich
+    public uint CurrencyIconId { get; set; } // Icon-ID der Währung (0 = unbekannt)
+    public uint CurrencyItemId { get; set; } // Item-ID der Währung, für Inventar-Abfrage (0 = unbekannt)
+    public uint CurrencyAmount { get; set; } // benötigte Menge der Währung
+    public string Source { get; set; } = string.Empty; // z.B. "Dungeon Drop", "Vendor", "Quest"
 
     // Nur für Hunting-Log-Einträge (siehe Plugin.GetHuntingLogEntries/ManualHuntingLogPositions) -
     // roamende Monster haben keine Kartenkoordinate wie Händler/Aetheryten, sondern (falls bekannt)
@@ -46,6 +53,19 @@ public class CollectibleEntry
     // Monster in der Objekttabelle zu finden (und RotationSolver mitzuteilen, welches priorisiert
     // angegriffen werden soll).
     public uint? BNpcNameId { get; init; }
+
+    // Nur für Sightseeing-Log-Einträge - manche Aussichtspunkte (Lumina "Adventure".Emote) schalten
+    // erst frei, wenn man am Zielort einen bestimmten Emote ausführt, nicht durch reine Nähe. Der
+    // Chat-Befehl (z.B. "/sit") kommt direkt aus dem verlinkten Emote/TextCommand-Sheet.
+    public string? RequiredEmoteCommand { get; init; }
+
+    // Nur für Portrait-Rahmen (siehe Plugin.GetFrameKitEntries) - ein Rahmen kann über ganz
+    // unterschiedliche Wege freigeschaltet werden (Quest, Errungenschaft, Duty, Emote/Minion/
+    // Mount/Ornament-Besitz, oder ein separates "Framer's Kit"-Item). Id allein (die BannerFrame-
+    // RowId) reicht für den Freischalt-Check nicht - dafür diese beiden zusätzlichen Felder, deren
+    // FrameKitUnlockId je nach FrameKitUnlockKind eine andere Sheet-RowId meint.
+    public FrameKitUnlockKind? FrameKitUnlockKind { get; init; }
+    public uint FrameKitUnlockId { get; init; }
 
     public bool HasVendorLocation => TerritoryTypeId != 0 && MapId != 0 && (VendorMapX != 0 || VendorMapY != 0);
 
@@ -69,6 +89,24 @@ public enum CollectibleType
     Quest,
     HuntingLog,
     AetherCurrent,
+    Sightseeing,
+}
+
+/// <summary>
+/// Auf welchem Weg ein Portrait-Rahmen freigeschaltet wird - siehe Plugin.GetFrameKitEntries für
+/// die Herleitung aus dem Lumina-Sheet "BannerCondition".
+/// </summary>
+public enum FrameKitUnlockKind
+{
+    Unknown,
+    Quest,
+    Duty,
+    Achievement,
+    Emote,
+    Minion,
+    Mount,
+    Ornament,
+    FramersKitItem,
 }
 
 public static class CollectionData
@@ -81,10 +119,13 @@ public static class CollectionData
         Converters = { new JsonStringEnumConverter(), new Vector3JsonConverter() },
     };
 
+    // "frames.json" (Portrait-Rahmen) gibt es bewusst nicht mehr - die Freischalt-Wege dafür sind
+    // zu unterschiedlich (Quest/Errungenschaft/Duty/Emote/Minion/Mount/Ornament/Kit-Item), um sie
+    // von Hand zu pflegen. Stattdessen live aus Lumina aufgelöst, siehe Plugin.GetFrameKitEntries.
     private static readonly string[] DataFiles =
     {
         "mounts.json", "minions.json", "orchestrions.json", "bardings.json",
-        "emotes.json", "facewear.json", "fashions.json", "triadcards.json", "frames.json",
+        "emotes.json", "facewear.json", "fashions.json", "triadcards.json",
         "aethercurrents.json",
     };
 
@@ -107,6 +148,15 @@ public static class CollectionData
             if (loaded != null)
                 entries.AddRange(loaded);
         }
+
+        // Viele Dungeon-Drops (Truhen-Notenrollen, Triple-Triad-Karten, Minions - siehe Category
+        // "Dungeon" in den JSON-Dateien) haben dort nur den Dungeon-Namen als Klartext in Source
+        // stehen, aber keine Zone - dadurch tauchten sie im Overlay nie auf, auch nicht, wenn man
+        // tatsächlich gerade in genau diesem Dungeon steht. Live aus Lumina nachgetragen, kein
+        // Community-Export nötig.
+        Plugin.EnrichEntriesWithZoneFromSource(entries);
+
+        entries.AddRange(Plugin.GetFrameKitEntries());
 
         cachedEntries = entries;
         return entries;

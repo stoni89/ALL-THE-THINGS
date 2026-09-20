@@ -13,7 +13,10 @@ using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using Lumina.Excel.Sheets;
+using LuminaSupplemental.Excel.Model;
+using LuminaSupplemental.Excel.Services;
 using AllTheThings.Windows;
 
 namespace AllTheThings;
@@ -32,6 +35,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ITargetManager TargetManager { get; private set; } = null!;
     [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
+    [PluginService] internal static IUnlockState UnlockState { get; private set; } = null!;
 
     private const string CommandName = "/att";
 
@@ -49,6 +53,7 @@ public sealed class Plugin : IDalamudPlugin
     public GoToAutomation GoToAutomation { get; init; }
     public HuntingLogAutomation HuntingLogAutomation { get; init; }
     public AetherCurrentAutomation AetherCurrentAutomation { get; init; }
+    public SightseeingAutomation SightseeingAutomation { get; init; }
 
     public Plugin()
     {
@@ -62,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         GoToAutomation = new GoToAutomation();
         HuntingLogAutomation = new HuntingLogAutomation();
         AetherCurrentAutomation = new AetherCurrentAutomation();
+        SightseeingAutomation = new SightseeingAutomation();
 
         MainWindow = new MainWindow(this);
         WindowSystem.AddWindow(MainWindow);
@@ -108,9 +114,10 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.Facewear => PlayerState.Instance()->IsGlassesUnlocked((ushort)entry.Id),
             CollectibleType.FashionAccessory => PlayerState.Instance()->IsOrnamentUnlocked(entry.Id),
             CollectibleType.TripleTriadCard => UIState.Instance()->IsTripleTriadCardUnlocked((ushort)entry.Id),
-            CollectibleType.FrameKit => PlayerState.Instance()->IsFramersKitUnlocked(entry.Id),
+            CollectibleType.FrameKit => IsFrameKitUnlocked(entry),
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
+            CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
             CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id),
             _ => false,
         };
@@ -131,6 +138,683 @@ public sealed class Plugin : IDalamudPlugin
     public static unsafe bool IsAetherCurrentUnlocked(uint aetherCurrentId) => PlayerState.Instance()->IsAetherCurrentUnlocked(aetherCurrentId);
 
     /// <summary>
+    /// Ob ein Sightseeing-Log-Eintrag (Lumina "Adventure"-Zeile) bereits abgeschlossen ist - nutzt
+    /// Dalamuds eigenen IUnlockState-Service statt direkt FFXIVClientStructs, da IsAdventureComplete
+    /// dort schon fertig als offizielle API bereitsteht.
+    /// </summary>
+    public static bool IsAdventureComplete(uint adventureId)
+    {
+        var sheet = DataManager.GetExcelSheet<Adventure>();
+        return sheet != null && sheet.TryGetRow(adventureId, out var row) && UnlockState.IsAdventureComplete(row);
+    }
+
+    /// <summary>
+    /// Ob das Sightseeing Log überhaupt schon freigeschaltet ist (unabhängig von einzelnen
+    /// Ätherströmungen o.ä. - ein ganz frischer Charakter hat es noch gar nicht). Dalamuds
+    /// IUnlockState hat dafür keine eigene Methode, daher direkt das rohe Byte-Feld aus
+    /// PlayerState - dessen genaue Bit-Bedeutung (z.B. ob es je Erweiterung mitzählt) ist nicht
+    /// dokumentiert, "!= 0" bedeutet aber zuverlässig "noch gar nicht freigeschaltet" vs. "schon".
+    /// </summary>
+    public static unsafe bool IsSightseeingLogUnlocked() => PlayerState.Instance()->SightseeingLogUnlockState != 0;
+
+    private static Dictionary<string, (uint TerritoryId, uint MapId)>? zoneByPlaceNameCache;
+
+    /// <summary>
+    /// Trägt TerritoryTypeId/MapId für Einträge nach, deren JSON-Datei nur den Fundort als
+    /// Klartext in Source kennt (z.B. "The Clyteum" bei einem Dungeon-Truhen-Drop), aber keine
+    /// Zone - betrifft vor allem Notenrollen/Minions/Triple-Triad-Karten mit Category "Dungeon"
+    /// (siehe CollectionData.GetAllEntries). Gleicht Source gegen die PlaceName-Spalte des Lumina-
+    /// Sheets "TerritoryType" ab (case-insensitive, führende/nachgestellte "*" wie bei "*The
+    /// Merchant's Tale*" entfernt) - Einträge, für die keine Übereinstimmung gefunden wird, bleiben
+    /// unverändert (TerritoryTypeId weiterhin 0, kein Rückschritt gegenüber vorher).
+    /// </summary>
+    public static void EnrichEntriesWithZoneFromSource(List<CollectibleEntry> entries)
+    {
+        if (zoneByPlaceNameCache == null)
+        {
+            zoneByPlaceNameCache = new Dictionary<string, (uint TerritoryId, uint MapId)>(StringComparer.OrdinalIgnoreCase);
+            var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+            if (territorySheet != null)
+            {
+                foreach (var territory in territorySheet)
+                {
+                    var placeName = territory.PlaceName.ValueNullable?.Name.ToString();
+                    if (string.IsNullOrEmpty(placeName) || zoneByPlaceNameCache.ContainsKey(placeName))
+                        continue;
+
+                    zoneByPlaceNameCache[placeName] = (territory.RowId, territory.Map.RowId);
+                }
+            }
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry.TerritoryTypeId != 0 || string.IsNullOrEmpty(entry.Source))
+                continue;
+
+            var source = entry.Source.Trim().Trim('*');
+            if (!zoneByPlaceNameCache.TryGetValue(source, out var zone))
+                continue;
+
+            entry.TerritoryTypeId = zone.TerritoryId;
+            entry.MapId = zone.MapId;
+        }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump zur Kalibrierung von EnrichEntriesWithZoneFromSource - listet jeden
+    /// "Dungeon"-Eintrag (Category enthält "Dungeon"), dem auch nach der Anreicherung noch eine
+    /// Zone fehlt, mitsamt seinem Source-Text, damit sich nicht erkannte Zonennamen gezielt
+    /// nachtragen lassen (z.B. Tippfehler oder Zonennamen, die sich zwischen Quelle und Lumina
+    /// unterscheiden).
+    /// </summary>
+    public static void DumpZoneEnrichmentDebugInfo()
+    {
+        var entries = CollectionData.GetAllEntries();
+        var dungeonEntries = entries.Where(e => e.Category.Contains("Dungeon", StringComparison.OrdinalIgnoreCase)).ToList();
+        var stillMissing = dungeonEntries.Where(e => e.TerritoryTypeId == 0).ToList();
+
+        Log.Info($"[ZoneEnrichmentDebug] {dungeonEntries.Count} Dungeon-Einträge insgesamt, {stillMissing.Count} davon noch ohne Zone:");
+        foreach (var entry in stillMissing)
+            Log.Info($"[ZoneEnrichmentDebug]   {entry.Type} \"{entry.Name}\": Source=\"{entry.Source}\"");
+    }
+
+    private static List<CollectibleEntry>? frameKitEntriesCache;
+
+    /// <summary>
+    /// Baut die vollständige Liste aller Portrait-Rahmen live aus Lumina auf ("BannerFrame"-Sheet),
+    /// mit dem jeweils korrekten Freischalt-Weg (siehe ResolveFrameUnlock) - Rahmen sind über ganz
+    /// unterschiedliche Mechaniken freischaltbar (Quest, Errungenschaft, Duty, Emote/Minion/Mount/
+    /// Ornament-Besitz oder ein separates "Framer's Kit"-Item), weshalb eine einzige statische
+    /// Datendatei (wie bei Mounts/Minions) hier nicht ausreicht. Nach dem Vorbild des Dalamud-
+    /// Plugins "Collections" (github.com/Seventhxiv/Collections), dessen Quellcode für die Quest/
+    /// Errungenschaft/Kit-Item-Fälle als Referenz diente - Duty/Emote/Minion/Mount/Ornament deckt
+    /// Collections selbst nicht ab, das kommt hier zusätzlich aus dem generischen Sheet-Schema.
+    /// Rahmen mit einem unbekannten/nicht abgedeckten Freischalt-Typ (z.B. der seltene verkettete
+    /// Sonderfall, den auch Collections nur über eine fragile Row-Offset-Heuristik löst) werden mit
+    /// FrameKitUnlockKind.Unknown eingetragen - IsFrameKitUnlocked liefert dafür konservativ false,
+    /// ganz ohne Fundort/Automation-Bezug (matcht das Verhalten für global unerreichbare Objekte wie
+    /// "Legacy Campaign"-Mounts, die ebenfalls TerritoryTypeId=0 haben).
+    /// </summary>
+    public static List<CollectibleEntry> GetFrameKitEntries()
+    {
+        if (frameKitEntriesCache != null)
+            return frameKitEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        var frameSheet = DataManager.GetExcelSheet<BannerFrame>();
+        if (frameSheet == null)
+        {
+            frameKitEntriesCache = result;
+            return result;
+        }
+
+        foreach (var frame in frameSheet)
+        {
+            if (frame.RowId == 0)
+                continue;
+
+            var name = frame.Name.ToString();
+            if (string.IsNullOrEmpty(name))
+                continue;
+
+            var condition = frame.UnlockCondition.ValueNullable;
+            if (condition == null)
+                continue;
+
+            var unlock = ResolveFrameUnlock(condition.Value);
+            if (unlock == null)
+                continue;
+
+            result.Add(new CollectibleEntry
+            {
+                Id = frame.RowId,
+                Name = name,
+                Type = CollectibleType.FrameKit,
+                Category = Loc.T("Framer's Kit", "Framer's Kit"),
+                TerritoryTypeId = unlock.Value.TerritoryId,
+                MapId = unlock.Value.MapId,
+                VendorMapX = unlock.Value.X,
+                VendorMapY = unlock.Value.Y,
+                FrameKitUnlockKind = unlock.Value.Kind,
+                FrameKitUnlockId = unlock.Value.UnlockId,
+                Source = unlock.Value.Source,
+            });
+        }
+
+        // Kit-Item-Rahmen (FrameKitUnlockKind.FramersKitItem) haben bis hier IMMER TerritoryTypeId=0
+        // (siehe ResolveFrameUnlock) - für die per Händler kaufbaren darunter (z.B. FATE-Belohnungen
+        // wie "Sharlayan Stoa Framer's Kit") wird das hier live nachgetragen, sonst blieben sie im
+        // zonenbasierten Overlay für immer unsichtbar, obwohl der Eintrag existiert.
+        EnrichFrameKitVendors(result);
+
+        frameKitEntriesCache = result;
+        return result;
+    }
+
+    /// <summary>
+    /// Trägt Händler/Fundort für Portrait-Rahmen nach, die als "Framer's Kit"-Item bei einem NPC
+    /// gekauft werden können (FrameKitUnlockKind.FramersKitItem, siehe GetFrameKitEntries) - Item →
+    /// Shop kommt aus dem rohen Lumina-Sheet "SpecialShop" (Währungs-Tausch-Händler, z.B. FATE-/
+    /// Event-Währungen), Shop → NPC direkt aus "ENpcBase.ENpcData" (Shop-RowIds tauchen dort 1:1
+    /// wieder auf - das NuGet-Paket "LuminaSupplemental.Excel"s ENpcShop-CSV deckt davon nur eine
+    /// Handvoll ab, für die hier relevanten neueren SpecialShops leer). NPCs mit sehr vielen Shops
+    /// referenzieren in ENpcData statt der einzelnen SpecialShops nur eine Menüzeile (wegen des
+    /// 32-Slot-Limits von ENpcData) - je nach Händlertyp "TopicSelect" (Eureka-/Bozja-/Zadnor-
+    /// Quartiermeister), "FateShop" (reine FATE-Belohnungshändler) oder, nochmal eine Ebene tiefer,
+    /// "InclusionShop" → "InclusionShopCategory" → "InclusionShopSeries" (Bicolor-Gemstone-/
+    /// Achievement-Certificate-/Sammelwährungs-Tauschhändler, z.B. in den Städten) - werden alle
+    /// separat aufgelöst und zurückverfolgt. NPC → Weltposition primär
+    /// aus dem rohen Lumina-Sheet "Level" (ebenfalls direkt aus SE-Rohdaten, deckt deutlich mehr ab
+    /// als die ENpcPlace-CSV desselben NuGet-Pakets, die hier nur noch als Fallback dient). Reine
+    /// Gil-Händler (GilShopItem) werden absichtlich NICHT abgedeckt (siehe Kommentar unten) -
+    /// betrifft vermutlich nur einen kleinen Teil der Kit-Item-Rahmen.
+    /// </summary>
+    private readonly record struct FrameKitShopMatch(uint ShopId, uint CurrencyAmount, uint CurrencyItemId, uint CurrencyIconId, string CurrencyText);
+
+    private static void EnrichFrameKitVendors(List<CollectibleEntry> entries)
+    {
+        var candidates = entries
+            .Where(e => e.Type == CollectibleType.FrameKit && e.FrameKitUnlockKind == FrameKitUnlockKind.FramersKitItem && e.TerritoryTypeId == 0)
+            .ToList();
+        if (candidates.Count == 0)
+            return;
+
+        try
+        {
+            var itemSheet = DataManager.GetExcelSheet<Item>();
+            var specialShopSheet = DataManager.GetExcelSheet<SpecialShop>();
+            var npcResidentSheet = DataManager.GetExcelSheet<ENpcResident>();
+            var npcBaseSheet = DataManager.GetExcelSheet<ENpcBase>();
+            if (itemSheet == null || specialShopSheet == null || npcResidentSheet == null || npcBaseSheet == null)
+                return;
+
+            // additionalData (== die "kitId", siehe PlayerState.IsFramersKitUnlocked-Doku) -> Item -
+            // zusätzlich auf den Namen geprüft, da AdditionalData für ganz unterschiedliche Zwecke
+            // wiederverwendet wird, nicht nur für Framer's Kits (Kollisionsschutz).
+            var kitIdToItemRowId = new Dictionary<uint, uint>();
+            foreach (var item in itemSheet)
+            {
+                if (item.AdditionalData.RowId == 0)
+                    continue;
+                if (!item.Name.ToString().Contains("Framer's Kit", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                kitIdToItemRowId[item.AdditionalData.RowId] = item.RowId;
+            }
+
+            Log.Info($"[FrameKitDebug] kitIdToItemRowId.Count={kitIdToItemRowId.Count} (candidates={candidates.Count})");
+            if (kitIdToItemRowId.Count == 0)
+                return;
+
+            // EINMAL komplett durchgehen (nicht pro Kandidat!) und für jedes gefundene Framer's-Kit-
+            // Item direkt den Treffer merken - Shop-Zeilen einzeln in try/catch, da Lumina bei
+            // manchen (offenbar leeren/reservierten) SpecialShop-Zeilen beim Auslesen einzelner
+            // Slots eine NullReferenceException werfen kann (live beobachtet) - eine einzelne
+            // kaputte Zeile darf dabei nicht die komplette Anreicherung (und damit das ganze
+            // Overlay) mitreißen.
+            var targetItemRowIds = kitIdToItemRowId.Values.ToHashSet();
+            var itemRowIdToShopMatch = new Dictionary<uint, FrameKitShopMatch>();
+            foreach (var shop in specialShopSheet)
+            {
+                try
+                {
+                    foreach (var slot in shop.Item)
+                    {
+                        foreach (var receive in slot.ReceiveItems)
+                        {
+                            var itemRowId = receive.Item.RowId;
+                            if (itemRowId == 0 || !targetItemRowIds.Contains(itemRowId) || itemRowIdToShopMatch.ContainsKey(itemRowId))
+                                continue;
+
+                            uint costAmount = 0;
+                            uint costItemId = 0;
+                            uint costIconId = 0;
+                            string costName = "?";
+                            foreach (var cost in slot.ItemCosts)
+                            {
+                                if (cost.CurrencyCost == 0)
+                                    continue;
+
+                                costAmount = cost.CurrencyCost;
+                                costItemId = cost.ItemCost.RowId;
+                                var costItem = cost.ItemCost.ValueNullable;
+                                costIconId = costItem?.Icon ?? 0;
+                                costName = costItem?.Name.ToString() ?? "?";
+                                break;
+                            }
+
+                            if (costAmount == 0)
+                                continue;
+
+                            itemRowIdToShopMatch[itemRowId] = new FrameKitShopMatch(shop.RowId, costAmount, costItemId, costIconId, $"{costAmount:N0} {costName}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler beim Lesen von SpecialShop-Zeile {shop.RowId} - übersprungen.");
+                }
+            }
+
+            Log.Info($"[FrameKitDebug] itemRowIdToShopMatch.Count={itemRowIdToShopMatch.Count}");
+            if (itemRowIdToShopMatch.Count == 0)
+                return;
+
+            // LuminaSupplemental.Excel's ENpcShop-CSV deckt nur eine Handvoll (~33) Shops ab - für die
+            // hier relevanten (neueren, Fate-/Event-)SpecialShops komplett leer. GilShop/SpecialShop-
+            // RowIds liegen aber in einem eigenen, mit ENpcBase.ENpcData geteilten ID-Raum: jeder NPC,
+            // der einen Shop betreibt, hat die Shop-RowId direkt (ohne Offset) als einen der 32
+            // ENpcData-Einträge - das lässt sich also direkt aus den Rohdaten auflösen, ganz ohne CSV.
+            // NPCs mit SEHR vielen Shops (z.B. Eureka-/Bozja-/Zadnor-Quartiermeister, oder der Bicolor-
+            // Gemstone-Tauschhändler in den Städten, der FATE-Belohnungen aus ALLEN Zonen der jeweiligen
+            // Erweiterung anbietet) referenzieren in ENpcData nicht die einzelnen SpecialShops direkt,
+            // sondern nur eine Menü-Zeile - "TopicSelect" (bis zu 10 Unter-Shops) oder "FateShop" (bis
+            // zu 3 Unter-Shops, speziell für FATE-Belohnungshändler) - sonst würden diese wegen des
+            // 32-Slot-Limits von ENpcData gar nicht mehr hineinpassen. Daher zusätzlich beide auflösen
+            // und rückwärts verfolgen (ein Menü kann mehrere unserer Ziel-Shops enthalten, deshalb pro
+            // Menü-Zeile eine Liste statt nur des ersten Treffers).
+            var targetShopIds = itemRowIdToShopMatch.Values.Select(m => m.ShopId).ToHashSet();
+            var menuIdToShopIds = new Dictionary<uint, List<uint>>();
+
+            void AddMenuShop(uint menuRowId, uint shopId)
+            {
+                if (!menuIdToShopIds.TryGetValue(menuRowId, out var list))
+                    menuIdToShopIds[menuRowId] = list = new List<uint>();
+                list.Add(shopId);
+            }
+
+            var topicSelectSheet = DataManager.GetExcelSheet<TopicSelect>();
+            if (topicSelectSheet != null)
+            {
+                foreach (var topic in topicSelectSheet)
+                    foreach (var shopRef in topic.Shop)
+                        if (shopRef.RowId != 0 && targetShopIds.Contains(shopRef.RowId))
+                            AddMenuShop(topic.RowId, shopRef.RowId);
+            }
+
+            var fateShopSheet = DataManager.GetExcelSheet<FateShop>();
+            if (fateShopSheet != null)
+            {
+                foreach (var fateShop in fateShopSheet)
+                    foreach (var shopRef in fateShop.SpecialShop)
+                        if (shopRef.RowId != 0 && targetShopIds.Contains(shopRef.RowId))
+                            AddMenuShop(fateShop.RowId, shopRef.RowId);
+            }
+
+            // Bicolor-Gemstone-/Achievement-Certificate-/Sammelwährungs-Tauschhändler (z.B. in den
+            // Städten) nutzen eine DRITTE, noch tiefere Menü-Verschachtelung: ENpcData → InclusionShop
+            // (bis zu 30 Kategorien) → InclusionShopCategory → InclusionShopSeries (ein Subrow-Sheet -
+            // eine Kategorie kann mehrere Serien/Patches mit je einem eigenen SpecialShop enthalten).
+            var inclusionShopSheet = DataManager.GetExcelSheet<InclusionShop>();
+            var inclusionShopSeriesSheet = DataManager.GetSubrowExcelSheet<InclusionShopSeries>();
+            Log.Info($"[FrameKitDebug] InclusionShop-Sheet null={inclusionShopSheet == null}, InclusionShopSeries-Sheet null={inclusionShopSeriesSheet == null}");
+            if (inclusionShopSheet != null && inclusionShopSeriesSheet != null)
+            {
+                var categoryCount = 0;
+                var seriesRowFoundCount = 0;
+                var seriesItemCount = 0;
+                var inclusionMatchCount = 0;
+                foreach (var inclusionShop in inclusionShopSheet)
+                {
+                    foreach (var categoryRef in inclusionShop.Category)
+                    {
+                        var category = categoryRef.ValueNullable;
+                        if (category == null)
+                            continue;
+                        categoryCount++;
+
+                        var seriesRowId = category.Value.InclusionShopSeries.RowId;
+                        if (!inclusionShopSeriesSheet.TryGetRow(seriesRowId, out var seriesRows))
+                            continue;
+                        seriesRowFoundCount++;
+
+                        foreach (var series in seriesRows)
+                        {
+                            seriesItemCount++;
+                            if (series.SpecialShop.RowId != 0 && targetShopIds.Contains(series.SpecialShop.RowId))
+                            {
+                                inclusionMatchCount++;
+                                AddMenuShop(inclusionShop.RowId, series.SpecialShop.RowId);
+                            }
+                        }
+                    }
+                }
+                Log.Info($"[FrameKitDebug] InclusionShop: categoryCount={categoryCount}, seriesRowFoundCount={seriesRowFoundCount}, " +
+                         $"seriesItemCount={seriesItemCount}, inclusionMatchCount={inclusionMatchCount}");
+            }
+
+            // Manche SpecialShops werden nicht direkt (oder über TopicSelect/FateShop/InclusionShop),
+            // sondern über ein "CustomTalk"-Skript geöffnet (SpecialShop.CustomTalk) - der NPC hat dann
+            // die CustomTalk-RowId statt der SpecialShop-RowId in ENpcData.
+            var customTalkIdToShopId = new Dictionary<uint, uint>();
+            foreach (var shop in specialShopSheet)
+            {
+                if (targetShopIds.Contains(shop.RowId) && shop.CustomTalk.RowId != 0)
+                    customTalkIdToShopId.TryAdd(shop.CustomTalk.RowId, shop.RowId);
+            }
+            Log.Info($"[FrameKitDebug] customTalkIdToShopId.Count={customTalkIdToShopId.Count}");
+
+            var shopIdToNpcId = new Dictionary<uint, uint>();
+            foreach (var npc in npcBaseSheet)
+            {
+                foreach (var data in npc.ENpcData)
+                {
+                    if (data.RowId == 0)
+                        continue;
+
+                    if (targetShopIds.Contains(data.RowId))
+                        shopIdToNpcId.TryAdd(data.RowId, npc.RowId);
+                    else if (menuIdToShopIds.TryGetValue(data.RowId, out var shopIdsViaMenu))
+                    {
+                        foreach (var shopIdViaMenu in shopIdsViaMenu)
+                            shopIdToNpcId.TryAdd(shopIdViaMenu, npc.RowId);
+                    }
+                    else if (customTalkIdToShopId.TryGetValue(data.RowId, out var shopIdViaCustomTalk))
+                        shopIdToNpcId.TryAdd(shopIdViaCustomTalk, npc.RowId);
+                }
+            }
+
+            // "Gadfrid" (ENpcResident #1037055) öffnet seine Bicolor-Gemstone-Tauschkataloge über eine
+            // einzelne Quest-Skript-ID in ENpcData (per Log bestätigt: ENpcData=[721620], eine Quest-
+            // RowId - kein Shop/TopicSelect/FateShop/InclusionShop/CustomTalk) - die eigentliche Auswahl
+            // zwischen den Katalogen passiert rein im Skript und ist aus Lumina-Rohdaten nicht auflösbar.
+            // Der Bicolor-Gemstone-Katalog ROTIERT (ältere Kataloge werden irgendwann wieder entfernt) -
+            // deshalb hier NUR der vom Nutzer im Spiel bestätigte, aktuell tatsächlich bei Gadfrid
+            // kaufbare Shop hart verdrahtet (Sharlayan Stoa/Agora, #1770470). Die anderen "600 Bicolor
+            // Gemstone"-Shops (Exarchic Dome/Tower, Eulmoran Comfort/Glory, Crimson/Golden Dawn, Dark/
+            // Bright Solution, Hannish Radiance/Wonders) sind vermutlich aus dem Katalog gerotiert und
+            // aktuell bei KEINEM NPC kaufbar - deshalb absichtlich NICHT eingetragen.
+            shopIdToNpcId.TryAdd(1770470u, 1037055u);
+
+            // Weltposition primär direkt aus dem rohen Lumina-Sheet "Level" (Type==8 => Object zeigt
+            // auf ENpcBase) - LuminaSupplemental.Excel's ENpcPlace-CSV kennt viele der hier relevanten
+            // (u.a. PvP-/Sammelwährungs-)Händler-NPCs offenbar gar nicht (live beobachtet), die CSV
+            // dient nur noch als Fallback für den seltenen Fall, dass ein NPC in "Level" fehlt.
+            var levelSheet = DataManager.GetExcelSheet<Level>();
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            var targetNpcIds = shopIdToNpcId.Values.ToHashSet();
+            var npcIdToPlace = new Dictionary<uint, (uint TerritoryTypeId, uint MapId, float X, float Y)>();
+            if (levelSheet != null && mapSheet != null)
+            {
+                foreach (var level in levelSheet)
+                {
+                    if (level.Type != 8)
+                        continue;
+                    var npcRowId = level.Object.RowId;
+                    if (npcRowId == 0 || !targetNpcIds.Contains(npcRowId) || npcIdToPlace.ContainsKey(npcRowId))
+                        continue;
+                    var mapId = level.Map.RowId;
+                    if (mapId == 0 || !mapSheet.TryGetRow(mapId, out var map))
+                        continue;
+
+                    var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+                        new Vector2(level.X, level.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+                    npcIdToPlace[npcRowId] = (level.Territory.RowId, mapId, mapCoords.X, mapCoords.Y);
+                }
+            }
+
+            var npcPlaces = CsvLoader.LoadResource<ENpcPlace>(CsvLoader.ENpcPlaceResourceName, true, out _, out _);
+            foreach (var place in npcPlaces)
+            {
+                if (!targetNpcIds.Contains(place.ENpcResidentId))
+                    continue;
+                npcIdToPlace.TryAdd(place.ENpcResidentId, (place.TerritoryTypeId, place.MapId, place.Position.X, place.Position.Y));
+            }
+
+            Log.Info($"[FrameKitDebug] shopIdToNpcId.Count={shopIdToNpcId.Count} (targetShopIds={targetShopIds.Count}, " +
+                     $"davon {menuIdToShopIds.Values.SelectMany(l => l).Distinct().Count()} über TopicSelect/FateShop/InclusionShop-Menüs gefunden), " +
+                     $"npcIdToPlace.Count={npcIdToPlace.Count} (targetNpcIds={targetNpcIds.Count}, aus Level-Sheet + ENpcPlace-CSV-Fallback)");
+
+            var enrichedCount = 0;
+            foreach (var entry in candidates)
+            {
+                try
+                {
+                    if (!kitIdToItemRowId.TryGetValue(entry.FrameKitUnlockId, out var itemRowId))
+                    {
+                        Log.Info($"[FrameKitDebug] {entry.Name}: kein Item mit AdditionalData={entry.FrameKitUnlockId} gefunden.");
+                        continue;
+                    }
+                    if (!itemRowIdToShopMatch.TryGetValue(itemRowId, out var match))
+                    {
+                        Log.Info($"[FrameKitDebug] {entry.Name}: Item #{itemRowId} in keinem SpecialShop als ReceiveItem gefunden.");
+                        continue;
+                    }
+                    if (!shopIdToNpcId.TryGetValue(match.ShopId, out var npcId))
+                    {
+                        Log.Info($"[FrameKitDebug] {entry.Name}: SpecialShop #{match.ShopId} (Währung: {match.CurrencyText}) wird von keinem NPC in ENpcBase.ENpcData referenziert.");
+                        continue;
+                    }
+                    if (!npcIdToPlace.TryGetValue(npcId, out var place))
+                    {
+                        Log.Info($"[FrameKitDebug] {entry.Name}: NPC #{npcId} hat weder einen Platz im Level-Sheet noch in der ENpcPlace-CSV.");
+                        continue;
+                    }
+                    if (!npcResidentSheet.TryGetRow(npcId, out var npc))
+                        continue;
+
+                    var vendorName = npc.Singular.ToString();
+                    entry.Vendor = vendorName;
+                    entry.VendorMapX = place.X;
+                    entry.VendorMapY = place.Y;
+                    entry.TerritoryTypeId = place.TerritoryTypeId;
+                    entry.MapId = place.MapId;
+                    entry.Currency = match.CurrencyText;
+                    entry.CurrencyIconId = match.CurrencyIconId;
+                    entry.CurrencyItemId = match.CurrencyItemId;
+                    entry.CurrencyAmount = match.CurrencyAmount;
+                    entry.Source = $"{vendorName} - {match.CurrencyText}";
+                    enrichedCount++;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler beim Anreichern von Framer's-Kit-Eintrag {entry.Name} - übersprungen.");
+                }
+            }
+
+            Log.Info($"[FrameKitDebug] EnrichFrameKitVendors fertig: {enrichedCount}/{candidates.Count} Einträge angereichert.");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Auflösen von Framer's-Kit-Händlern - Anreicherung übersprungen.");
+        }
+    }
+
+    /// <summary>
+    /// Löst EINE BannerCondition-Zeile in einen konkreten Freischalt-Weg auf. UnlockType1-Werte
+    /// 1/4/9 sind direkt vom Dalamud-Plugin "Collections" übernommen (dort live gegen echte
+    /// BannerCondition-Daten getestet) - 4 bewusst NICHT wie im generischen Sheet-Schema als
+    /// InstanceContent gelesen, sondern wie Collections es tut über das separate "Prerequisite"-
+    /// Feld als Errungenschaft (Achievement.Key, NICHT Achievement.RowId!). 3/5/6/7/8 kommen direkt
+    /// aus dem generischen RowRef-Schema von UnlockCriteria1 (Duty/Emote/Minion/Mount/Ornament) -
+    /// von Collections nicht abgedeckt, hier aber genauso zuverlässig auflösbar.
+    /// </summary>
+    private static (FrameKitUnlockKind Kind, uint UnlockId, string Source, uint TerritoryId, uint MapId, float X, float Y)? ResolveFrameUnlock(BannerCondition condition)
+    {
+        switch (condition.UnlockType1)
+        {
+            case 1: // Quest
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var questSheet = DataManager.GetExcelSheet<Quest>();
+                if (questSheet == null || !questSheet.TryGetRow(criteria.RowId, out var quest))
+                    return null;
+
+                var (mapId, issuerTerritoryId, x, y) = ResolveIssuerMapPosition(quest);
+                var questName = quest.Name.ToString();
+                return (FrameKitUnlockKind.Quest, criteria.RowId, $"{Loc.T("Quest", "Quest")}: {questName}", issuerTerritoryId, mapId, x, y);
+            }
+
+            case 3: // Duty (InstanceContent)
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var instanceSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.InstanceContent>();
+                var dutyName = instanceSheet != null && instanceSheet.TryGetRow(criteria.RowId, out var duty)
+                    ? duty.ContentFinderCondition.ValueNullable?.Name.ToString() ?? $"#{criteria.RowId}"
+                    : $"#{criteria.RowId}";
+                return (FrameKitUnlockKind.Duty, criteria.RowId, $"{Loc.T("Dungeon/Trial", "Duty")}: {dutyName}", 0, 0, 0, 0);
+            }
+
+            case 4: // Achievement - über Prerequisite/Achievement.Key, siehe Methodenkommentar
+            {
+                var prereqId = condition.Prerequisite.RowId;
+                if (prereqId == 0)
+                    return null;
+
+                var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+                if (achievementSheet == null)
+                    return null;
+
+                foreach (var achievement in achievementSheet)
+                {
+                    if (achievement.Key.RowId != prereqId)
+                        continue;
+
+                    return (FrameKitUnlockKind.Achievement, achievement.RowId,
+                        $"{Loc.T("Errungenschaft", "Achievement")}: {achievement.Name.ToString()}", 0, 0, 0, 0);
+                }
+
+                return null;
+            }
+
+            case 5: // Emote
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var emoteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+                var emoteName = emoteSheet != null && emoteSheet.TryGetRow(criteria.RowId, out var emote) ? emote.Name.ToString() : $"#{criteria.RowId}";
+                return (FrameKitUnlockKind.Emote, criteria.RowId, $"{Loc.T("Emote", "Emote")}: {emoteName}", 0, 0, 0, 0);
+            }
+
+            case 6: // Minion (Companion)
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var companionSheet = DataManager.GetExcelSheet<Companion>();
+                var minionName = companionSheet != null && companionSheet.TryGetRow(criteria.RowId, out var companion) ? companion.Singular.ToString() : $"#{criteria.RowId}";
+                return (FrameKitUnlockKind.Minion, criteria.RowId, $"{Loc.T("Minion", "Minion")}: {minionName}", 0, 0, 0, 0);
+            }
+
+            case 7: // Mount
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var mountSheet = DataManager.GetExcelSheet<Mount>();
+                var mountName = mountSheet != null && mountSheet.TryGetRow(criteria.RowId, out var mount) ? mount.Singular.ToString() : $"#{criteria.RowId}";
+                return (FrameKitUnlockKind.Mount, criteria.RowId, $"{Loc.T("Mount", "Mount")}: {mountName}", 0, 0, 0, 0);
+            }
+
+            case 8: // Ornament (Fashion Accessory)
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                var ornamentSheet = DataManager.GetExcelSheet<Ornament>();
+                var ornamentName = ornamentSheet != null && ornamentSheet.TryGetRow(criteria.RowId, out var ornament) ? ornament.Singular.ToString() : $"#{criteria.RowId}";
+                return (FrameKitUnlockKind.Ornament, criteria.RowId, $"{Loc.T("Accessoire", "Accessory")}: {ornamentName}", 0, 0, 0, 0);
+            }
+
+            case 9: // Framer's Kit-Item - siehe PlayerState.IsFramersKitUnlocked-Doku (kitId steht
+                    // an Offset 0 der BannerCondition-Zeile, wenn UnlockType1==9)
+            {
+                var criteria = condition.UnlockCriteria1.FirstOrDefault(r => r.RowId != 0);
+                if (criteria.RowId == 0)
+                    return null;
+
+                return (FrameKitUnlockKind.FramersKitItem, criteria.RowId, Loc.T("Framer's Kit (Gegenstand)", "Framer's Kit (item)"), 0, 0, 0, 0);
+            }
+
+            default:
+                // Z.B. Typ 11 (verkettete Sonderregel, siehe Collections-Quellcode) - lässt sich nur
+                // über eine fragile Row-Offset-Heuristik auflösen, die hier bewusst nicht nachgebaut
+                // wird. Rahmen wird trotzdem gelistet (Source bleibt generisch), IsFrameKitUnlocked
+                // liefert dafür konservativ false.
+                return (FrameKitUnlockKind.Unknown, 0, Loc.T("Unbekannter Freischalt-Weg", "Unknown unlock method"), 0, 0, 0, 0);
+        }
+    }
+
+    /// <summary>
+    /// Dispatcht den Freischalt-Check je nach FrameKitUnlockKind auf die jeweils passende API -
+    /// siehe ResolveFrameUnlock/GetFrameKitEntries für die Herleitung.
+    /// </summary>
+    public static unsafe bool IsFrameKitUnlocked(CollectibleEntry entry)
+    {
+        switch (entry.FrameKitUnlockKind)
+        {
+            case FrameKitUnlockKind.Quest:
+                return QuestManager.IsQuestComplete((ushort)entry.FrameKitUnlockId);
+
+            case FrameKitUnlockKind.Duty:
+            {
+                var sheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.InstanceContent>();
+                return sheet != null && sheet.TryGetRow(entry.FrameKitUnlockId, out var row) && UnlockState.IsInstanceContentUnlocked(row);
+            }
+
+            case FrameKitUnlockKind.Achievement:
+            {
+                var sheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+                return sheet != null && sheet.TryGetRow(entry.FrameKitUnlockId, out var row) && UnlockState.IsAchievementComplete(row);
+            }
+
+            case FrameKitUnlockKind.Emote:
+                return UIState.Instance()->IsEmoteUnlocked((ushort)entry.FrameKitUnlockId);
+
+            case FrameKitUnlockKind.Minion:
+                return UIState.Instance()->IsCompanionUnlocked(entry.FrameKitUnlockId);
+
+            case FrameKitUnlockKind.Mount:
+                return PlayerState.Instance()->IsMountUnlocked(entry.FrameKitUnlockId);
+
+            case FrameKitUnlockKind.Ornament:
+                return PlayerState.Instance()->IsOrnamentUnlocked(entry.FrameKitUnlockId);
+
+            case FrameKitUnlockKind.FramersKitItem:
+                return PlayerState.Instance()->IsFramersKitUnlocked(entry.FrameKitUnlockId);
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump aller Portrait-Rahmen mit ihrem aufgelösten Freischalt-Weg - zur
+    /// Kalibrierung von GetFrameKitEntries/ResolveFrameUnlock, v.a. um FrameKitUnlockKind.Unknown-
+    /// Fälle und offensichtlich falsch aufgelöste Namen/Quellen zu finden.
+    /// </summary>
+    public static void DumpFrameKitDebugInfo()
+    {
+        // Cache verwerfen, damit EnrichFrameKitVendors (inkl. seiner Diagnose-Logs) hier garantiert
+        // frisch läuft - sonst stehen die Diagnose-Zeilen (kitIdToItemRowId.Count usw.) irgendwo
+        // weiter oben im Log, von der allerersten Berechnung beim Öffnen des Overlays.
+        frameKitEntriesCache = null;
+        var entries = GetFrameKitEntries();
+        Log.Info($"[FrameKitDebug] {entries.Count} Portrait-Rahmen mit Freischalt-Bedingung gefunden:");
+        foreach (var entry in entries)
+        {
+            var unlocked = IsFrameKitUnlocked(entry);
+            Log.Info($"[FrameKitDebug]   {entry.Name}(#{entry.Id}): Kind={entry.FrameKitUnlockKind}, UnlockId={entry.FrameKitUnlockId}, " +
+                     $"Source=\"{entry.Source}\", unlocked={unlocked}");
+        }
+
+        var unknownCount = entries.Count(e => e.FrameKitUnlockKind == FrameKitUnlockKind.Unknown);
+        Log.Info($"[FrameKitDebug] Davon {unknownCount} mit unbekanntem Freischalt-Weg (FrameKitUnlockKind.Unknown).");
+    }
+
+    /// <summary>
     /// Prüft, ob ein saisonales Event (Winterstern, Valentionstag, ...) aktuell läuft - für den
     /// Ausschluss von Event-Quests, die laut Datenbank zwar existieren, aber gerade nicht
     /// annehmbar sind, weil das zugehörige Event nicht aktiv ist.
@@ -148,6 +832,83 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Namen aller aktuell laufenden saisonalen Events (Lumina "Festival"-Sheet), gefiltert auf
+    /// nicht-leere Namen - für IsSeasonalEventEntryCurrentlyActive, da statische JSON-Einträge
+    /// (Mounts/Minions/... mit Category "Saisonevent") anders als Quests keine Festival-RowId
+    /// speichern, sondern nur einen Klartext-Namen in Name/Source.
+    /// </summary>
+    private static unsafe List<string> GetActiveFestivalNames()
+    {
+        var result = new List<string>();
+        var gameMain = GameMain.Instance();
+        var festivalSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Festival>();
+        if (gameMain == null || festivalSheet == null)
+            return result;
+
+        foreach (var festival in gameMain->ActiveFestivals)
+        {
+            if (festival.Id == 0 || !festivalSheet.TryGetRow(festival.Id, out var row))
+                continue;
+
+            var name = row.Name.ToString();
+            if (!string.IsNullOrEmpty(name))
+                result.Add(name);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Ob ein Sammelobjekt mit Category "Saisonevent" (Mounts/Minions/... ohne eigene Festival-
+    /// RowId, siehe GetActiveFestivalNames-Kommentar) gerade tatsächlich erhältlich ist - per
+    /// (grobem, textbasiertem) Abgleich von Name/Source gegen die Namen aller aktuell laufenden
+    /// Events. Läuft gerade GAR KEIN Event, ist so ein Eintrag sicher nicht erhältlich (kein
+    /// Fehlalarm möglich); läuft eins, aber der Name matcht nicht (z.B. wegen abweichender
+    /// Formulierung), wird der Eintrag trotzdem ausgeblendet - siehe Nutzerentscheidung dazu.
+    /// Alle anderen Categories sind von diesem Filter unberührt (liefert dafür immer true).
+    /// </summary>
+    public static bool IsSeasonalEventEntryCurrentlyActive(CollectibleEntry entry)
+    {
+        if (entry.Category != "Saisonevent")
+            return true;
+
+        var activeNames = GetActiveFestivalNames();
+        if (activeNames.Count == 0)
+            return false;
+
+        foreach (var name in activeNames)
+        {
+            if (entry.Name.Contains(name, StringComparison.OrdinalIgnoreCase) || entry.Source.Contains(name, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump zur Kalibrierung von IsSeasonalEventEntryCurrentlyActive - zeigt die
+    /// Namen aller aktuell laufenden Events (leer, wenn keins läuft) sowie für jeden "Saisonevent"-
+    /// Eintrag, ob er gerade als aktiv erkannt wird. Praktisch v.a. WÄHREND eines laufenden Events,
+    /// um Namensabweichungen zwischen Festival.Name und Item-Source/Name zu finden.
+    /// </summary>
+    public static void DumpSeasonalEventDebugInfo()
+    {
+        var activeNames = GetActiveFestivalNames();
+        Log.Info($"[SeasonalEventDebug] Aktuell laufende Events: [{string.Join(", ", activeNames)}]");
+
+        var entries = CollectionData.GetAllEntries().Where(e => e.Category == "Saisonevent").ToList();
+        var activeCount = entries.Count(IsSeasonalEventEntryCurrentlyActive);
+        Log.Info($"[SeasonalEventDebug] {entries.Count} Saisonevent-Einträge insgesamt, {activeCount} davon aktuell als aktiv erkannt.");
+
+        foreach (var entry in entries)
+        {
+            var active = IsSeasonalEventEntryCurrentlyActive(entry);
+            if (active)
+                Log.Info($"[SeasonalEventDebug]   AKTIV: {entry.Type} \"{entry.Name}\" (Source=\"{entry.Source}\")");
+        }
     }
 
     private uint? liveEntriesZoneId;
@@ -428,6 +1189,14 @@ public sealed class Plugin : IDalamudPlugin
                     if (row.Festival.RowId != 0 && !IsFestivalActive((ushort)row.Festival.RowId))
                         continue;
 
+                    // An eine bestimmte Große Kompanie (Sturmgarde/Zweiter Adler/Unsterbliche
+                    // Flammen) gebundene Quests (z.B. "My Little Chocobo (Maelstrom)") nur zeigen,
+                    // wenn der Charakter tatsächlich dieser Kompanie angehört - sonst stünde die
+                    // Quest laut Datenbank als "annehmbar" da, obwohl man einer anderen/gar keiner
+                    // Kompanie beigetreten ist und sie im Spiel gar nicht annehmen kann.
+                    if (row.GrandCompany.RowId != 0 && row.GrandCompany.RowId != PlayerState.Instance()->GrandCompany)
+                        continue;
+
                     // Klassengebundene Quests bewusst ausklammern - aber nicht nur Kategorie 1 ("All
                     // Classes") akzeptieren, sondern jede Kategorie, deren Name mit "All" beginnt
                     // (z.B. Kategorie 130 "All classes and jobs (excluding limited jobs)"). Das
@@ -459,6 +1228,50 @@ public sealed class Plugin : IDalamudPlugin
                     if (hasPrev && !prevOk)
                         continue;
 
+                    // Separate Sperre für Quests, die zwar keinen direkten Vorgänger in derselben
+                    // Questreihe haben (PreviousQuest bleibt dafür leer), aber trotzdem erst nach
+                    // Erreichen eines bestimmten Story-/Erweiterungsfortschritts angeboten werden
+                    // (z.B. viele Nebenquests, die "irgendwann in Endwalker" freischalten) - ohne
+                    // diesen Check standen solche Quests fälschlich als "annehmbar" da, obwohl sie
+                    // auf der Karte noch gar kein Icon hatten (siehe "Wings of Hope").
+                    var hasLock = false;
+                    var lockOk = false;
+                    foreach (var lockRef in row.QuestLock)
+                    {
+                        if (lockRef.RowId == 0)
+                            continue;
+
+                        hasLock = true;
+                        if (QuestManager.IsQuestComplete((ushort)lockRef.RowId))
+                        {
+                            lockOk = true;
+                            break;
+                        }
+                    }
+
+                    if (hasLock && !lockOk)
+                        continue;
+
+                    // Manche Quests setzen zusätzlich (oder statt QuestLock) einen abgeschlossenen
+                    // Dungeon/Trial voraus.
+                    var hasInstanceLock = false;
+                    var instanceLockOk = false;
+                    foreach (var instanceRef in row.InstanceContent)
+                    {
+                        if (instanceRef.RowId == 0)
+                            continue;
+
+                        hasInstanceLock = true;
+                        if (instanceRef.ValueNullable is { } instanceRow && UnlockState.IsInstanceContentUnlocked(instanceRow))
+                        {
+                            instanceLockOk = true;
+                            break;
+                        }
+                    }
+
+                    if (hasInstanceLock && !instanceLockOk)
+                        continue;
+
                     var name = row.Name.ToString();
                     if (string.IsNullOrEmpty(name))
                         continue;
@@ -485,6 +1298,48 @@ public sealed class Plugin : IDalamudPlugin
                 catch (Exception ex)
                 {
                     Log.Error(ex, $"Fehler bei Quest-Zeile {row.RowId}");
+                }
+            }
+        }
+
+        // Sightseeing-Log-Einträge ("Adventure" im Lumina-Sheet) - anders als Ätherströmungen haben
+        // diese eine echte Weltposition direkt im Sheet (über die verlinkte "Level"-Zeile), kein
+        // Community-Export nötig. Achsen-Umrechnung (Level.X/Z/Y -> Welt X/Y/Z) und der +0.5f
+        // Höhenversatz sind vom Dalamud-Plugin "Tourist" übernommen (dessen MarkerService setzt
+        // exakt dieselbe VFX-Markierung an dieser Position).
+        var adventureSheet = DataManager.GetExcelSheet<Adventure>();
+        if (adventureSheet != null)
+        {
+            foreach (var row in adventureSheet)
+            {
+                try
+                {
+                    var level = row.Level.ValueNullable;
+                    if (level == null || level.Value.Territory.RowId != territoryId)
+                        continue;
+
+                    var name = row.Name.ToString();
+                    if (string.IsNullOrEmpty(name))
+                        continue;
+
+                    var emoteCommand = row.Emote.ValueNullable?.TextCommand.ValueNullable?.Command.ToString();
+
+                    result.Add(new CollectibleEntry
+                    {
+                        Id = row.RowId,
+                        Name = name,
+                        Type = CollectibleType.Sightseeing,
+                        Category = Loc.T("Sightseeing", "Sightseeing"),
+                        TerritoryTypeId = territoryId,
+                        MapId = level.Value.Map.RowId,
+                        WorldPosition = new Vector3(level.Value.X, level.Value.Z, level.Value.Y),
+                        RequiredEmoteCommand = string.IsNullOrEmpty(emoteCommand) ? null : emoteCommand,
+                        Source = Loc.T("Sightseeing", "Sightseeing"),
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler bei Adventure-Zeile {row.RowId}");
                 }
             }
         }
@@ -714,6 +1569,40 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         return "Unbekannt";
+    }
+
+    /// <summary>
+    /// Ob mindestens ein sichtbares, echtes natives Spielfenster (z.B. Währungs-, Inventar- oder
+    /// Charakterfenster - erkannt über AtkUnitBase.WindowNode != null, das nur bei tatsächlich
+    /// beweglichen Fenstern mit Titelleiste gesetzt ist, nicht bei fest verankerten HUD-Elementen
+    /// wie Aktionsleisten) den übergebenen Bildschirmbereich überlappt. Dalamud/ImGui zeichnet
+    /// grundsätzlich IMMER nach (also über) dem nativen Spiel-UI in einem einzigen Rendering-
+    /// Durchgang - es gibt keine echte Z-Order zwischen beiden. Als einzig praktikabler Ersatz für
+    /// "unser Overlay soll hinter einem darüber gezogenen Spielfenster verschwinden" wird das
+    /// Overlay bei einer Überlappung deshalb selbst komplett unsichtbar gemacht (siehe
+    /// CompactOverlayWindow.Draw), nicht wirklich "dahinter" gezeichnet.
+    /// </summary>
+    public static unsafe bool IsOverlappedByVisibleNativeWindow(Vector2 min, Vector2 max)
+    {
+        var unitManager = RaptureAtkUnitManager.Instance();
+        if (unitManager == null)
+            return false;
+
+        var list = unitManager->AllLoadedUnitsList;
+        for (var i = 0; i < list.Count; i++)
+        {
+            var unit = list.Entries[i].Value;
+            if (unit == null || !unit->IsVisible || unit->WindowNode == null)
+                continue;
+
+            var unitMin = new Vector2(unit->X, unit->Y);
+            var unitMax = unitMin + new Vector2(unit->GetScaledWidth(true), unit->GetScaledHeight(true));
+
+            if (unitMin.X < max.X && unitMax.X > min.X && unitMin.Y < max.Y && unitMax.Y > min.Y)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1009,6 +1898,29 @@ public sealed class Plugin : IDalamudPlugin
                          $"Name={target.Value.BNpcName.ValueNullable?.Singular}, Fortschritt={rankCounts[i]}/{note.Count[i]}, " +
                          $"PlaceNameZone(RowIds)=[{zoneIds}]");
             }
+        }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump aller Sightseeing-Log-Punkte der aktuellen Zone (Name, RowId, Welt-
+    /// position, Radius, benötigter Emote, Freischalt-Status) - zur Kalibrierung von
+    /// SightseeingAutomation (v.a. ob die Achsen-Umrechnung aus Level.X/Y/Z stimmt und ob der
+    /// hinterlegte Emote tatsächlich zur Freischaltung reicht).
+    /// </summary>
+    public void DumpSightseeingDebugInfo()
+    {
+        var territoryId = ClientState.TerritoryType;
+        var sightseeing = GetLiveZoneEntries(territoryId)
+            .Where(e => e.Type == CollectibleType.Sightseeing)
+            .OrderBy(e => e.Name)
+            .ToList();
+
+        Log.Info($"[SightseeingDebug] Zone {territoryId}: {sightseeing.Count} Sightseeing-Punkte:");
+        foreach (var entry in sightseeing)
+        {
+            var emote = string.IsNullOrEmpty(entry.RequiredEmoteCommand) ? "keiner" : entry.RequiredEmoteCommand;
+            Log.Info($"[SightseeingDebug]   {entry.Name}(#{entry.Id}): Position={entry.WorldPosition}, benötigter Emote={emote}, " +
+                     $"unlocked={IsAdventureComplete(entry.Id)}");
         }
     }
 

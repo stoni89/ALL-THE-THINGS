@@ -58,6 +58,12 @@ public sealed class QuestAutomation
     private readonly ICallGateSubscriber<string, bool> startSingleQuest;
     private readonly ICallGateSubscriber<bool> isRunning;
 
+    // Nur für die proaktive Ausgrau-Prüfung im Overlay (siehe IsRotationSolverAvailable) - Quest-
+    // Automation steuert RotationSolver selbst NICHT an (anders als HuntingLogAutomation), aber
+    // während Questionable läuft können durchaus kampfpflichtige Quest-Schritte auftreten, die ohne
+    // eine laufende Kampf-Rotation ins Stocken geraten würden.
+    private readonly ICallGateSubscriber<bool> rsrAutorotationActive;
+
     // questId -> "gesperrt"? Prüft nur (ohne Nebenwirkung), ob Questionable eine Quest aktuell
     // bearbeiten könnte - für die proaktive Support-Markierung im Overlay direkt beim Betreten
     // einer Zone (siehe RefreshSupportStatus), statt erst nach einem echten Start-Versuch.
@@ -126,6 +132,7 @@ public sealed class QuestAutomation
         startSingleQuest = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.StartSingleQuest");
         isRunning = Plugin.PluginInterface.GetIpcSubscriber<bool>("Questionable.IsRunning");
         isQuestLocked = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.IsQuestLocked");
+        rsrAutorotationActive = Plugin.PluginInterface.GetIpcSubscriber<bool>("RotationSolverReborn.AutorotationActive");
 
         lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
         lifestreamAethernetTeleportById = Plugin.PluginInterface.GetIpcSubscriber<uint, bool>("Lifestream.AethernetTeleportById");
@@ -171,6 +178,23 @@ public sealed class QuestAutomation
         try
         {
             return startSingleQuest.HasFunction && isRunning.HasFunction;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Prüft, ob RotationSolver Reborn aktuell installiert/geladen ist - siehe Feldkommentar an
+    /// rsrAutorotationActive, warum das auch für die Quest-Automation relevant ist, obwohl sie
+    /// selbst keine RotationSolver-IPC aufruft.
+    /// </summary>
+    public bool IsRotationSolverAvailable()
+    {
+        try
+        {
+            return rsrAutorotationActive.HasFunction;
         }
         catch
         {
