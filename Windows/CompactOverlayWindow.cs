@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Linq;
 using System.Numerics;
 using System.Text.RegularExpressions;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Windowing;
@@ -18,8 +19,15 @@ public class CompactOverlayWindow : Window
 {
     private readonly Plugin plugin;
 
+    // NoBringToFrontOnFocus ist hier der entscheidende Teil: ohne das rutscht das Overlay bei
+    // JEDER Interaktion (auch nur Hovern/Scrollen) wieder an die Spitze des ImGui-Z-Stapels - lag
+    // ein anderes Fenster (Spiel-eigenes UI oder ein anderes Plugin) optisch DARÜBER, fing das
+    // Overlay dessen Klicks trotzdem ab (es galt für die Eingabe-Ermittlung weiterhin als "vorn"),
+    // wodurch das andere Fenster an dieser Stelle nicht mehr klickbar war. Da dieses Fenster ohnehin
+    // dauerhaft offen bleiben soll (kein Grund, es je "nach vorne" zu holen), kostet das nichts.
     private const ImGuiWindowFlags BaseFlags =
-        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing;
+        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing |
+        ImGuiWindowFlags.NoBringToFrontOnFocus;
 
     public CompactOverlayWindow(Plugin plugin) : base("##AllTheThingsCompact", BaseFlags)
     {
@@ -39,6 +47,28 @@ public class CompactOverlayWindow : Window
 
     public void Dispose() { }
 
+    // Position/Größe vom LETZTEN Frame (siehe Draw, ganz unten aktualisiert) - für die
+    // Überlappungsprüfung in PreDraw. Erst NACH Begin() (also in Draw) wüsste man die aktuelle
+    // Position zwar noch genauer, aber Fenster-Flags wie NoMouseInputs (siehe PreDraw) wirken nur,
+    // wenn sie VOR Begin() gesetzt werden - eine Frame Verzögerung ist dafür unmerklich, da sich
+    // die Fensterposition normalerweise nicht jeden Frame ändert.
+    private Vector2? lastWindowMin;
+    private Vector2? lastWindowMax;
+
+    // Vom aktuellen Frame - einmal in PreDraw ermittelt, dann sowohl in PreDraw (Flags) als auch in
+    // Draw (Alpha) verwendet, damit beide dieselbe Entscheidung für denselben Frame treffen.
+    private bool hiddenBehindNativeWindow;
+
+    /// <summary>
+    /// Verhindert, dass das Overlay schon am Titelbildschirm (vor dem Einloggen) oder während des
+    /// Lade-/Zonenwechsel-Übergangs (BetweenAreas/BetweenAreas51 - Ladebildschirm, Zone noch nicht
+    /// fertig geladen) mit ggf. veralteten Daten der letzten Sitzung angezeigt wird - wird von
+    /// Dalamuds WindowSystem VOR PreDraw/Draw/PostDraw geprüft, das Fenster erscheint also gar
+    /// nicht erst statt nur mit falschem Inhalt.
+    /// </summary>
+    public override bool DrawConditions() =>
+        Plugin.ClientState.IsLoggedIn && !Plugin.Condition[ConditionFlag.BetweenAreas] && !Plugin.Condition[ConditionFlag.BetweenAreas51];
+
     // Bewusst FEST (nicht von CompactTransparency abhängig) - der Resize-Griff unten rechts soll
     // auch bei voller Transparenz sichtbar bleiben, sonst sieht man gar nicht mehr, wo das Fenster
     // endet bzw. wo man es zum Skalieren greifen kann.
@@ -50,9 +80,18 @@ public class CompactOverlayWindow : Window
     {
         var config = plugin.Configuration;
 
+        // Liegt (laut letztem Frame) ein natives Fenster über uns, wird die Maus-Eingabe für
+        // dieses Fenster für den GESAMTEN Frame deaktiviert (NoMouseInputs) - ohne das würde unser
+        // (dann unsichtbares, siehe Draw) Fenster trotzdem weiterhin Klicks für sich beanspruchen,
+        // wodurch das eigentlich sichtbare native Fenster darüber nicht mehr klickbar wäre.
+        hiddenBehindNativeWindow = lastWindowMin.HasValue && lastWindowMax.HasValue &&
+            Plugin.IsOverlappedByVisibleNativeWindow(lastWindowMin.Value, lastWindowMax.Value);
+
         // Gesperrt = weder verschiebbar noch skalierbar - ImGui blendet den Resize-Griff dann
         // automatisch aus (kein zusätzlicher Farb-Trick nötig), macht also gleich beides.
         Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoResize : BaseFlags;
+        if (hiddenBehindNativeWindow)
+            Flags |= ImGuiWindowFlags.NoMouseInputs;
 
         var alpha = 1f - System.Math.Clamp(config.CompactTransparency, 0f, 1f);
 
@@ -74,6 +113,40 @@ public class CompactOverlayWindow : Window
     }
 
     public override void Draw()
+    {
+        // Erzwingt JEDEN Frame aufs Neue, dass dieses Fenster ganz hinten im Anzeige-Stapel sitzt -
+        // NoBringToFrontOnFocus (siehe BaseFlags) verhindert nur, dass es bei eigener Interaktion
+        // wieder nach vorn rutscht, garantiert aber nicht, dass es ÜBERHAUPT hinten bleibt (z.B.
+        // wenn ein anderes Fenster geschlossen und neu geöffnet wird). BringWindowToDisplayBack ist
+        // intern in ImGui, aber über ImGuiP öffentlich zugänglich - genau dafür gedacht.
+        ImGuiP.BringWindowToDisplayBack(ImGuiP.GetCurrentWindow());
+
+        // Für die Überlappungsprüfung im NÄCHSTEN Frame merken (siehe PreDraw/hiddenBehindNativeWindow).
+        lastWindowMin = ImGui.GetWindowPos();
+        lastWindowMax = lastWindowMin + ImGui.GetWindowSize();
+
+        // Dalamud/ImGui zeichnet grundsätzlich IMMER über dem nativen Spiel-UI (keine echte Z-
+        // Order zwischen beiden möglich, siehe Plugin.IsOverlappedByVisibleNativeWindow-Kommentar).
+        // Liegt gerade ein echtes natives Fenster (Währung, Inventar, ...) über uns (schon in
+        // PreDraw ermittelt, siehe dort), wird der gesamte Inhalt komplett unsichtbar gemacht
+        // (Alpha=0 für ALLES in diesem Fenster, nicht nur den Hintergrund) UND (siehe PreDraw/
+        // NoMouseInputs) fängt es selbst keine Klicks mehr ab - so verschwindet unser Overlay
+        // optisch UND für Eingaben "dahinter", auch wenn es technisch nur selbst ausgeblendet wird.
+        if (hiddenBehindNativeWindow)
+            ImGui.PushStyleVar(ImGuiStyleVar.Alpha, 0f);
+
+        try
+        {
+            DrawContent();
+        }
+        finally
+        {
+            if (hiddenBehindNativeWindow)
+                ImGui.PopStyleVar();
+        }
+    }
+
+    private void DrawContent()
     {
         var config = plugin.Configuration;
         using var fontScope = PushCompactFont(config);
@@ -113,6 +186,10 @@ public class CompactOverlayWindow : Window
             // nur in genau dieser einen Zone, nicht stadtweit wie Aetheryten/Quest-NPCs.
             .Concat(plugin.GetHuntingLogEntries(currentTerritoryId))
             .Where(e => siblingTerritories.Contains(e.TerritoryTypeId))
+            // "Saisonevent"-Einträge (Mounts/Minions/... ohne Bezug zu einem laufenden Event, siehe
+            // Plugin.IsSeasonalEventEntryCurrentlyActive) nur zeigen, wenn das zugehörige Event laut
+            // grobem Namensabgleich auch wirklich gerade läuft.
+            .Where(Plugin.IsSeasonalEventEntryCurrentlyActive)
             .ToList();
 
         var afterTypeFilter = allForZone
@@ -161,6 +238,13 @@ public class CompactOverlayWindow : Window
             .ToList();
         plugin.AetherCurrentAutomation.Update(missingAetherCurrentsInZone);
 
+        // Ebenfalls nicht stadtweit - Sightseeing-Punkte kommen aus GetLiveZoneEntries mit exakter
+        // Zonen-Zuordnung (siehe Plugin.ComputeLiveZoneEntries), kein Bezirkswechsel nötig.
+        var missingSightseeingInZone = allForZone
+            .Where(e => e.Type == CollectibleType.Sightseeing && !plugin.IsOwned(e))
+            .ToList();
+        plugin.SightseeingAutomation.Update(missingSightseeingInZone);
+
         // Unabhängig von den Automationen oben - das "Hinlaufen"-Icon (siehe DrawClickableName)
         // betrifft immer nur einen einzelnen Eintrag, egal ob gerade eine Automation läuft.
         plugin.GoToAutomation.Update();
@@ -171,14 +255,33 @@ public class CompactOverlayWindow : Window
         var hasActionableAetherytes = missingAetherytesCity.Count > 0;
         var hasActionableHuntingLog = missingHuntingLogInZone.Any(e => e.WorldPosition.HasValue);
         var hasActionableAetherCurrents = missingAetherCurrentsInZone.Any(e => e.HasGoToTarget);
+        var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget);
+
+        // Reihe der Automations-Knöpfe bricht bei Bedarf selbst in eine zweite Zeile um (statt über
+        // den Fensterrand hinauszulaufen), wenn das kompakte Fenster nicht breit genug gezogen
+        // wurde - jeder Knopf entscheidet VOR dem eigentlichen Zeichnen anhand seiner (aus dem
+        // Label vorab berechneten) Breite, ob er noch auf die aktuelle Zeile passt.
+        var automationRowContentMaxX = ImGui.GetWindowContentRegionMax().X;
+        var automationStopLabel = Loc.T("Automation stoppen", "Stop automation");
+
+        void ContinueAutomationRow(bool isActive, string startLabel)
+        {
+            var label = isActive ? automationStopLabel : startLabel;
+            var width = ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f;
+            ImGui.SameLine();
+            if (ImGui.GetCursorPosX() + width > automationRowContentMaxX)
+                ImGui.NewLine();
+        }
 
         DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
-        ImGui.SameLine();
+        ContinueAutomationRow(plugin.AetheryteAutomation.IsActive, Loc.T("Auto Aetheryte", "Auto Aetheryte"));
         DrawAetheryteAutomationButton(hasActionableAetherytes);
-        ImGui.SameLine();
+        ContinueAutomationRow(plugin.HuntingLogAutomation.IsActive, Loc.T("Auto Hunting Log", "Auto Hunting Log"));
         DrawHuntingLogAutomationButton(hasActionableHuntingLog);
-        ImGui.SameLine();
+        ContinueAutomationRow(plugin.AetherCurrentAutomation.IsActive, Loc.T("Auto Ätherströmung", "Auto Aether Current"));
         DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
+        ContinueAutomationRow(plugin.SightseeingAutomation.IsActive, Loc.T("Auto Sightseeing", "Auto Sightseeing"));
+        DrawSightseeingAutomationButton(hasActionableSightseeing);
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -195,6 +298,9 @@ public class CompactOverlayWindow : Window
 
         if (plugin.AetherCurrentAutomation.ShouldShowStatusText)
             OutlineText(plugin.AetherCurrentAutomation.StatusText, plugin.AetherCurrentAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.SightseeingAutomation.ShouldShowStatusText)
+            OutlineText(plugin.SightseeingAutomation.StatusText, plugin.SightseeingAutomation.IsActive ? AffordableColor : VendorLinkColor);
 
         if (config.ShowDebugInfo)
             OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
@@ -297,19 +403,39 @@ public class CompactOverlayWindow : Window
 
         OutlineText(Loc.T("Deine Währungen:", "Your currencies:"), MutedColor);
 
+        // Mehrere Währungen pro Zeile statt jeweils einer eigenen - bricht (wie die Automations-
+        // Knopfreihe weiter oben) selbst in eine weitere Zeile um, sobald das kompakte Fenster
+        // nicht breit genug gezogen wurde. Jede Währung entscheidet VOR dem Zeichnen anhand ihrer
+        // (aus Icon+Text vorab berechneten) Breite, ob sie noch auf die aktuelle Zeile passt.
+        var contentMaxX = ImGui.GetWindowContentRegionMax().X;
+        var iconSize = ImGui.GetTextLineHeight();
+        var itemSpacing = ImGui.GetStyle().ItemSpacing.X;
+        var isFirst = true;
+
         foreach (var sample in currencies)
         {
-            if (sample.CurrencyIconId != 0)
+            var owned = plugin.GetCurrencyAmount(sample.CurrencyItemId);
+            var label = GetCurrencyLabel(sample.Currency);
+            var text = $"{owned.ToString("N0", CultureInfo.InvariantCulture)} {label}";
+            var hasIcon = sample.CurrencyIconId != 0;
+            var itemWidth = ImGui.CalcTextSize(text).X + (hasIcon ? iconSize + itemSpacing : 0f);
+
+            if (!isFirst)
+            {
+                ImGui.SameLine();
+                if (ImGui.GetCursorPosX() + itemWidth > contentMaxX)
+                    ImGui.NewLine();
+            }
+            isFirst = false;
+
+            if (hasIcon)
             {
                 var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(sample.CurrencyIconId)).GetWrapOrEmpty();
-                var size = new Vector2(ImGui.GetTextLineHeight());
-                ImGui.Image(icon.Handle, size);
+                ImGui.Image(icon.Handle, new Vector2(iconSize));
                 ImGui.SameLine();
             }
 
-            var owned = plugin.GetCurrencyAmount(sample.CurrencyItemId);
-            var label = GetCurrencyLabel(sample.Currency);
-            OutlineText($"{owned.ToString("N0", CultureInfo.InvariantCulture)} {label}", NormalColor);
+            OutlineText(text, NormalColor);
         }
 
         ImGui.Spacing();
@@ -344,10 +470,19 @@ public class CompactOverlayWindow : Window
     }
 
     /// <summary>
+    /// Gemeinsamer Tooltip-Text für JEDEN Automations-Knopf, sobald irgendein als "Required"
+    /// markiertes Plugin fehlt (siehe MainWindow.HasMissingRequiredDependency) - bewusst pauschal
+    /// statt pro Knopf ein anderes konkretes Plugin zu nennen: welches Plugin eine Automation
+    /// tatsächlich braucht, ist ohnehin auf der Plugins-Seite ersichtlich.
+    /// </summary>
+    private static string MissingPluginTooltip => Loc.T(
+        "Es fehlt mindestens ein benötigtes Plugin - siehe Plugins-Seite.",
+        "At least one required plugin is missing - see the Plugins page.");
+
+    /// <summary>
     /// Knopf, der die Questionable-Automation (siehe QuestAutomation.cs) für die aktuell
-    /// fehlenden Quests dieser Zone an-/ausschaltet. Questionable ist ein separates Fremdplugin -
-    /// ist es nicht installiert/geladen, wird das per Tooltip erklärt statt der Knopf einfach
-    /// nichts zu tun.
+    /// fehlenden Quests dieser Zone an-/ausschaltet. Ausgegraut, sobald irgendein als "Required"
+    /// markiertes Plugin fehlt (nicht nur Questionable selbst) - siehe MissingPluginTooltip.
     /// </summary>
     private void DrawQuestAutomationButton(bool hasActionableQuests, uint effectiveTerritoryId)
     {
@@ -355,12 +490,12 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Quest", "Auto Quest");
-        var isQuestionableAvailable = automation.IsQuestionableAvailable();
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
-        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt Questionable, gibt
-        // es aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableQuests || !isQuestionableAvailable);
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts sinnvoll zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableQuests || hasMissingPlugin);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Quest]);
         if (isDisabled)
@@ -372,15 +507,15 @@ public class CompactOverlayWindow : Window
 
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
-            ImGui.SetTooltip(isDisabled
-                ? !isQuestionableAvailable
-                    ? Loc.T("Questionable nicht gefunden - bitte installieren.", "Questionable not found - please install it.")
-                    : Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
-                : automation.IsActive
-                    ? Loc.T("Bricht die aktuelle Quest sofort ab und stoppt die Automation.", "Immediately cancels the current quest and stops the automation.")
-                    : Loc.T(
-                        "Lässt Questionable nacheinander alle fehlenden Quests dieser Zone annehmen und abschließen.",
-                        "Has Questionable pick up and complete all missing quests in this zone, one by one."));
+            ImGui.SetTooltip(hasMissingPlugin
+                ? MissingPluginTooltip
+                : isDisabled
+                    ? Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
+                    : automation.IsActive
+                        ? Loc.T("Bricht die aktuelle Quest sofort ab und stoppt die Automation.", "Immediately cancels the current quest and stops the automation.")
+                        : Loc.T(
+                            "Lässt Questionable nacheinander alle fehlenden Quests dieser Zone annehmen und abschließen.",
+                            "Has Questionable pick up and complete all missing quests in this zone, one by one."));
         }
 
         if (!clicked)
@@ -390,7 +525,7 @@ public class CompactOverlayWindow : Window
         {
             automation.Stop();
         }
-        else if (isQuestionableAvailable)
+        else if (!hasMissingPlugin)
         {
             automation.Start(effectiveTerritoryId);
         }
@@ -412,10 +547,12 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Aetheryte", "Auto Aetheryte");
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
-        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
-        var isDisabled = !automation.IsActive && !hasActionableAetherytes;
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableAetherytes || hasMissingPlugin);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Aetheryte]);
         if (isDisabled)
@@ -427,13 +564,15 @@ public class CompactOverlayWindow : Window
 
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
-            ImGui.SetTooltip(isDisabled
-                ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
-                : automation.IsActive
-                    ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
-                    : Loc.T(
-                        "Läuft mit vnavmesh nacheinander alle fehlenden Aetheryten/Kristalle ab und interagiert mit ihnen.",
-                        "Uses vnavmesh to walk to and interact with all missing aetherytes/crystals, one by one."));
+            ImGui.SetTooltip(hasMissingPlugin
+                ? MissingPluginTooltip
+                : isDisabled
+                    ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
+                    : automation.IsActive
+                        ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                        : Loc.T(
+                            "Läuft mit vnavmesh nacheinander alle fehlenden Aetheryten/Kristalle ab und interagiert mit ihnen.",
+                            "Uses vnavmesh to walk to and interact with all missing aetherytes/crystals, one by one."));
         }
 
         if (!clicked)
@@ -443,7 +582,7 @@ public class CompactOverlayWindow : Window
         {
             automation.Stop();
         }
-        else if (automation.IsVNavmeshAvailable())
+        else if (!hasMissingPlugin)
         {
             automation.Start();
         }
@@ -466,10 +605,12 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Hunting Log", "Auto Hunting Log");
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
-        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
-        var isDisabled = !automation.IsActive && !hasActionableHuntingLog;
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableHuntingLog || hasMissingPlugin);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.HuntingLog]);
         if (isDisabled)
@@ -481,15 +622,17 @@ public class CompactOverlayWindow : Window
 
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
-            ImGui.SetTooltip(isDisabled
-                ? Loc.T(
-                    "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
-                    "No hunting log targets with a known position in this zone.")
-                : automation.IsActive
-                    ? Loc.T("Bricht Laufen/Kämpfen sofort ab und stoppt die Automation.", "Immediately stops moving/fighting and the automation.")
-                    : Loc.T(
-                        "Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit RotationSolver Reborn.",
-                        "Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with RotationSolver Reborn."));
+            ImGui.SetTooltip(hasMissingPlugin
+                ? MissingPluginTooltip
+                : isDisabled
+                    ? Loc.T(
+                        "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
+                        "No hunting log targets with a known position in this zone.")
+                    : automation.IsActive
+                        ? Loc.T("Bricht Laufen/Kämpfen sofort ab und stoppt die Automation.", "Immediately stops moving/fighting and the automation.")
+                        : Loc.T(
+                            "Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit RotationSolver Reborn.",
+                            "Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with RotationSolver Reborn."));
         }
 
         if (!clicked)
@@ -499,7 +642,7 @@ public class CompactOverlayWindow : Window
         {
             automation.Stop();
         }
-        else if (automation.IsAvailable())
+        else if (!hasMissingPlugin)
         {
             automation.Start();
         }
@@ -520,10 +663,12 @@ public class CompactOverlayWindow : Window
         var label = automation.IsActive
             ? Loc.T("Automation stoppen", "Stop automation")
             : Loc.T("Auto Ätherströmung", "Auto Aether Current");
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
 
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
-        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht.
-        var isDisabled = !automation.IsActive && !hasActionableAetherCurrents;
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!hasActionableAetherCurrents || hasMissingPlugin);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.AetherCurrent]);
         if (isDisabled)
@@ -535,15 +680,17 @@ public class CompactOverlayWindow : Window
 
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
         {
-            ImGui.SetTooltip(isDisabled
-                ? Loc.T(
-                    "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
-                    "No aether currents with a known position in this zone.")
-                : automation.IsActive
-                    ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
-                    : Loc.T(
-                        "Läuft mit vnavmesh nacheinander alle fehlenden Ätherströmungen ab und wartet auf die automatische Freischaltung.",
-                        "Uses vnavmesh to walk to all missing aether currents, one by one, and waits for them to unlock automatically."));
+            ImGui.SetTooltip(hasMissingPlugin
+                ? MissingPluginTooltip
+                : isDisabled
+                    ? Loc.T(
+                        "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
+                        "No aether currents with a known position in this zone.")
+                    : automation.IsActive
+                        ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                        : Loc.T(
+                            "Läuft mit vnavmesh nacheinander alle fehlenden Ätherströmungen ab und wartet auf die automatische Freischaltung.",
+                            "Uses vnavmesh to walk to all missing aether currents, one by one, and waits for them to unlock automatically."));
         }
 
         if (!clicked)
@@ -553,7 +700,72 @@ public class CompactOverlayWindow : Window
         {
             automation.Stop();
         }
-        else if (automation.IsVNavmeshAvailable())
+        else if (!hasMissingPlugin)
+        {
+            automation.Start();
+        }
+        else
+        {
+            automation.MarkUnavailable();
+        }
+    }
+
+    /// <summary>
+    /// Knopf, der die Sightseeing-Automation (siehe SightseeingAutomation.cs) für die aktuell
+    /// fehlenden Punkte dieser Zone an-/ausschaltet. Prüfreihenfolge bewusst: erst ob das
+    /// Sightseeing Log selbst überhaupt freigeschaltet ist (kein Plugin-Thema, betrifft nur ganz
+    /// frische Charaktere), erst DANACH die Plugin-Verfügbarkeit (wie bei den anderen Knöpfen) -
+    /// siehe Tooltip-Reihenfolge unten.
+    /// </summary>
+    private void DrawSightseeingAutomationButton(bool hasActionableSightseeing)
+    {
+        var automation = plugin.SightseeingAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Auto Sightseeing", "Auto Sightseeing");
+
+        // Kein Plugin-Thema - eigenständig VOR hasMissingPlugin geprüft (siehe Tooltip unten).
+        var logUnlocked = Plugin.IsSightseeingLogUnlocked();
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
+
+        // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
+        // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
+        // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
+        var isDisabled = !automation.IsActive && (!logUnlocked || !hasActionableSightseeing || hasMissingPlugin);
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Sightseeing]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactSightseeingAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(!logUnlocked
+                ? Loc.T("Sightseeing Log noch nicht freigeschaltet.", "Sightseeing Log not unlocked yet.")
+                : hasMissingPlugin
+                    ? MissingPluginTooltip
+                    : isDisabled
+                        ? Loc.T(
+                            "Keine Sightseeing-Punkte mit bekannter Position in dieser Zone.",
+                            "No sightseeing points with a known position in this zone.")
+                        : automation.IsActive
+                            ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
+                            : Loc.T(
+                                "Läuft mit vnavmesh nacheinander alle fehlenden Sightseeing-Punkte ab und wartet auf die automatische Freischaltung.",
+                                "Uses vnavmesh to walk to all missing sightseeing points, one by one, and waits for them to unlock automatically."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+        {
+            automation.Stop();
+        }
+        else if (!hasMissingPlugin)
         {
             automation.Start();
         }
@@ -720,6 +932,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
         [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
         [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
+        [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
     };
     private static readonly Vector2[] ShadowOffsets =
     {

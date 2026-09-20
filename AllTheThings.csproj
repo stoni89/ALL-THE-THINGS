@@ -5,10 +5,18 @@
     <Author>Dein Name</Author>
     <Name>All The Things</Name>
     <Punchline>Sammel-Tracker pro Karte, inspiriert von "All the Things"</Punchline>
-    <Description>Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories, Triple-Triad-Karten und Portrait-Rahmen in der aktuellen Zone noch fehlen.</Description>
+    <Description>Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories, Triple-Triad-Karten und Framer's Kits in der aktuellen Zone noch fehlen.</Description>
     <RepoUrl></RepoUrl>
     <Tags>collection;tracker;utility;allthethings</Tags>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Liefert vorberechnete NPC<->Shop- und NPC<->Position-Zuordnungen (ENpcShop/ENpcPlace), die
+         aus Square Enix' eigenen Rohdaten allein nicht sauber auflösbar sind - für die Händler-
+         Auflösung bei per Framer's-Kit-Item kaufbaren Portrait-Rahmen (siehe Plugin.EnrichFrameKitVendors).
+         Dieselbe Version, die auch das Dalamud-Plugin "Collections" nutzt. -->
+    <PackageReference Include="LuminaSupplemental.Excel" Version="4.3.1" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="Data\mounts.json" CopyToOutputDirectory="PreserveNewest" />
@@ -19,7 +27,6 @@
     <None Include="Data\facewear.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\fashions.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\triadcards.json" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="Data\frames.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\aethercurrents.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Data\icon.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

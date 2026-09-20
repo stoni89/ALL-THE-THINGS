@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Reflection;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Windowing;
@@ -101,6 +102,17 @@ public class MainWindow : Window
     }
 
     public void Dispose() { }
+
+    /// <summary>
+    /// Verhindert, dass das Optionsfenster schon am Titelbildschirm (vor dem Einloggen) oder
+    /// während des Lade-/Zonenwechsel-Übergangs (BetweenAreas/BetweenAreas51) mit ggf. veralteten
+    /// Daten der letzten Sitzung angezeigt wird, falls es beim letzten Schließen des Spiels offen
+    /// war (Dalamud stellt den Öffnen-Zustand von Fenstern über Neustarts hinweg wieder her) - wird
+    /// von Dalamuds WindowSystem VOR PreDraw/Draw/PostDraw geprüft, das Fenster erscheint also gar
+    /// nicht erst.
+    /// </summary>
+    public override bool DrawConditions() =>
+        Plugin.ClientState.IsLoggedIn && !Plugin.Condition[ConditionFlag.BetweenAreas] && !Plugin.Condition[ConditionFlag.BetweenAreas51];
 
     /// <summary>
     /// Zwingt die Fenstergröße beim Ein-/Ausklappen (siehe DrawCustomHeader/collapsed) auf die
@@ -934,6 +946,34 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
+        if (ImGui.Button(Loc.T("Sightseeing-Debug-Dump ins Log schreiben", "Write sightseeing debug dump to log")))
+            plugin.DumpSightseeingDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (ImGui.Button(Loc.T("Framer's-Kit-Debug-Dump ins Log schreiben", "Write framer's kit debug dump to log")))
+            Plugin.DumpFrameKitDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (ImGui.Button(Loc.T("Dungeon-Zonen-Debug-Dump ins Log schreiben", "Write dungeon zone debug dump to log")))
+            Plugin.DumpZoneEnrichmentDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        if (ImGui.Button(Loc.T("Saisonevent-Debug-Dump ins Log schreiben", "Write seasonal event debug dump to log")))
+            Plugin.DumpSeasonalEventDebugInfo();
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         if (ImGui.Button(Loc.T("Ätherströmungs-Debug-Dump ins Log schreiben", "Write aether current debug dump to log")))
             Plugin.DumpAetherCurrentDebugInfo();
 
@@ -980,17 +1020,24 @@ public class MainWindow : Window
             "For traveling between districts of a split capital city during automation.",
             true),
         ("RotationSolver", "RotationSolver Reborn",
-            "Übernimmt den Kampf bei der Hunting-Log-Kill-Automation.",
-            "Drives combat for the hunting log kill automation.",
+            "Übernimmt den Kampf bei der Hunting-Log-Kill-Automation und bei kampfpflichtigen Schritten während der Quest-Automation.",
+            "Drives combat for the hunting log kill automation and for combat-required steps during the quest automation.",
+            true),
+        ("TextAdvance", "TextAdvance",
+            "Klickt automatisch durch Dialoge/Cutscenes während der Quest-Automation.",
+            "Automatically clicks through dialogue/cutscenes during the quest automation.",
             true),
     };
 
     /// <summary>
     /// Ob mindestens ein als "Required" markiertes Plugin aktuell nicht installiert/geladen ist -
-    /// wird sowohl für den Warn-Badge im Fenstertitel als auch den roten Punkt am Plugins-Icon in
-    /// der Seitenleiste gebraucht (siehe DrawCustomHeader/Draw).
+    /// wird für den Warn-Badge im Fenstertitel, den roten Punkt am Plugins-Icon in der Seitenleiste
+    /// (siehe DrawCustomHeader/Draw) UND zum Ausgrauen sämtlicher Automations-Knöpfe im kompakten
+    /// Overlay gebraucht (siehe CompactOverlayWindow) - bewusst pauschal für JEDES fehlende
+    /// Required-Plugin, nicht nur das von der jeweiligen Automation tatsächlich genutzte, damit
+    /// nicht pro Knopf einzeln nachvollzogen werden muss, welches Plugin wofür gebraucht wird.
     /// </summary>
-    private static bool HasMissingRequiredDependency() =>
+    internal static bool HasMissingRequiredDependency() =>
         Dependencies.Any(d => d.Required && !Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded));
 
     private static void DrawDependenciesPage()
