@@ -5,7 +5,7 @@
     <Author>Stoni</Author>
     <Name>All The Things</Name>
     <Punchline>Zone Completion, inspired by "All the Things" from WoW</Punchline>
-    <Description>Shows which mounts, minions, orchestrion rolls, bardings, emotes, facewear, fashion accessories, Triple Triad cards, and portrait frames are still missing in your current zone.</Description>
+    <Description>Completionist plugin per zone with automation capabilities.</Description>
     <RepoUrl>https://github.com/stoni89/ALL-THE-THINGS</RepoUrl>
     <Tags>collection;tracker;utility;allthethings</Tags>
   </PropertyGroup>
