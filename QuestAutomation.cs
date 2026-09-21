@@ -5,7 +5,7 @@ using Dalamud.Game.Chat;
 using Dalamud.Game.Text;
 using Dalamud.Plugin.Ipc;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Steuert das Fremdplugin "Questionable" (https://github.com/WigglyMuffin/Questionable) über

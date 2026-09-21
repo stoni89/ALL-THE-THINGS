@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using System.Numerics;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Von Hand (bzw. per einmaligem Scraper-Lauf gegen ffxiv.consolegameswiki.com, siehe

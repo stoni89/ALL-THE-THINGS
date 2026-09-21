@@ -21,9 +21,9 @@ using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using LuminaSupplemental.Excel.Model;
 using LuminaSupplemental.Excel.Services;
-using AllTheThings.Windows;
+using TheExplorersCodex.Windows;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 public sealed class Plugin : IDalamudPlugin
 {
@@ -41,7 +41,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
     [PluginService] internal static IUnlockState UnlockState { get; private set; } = null!;
 
-    private const string CommandName = "/att";
+    private const string CommandName = "/exc";
 
     // Für den Zugriff aus statischen Methoden (z.B. TryUseSprint), die keine Plugin-Instanz haben -
     // es gibt zur Laufzeit ohnehin immer nur genau eine.
@@ -55,7 +55,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Configuration Configuration { get; init; }
 
-    public readonly WindowSystem WindowSystem = new("AllTheThings");
+    public readonly WindowSystem WindowSystem = new("TheExplorersCodex");
     private MainWindow MainWindow { get; init; }
     public CompactOverlayWindow CompactOverlayWindow { get; init; }
     public NavigationArrowWindow NavigationArrowWindow { get; init; }
@@ -95,7 +95,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = Loc.T("Öffnet All The Things.", "Opens All The Things.")
+            HelpMessage = Loc.T("Öffnet The Explorer's Codex.", "Opens The Explorer's Codex.")
         });
 
         PluginInterface.UiBuilder.Draw += DrawUI;

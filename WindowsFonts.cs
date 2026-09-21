@@ -4,7 +4,7 @@ using System.IO;
 using System.Linq;
 using Microsoft.Win32;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Liest die auf dem System installierten TrueType-/OpenType-Schriften aus der Registry aus,

@@ -5,7 +5,7 @@ using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Ein einzelnes sammelbares Objekt (Mount, Minion, ...) mit Fundort-Info.

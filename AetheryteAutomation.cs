@@ -6,7 +6,7 @@ using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Plugin.Ipc;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Läuft nacheinander alle aktuell fehlenden Aetheryten/Aethernetz-Kristalle ab und interagiert mit

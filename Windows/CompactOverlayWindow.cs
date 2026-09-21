@@ -11,7 +11,7 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using Dalamud.Bindings.ImGui;
 
-namespace AllTheThings.Windows;
+namespace TheExplorersCodex.Windows;
 
 /// <summary>
 /// Schlankes, randloses Overlay-Fenster - zeigt nur Sammelobjekte der aktuellen Zone.
@@ -31,7 +31,7 @@ public class CompactOverlayWindow : Window
         ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing |
         ImGuiWindowFlags.NoBringToFrontOnFocus;
 
-    public CompactOverlayWindow(Plugin plugin) : base("##AllTheThingsCompact", BaseFlags)
+    public CompactOverlayWindow(Plugin plugin) : base("##TheExplorersCodexCompact", BaseFlags)
     {
         this.plugin = plugin;
         RespectCloseHotkey = false;
@@ -188,7 +188,7 @@ public class CompactOverlayWindow : Window
         // verwendet werden. Nur für Datenabfragen, nicht für die angezeigte Zonenüberschrift unten.
         var effectiveTerritoryId = Plugin.ResolveEffectiveTerritoryId(currentTerritoryId);
 
-        OutlineText("All The Things", TitleColor);
+        OutlineText("The Explorer's Codex", TitleColor);
         if (ImGui.IsItemHovered())
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
 

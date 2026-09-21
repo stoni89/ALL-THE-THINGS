@@ -1,6 +1,6 @@
 using Dalamud.Game;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Sehr einfache Übersetzungshilfe: Deutsch und Englisch, ausgewählt anhand der

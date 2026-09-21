@@ -5,7 +5,7 @@ using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin.Ipc;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Läuft nacheinander alle aktuell noch fehlenden Hunting-Log-Ziele der Zone ab (siehe

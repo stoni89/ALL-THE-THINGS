@@ -1,4 +1,4 @@
-# All The Things
+# The Explorer's Codex
 
 Custom Plugin Repository URL (Dalamud → Settings → Experimental → Custom Plugin Repositories):
 

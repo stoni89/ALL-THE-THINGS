@@ -4,7 +4,7 @@ using Dalamud.Interface;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Bindings.ImGui;
 
-namespace AllTheThings.Windows;
+namespace TheExplorersCodex.Windows;
 
 /// <summary>
 /// Kleines Set wiederverwendbarer ImGui-Bausteine für einen moderneren Look des Optionsfensters

@@ -3,7 +3,7 @@ using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin.Ipc;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Läuft (auf Klick des "Hinlaufen"-Icons neben einem verlinkten Eintrag, siehe

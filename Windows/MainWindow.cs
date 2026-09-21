@@ -12,7 +12,7 @@ using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using Dalamud.Bindings.ImGui;
 
-namespace AllTheThings.Windows;
+namespace TheExplorersCodex.Windows;
 
 public class MainWindow : Window
 {
@@ -90,7 +90,7 @@ public class MainWindow : Window
     private readonly (FontAwesomeIcon Icon, string Label, Action Draw)[] navItems;
 
     public MainWindow(Plugin plugin) : base(
-        $"All The Things (v{VersionText})##AllTheThings",
+        $"The Explorer's Codex (v{VersionText})##TheExplorersCodex",
         ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
     {
         this.plugin = plugin;
@@ -239,7 +239,7 @@ public class MainWindow : Window
         // welcher Skalierungsfaktor gerade aktiv ist. Icon-Größe bewusst NICHT mehr daran gekoppelt
         // (siehe IconSizeScale) - eingeklappt bleibt es dagegen weiterhin an den Text gekoppelt,
         // da dort ohnehin alles gemeinsam einfach skaliert wird.
-        const string titleText = "All The Things";
+        const string titleText = "The Explorer's Codex";
         var titleLineHeight = ImGui.CalcTextSize(titleText).Y;
         var iconSize = collapsed ? titleLineHeight : Plugin.PluginInterface.UiBuilder.FontDefaultSizePx * IconSizeScale;
         var rowHeight = MathF.Max(titleLineHeight, iconSize);
@@ -438,10 +438,10 @@ public class MainWindow : Window
         ImGui.Image(aboutIcon.Handle, new Vector2(aboutIconSize, aboutIconSize));
 
         ImGui.SetWindowFontScale(1.2f);
-        var nameWidth = ImGui.CalcTextSize("All The Things").X;
+        var nameWidth = ImGui.CalcTextSize("The Explorer's Codex").X;
         if (availWidth > nameWidth)
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (availWidth - nameWidth) * 0.5f);
-        ImGui.TextUnformatted("All The Things");
+        ImGui.TextUnformatted("The Explorer's Codex");
         ImGui.SetWindowFontScale(1f);
 
         var versionText = $"{Loc.T("Version", "Version")} {VersionText}";

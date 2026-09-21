@@ -3,11 +3,11 @@
     <Version>0.5.0</Version>
     <!-- Manifest-Felder (siehe https://github.com/goatcorp/DalamudPackager) -->
     <Author>Stoni</Author>
-    <Name>All The Things</Name>
+    <Name>The Explorer's Codex</Name>
     <Punchline>Zone Completion, inspired by "All the Things" from WoW</Punchline>
     <Description>Completionist plugin per zone with automation capabilities.</Description>
     <RepoUrl>https://github.com/stoni89/ALL-THE-THINGS</RepoUrl>
-    <Tags>collection;tracker;utility;allthethings</Tags>
+    <Tags>collection;tracker;utility;explorerscodex</Tags>
   </PropertyGroup>
 
   <ItemGroup>

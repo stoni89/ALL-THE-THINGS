@@ -4,7 +4,7 @@ using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface.Windowing;
 using Dalamud.Bindings.ImGui;
 
-namespace AllTheThings.Windows;
+namespace TheExplorersCodex.Windows;
 
 /// <summary>
 /// TomTom-artiger Wegweiser-Pfeil (World of Warcraft) - zeigt relativ zur Blickrichtung des
@@ -24,7 +24,7 @@ public class NavigationArrowWindow : Window
         ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoFocusOnAppearing |
         ImGuiWindowFlags.NoBringToFrontOnFocus;
 
-    public NavigationArrowWindow(Plugin plugin) : base("##AllTheThingsNavigationArrow", BaseFlags)
+    public NavigationArrowWindow(Plugin plugin) : base("##TheExplorersCodexNavigationArrow", BaseFlags)
     {
         this.plugin = plugin;
         RespectCloseHotkey = false;

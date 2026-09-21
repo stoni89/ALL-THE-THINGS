@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using Dalamud.Interface.ManagedFontAtlas;
 
-namespace AllTheThings;
+namespace TheExplorersCodex;
 
 /// <summary>
 /// Lädt beliebige TrueType-/OpenType-Dateien (z.B. installierte Windows-Schriften) dynamisch
