@@ -157,6 +157,12 @@ public static class CollectionData
         // Community-Export nötig.
         Plugin.EnrichEntriesWithZoneFromSource(entries);
 
+        // Viele Händlereinträge kennen zwar Vendor+Zone als Klartext, aber keine Kartenkoordinate
+        // (VendorMapX/Y = 0) - dadurch fehlten "Auf Karte anzeigen"/"Hinlaufen" (siehe z.B.
+        // "Jonathas" in Old Gridania). Nach EnrichEntriesWithZoneFromSource, damit auch Einträge
+        // erfasst werden, deren Zone erst DORT nachgetragen wurde.
+        Plugin.EnrichEntriesWithVendorPosition(entries);
+
         entries.AddRange(Plugin.GetFrameKitEntries());
         entries.AddRange(Plugin.GetChocobokeepEntries());
 

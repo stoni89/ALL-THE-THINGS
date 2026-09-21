@@ -36,21 +36,29 @@ public class MainWindow : Window
     private RailPage railPage = RailPage.Settings;
     private bool collapsed;
     private bool collapsedLastFrame;
-    private Vector2 expandedSize = new(720f, 960f);
+    private Vector2 expandedSize = new(746f, 960f);
+
+    // Rechter Randabstand für JEDEN Tab-Inhalt (Einstellungen/Statistik/Plugins/Über) - dieselbe
+    // Größe wie dividerToSidebarGap unten (der Abstand von der vertikalen Trennlinie zu "Settings"
+    // bzw. den Tab-Inhalten), damit Elemente, die die volle Breite ausnutzen (z.B. ProgressBar mit
+    // Breite -1 im Statistik-Tab), nicht bis an den Fensterrand reichen. Die Fensterbreite (siehe
+    // expandedSize/ExpandedSizeConstraints) ist um denselben Betrag größer, damit die NUTZBARE
+    // Breite dadurch nicht kleiner wird als vorher.
+    private const float ContentRightMargin = 26f;
 
     // Kopfzeilen-Bandhöhe und Titel-Skalierung je Zustand (siehe DrawCustomHeader) - eingeklappt
     // bewusst kleiner, damit die Titelleiste dann wirklich kompakt wirkt, statt (wie zuvor) immer
     // gleich hoch zu bleiben und nur das Fenster darunter wegzuschneiden.
-    private const float HeaderBandHeightExpanded = 52f;
+    private const float HeaderBandHeightExpanded = 38f;
     private const float HeaderBandHeightCollapsed = 16f;
-    private const float TitleScaleExpanded = 2.0f;
+    private const float TitleScaleExpanded = 1.6f;
     private const float TitleScaleCollapsed = 0.9f;
 
     // Eigener, vom Titeltext entkoppelter Skalierungsfaktor fürs Icon - entspricht bewusst dem
     // ALTEN TitleScaleExpanded-Wert, damit das Icon exakt gleich groß bleibt, obwohl der Titeltext
     // jetzt kleiner skaliert wird (das Icon war vorher an die gerenderte Texthöhe gekoppelt, siehe
     // DrawCustomHeader-Kommentar dort).
-    private const float IconSizeScale = 2.4f;
+    private const float IconSizeScale = 1.8f;
 
     // WindowPadding bleibt in beiden Zuständen identisch (siehe PreDraw) - genau das war der Grund
     // für das gemeldete "Verschieben" der Titelleiste beim Ein-/Ausklappen: Ein unterschiedliches
@@ -69,8 +77,8 @@ public class MainWindow : Window
     // Spieler soll das Fenster gar nicht erst so klein ziehen können, dass eine Scrollbar nötig würde.
     private static readonly WindowSizeConstraints ExpandedSizeConstraints = new()
     {
-        MinimumSize = new Vector2(520, 930),
-        MaximumSize = new Vector2(1100, 1050),
+        MinimumSize = new Vector2(520 + ContentRightMargin, 930),
+        MaximumSize = new Vector2(1100 + ContentRightMargin, 1050),
     };
 
     private static readonly WindowSizeConstraints CollapsedSizeConstraints = new()
@@ -91,7 +99,6 @@ public class MainWindow : Window
         {
             (FontAwesomeIcon.Cog, Loc.T("Allgemein", "General"), DrawGeneralTab),
             (FontAwesomeIcon.Desktop, Loc.T("Anzeige", "Display"), DrawDisplayTab),
-            (FontAwesomeIcon.Bolt, "QoL", DrawQoLTab),
             (FontAwesomeIcon.Bug, Loc.T("Debug", "Debug"), DrawDebugTab),
         };
 
@@ -383,7 +390,7 @@ public class MainWindow : Window
                 // erst nötig sein/erscheinen. Ohne NoScrollbar würde ImGui bei einer versehentlichen
                 // Ein-Pixel-Überlänge sonst wieder eine Scrollbar samt der bekannten Pfeil-Kollision
                 // rechts einblenden (siehe Anzeige-Tab).
-                ImGui.BeginChild("##OptionsContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##OptionsContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
@@ -392,7 +399,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Statistics)
             {
-                ImGui.BeginChild("##StatisticsContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##StatisticsContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawStatisticsPage();
@@ -401,7 +408,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Dependencies)
             {
-                ImGui.BeginChild("##DependenciesContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##DependenciesContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawDependenciesPage();
@@ -410,7 +417,7 @@ public class MainWindow : Window
             }
             else
             {
-                ImGui.BeginChild("##AboutContent", new Vector2(0f, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##AboutContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawAboutPage();
@@ -636,6 +643,7 @@ public class MainWindow : Window
             Loc.T("Allgemein", "General"),
             Loc.T("Zeigt fehlende Sammelobjekte der aktuellen Zone an.", "Shows missing collectibles for the current zone."));
 
+        ModernUi.GroupLabel(Loc.T("Overlay", "Overlay"));
         ModernUi.BeginCard();
         var showOverlay = config.ShowCompactOverlay;
         if (ModernUi.ToggleRow(Loc.T("Overlay aktivieren", "Enable overlay"), ref showOverlay))
@@ -644,6 +652,77 @@ public class MainWindow : Window
             plugin.CompactOverlayWindow.IsOpen = showOverlay;
             config.Save();
         }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showAutomationButtons = config.ShowAutomationButtons;
+        if (ModernUi.ToggleRow(Loc.T("Automation-Knöpfe anzeigen", "Show automation buttons"), ref showAutomationButtons))
+        {
+            config.ShowAutomationButtons = showAutomationButtons;
+            config.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(Loc.T(
+                "Blendet nur die Start-/Stopp-Knöpfe im Overlay aus - laufende Automationen werden dadurch nicht gestoppt.",
+                "Only hides the start/stop buttons in the overlay - running automations keep running."));
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showWallet = config.ShowCurrencyWallet;
+        if (ModernUi.ToggleRow(Loc.T("Währungen anzeigen", "Show currencies"), ref showWallet))
+        {
+            config.ShowCurrencyWallet = showWallet;
+            config.Save();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showGoToIcon = config.ShowGoToIcon;
+        if (ModernUi.ToggleRow(Loc.T("\"Hinlaufen\"-Icon anzeigen", "Show \"go to\" icon"), ref showGoToIcon))
+        {
+            config.ShowGoToIcon = showGoToIcon;
+            config.Save();
+        }
+        ModernUi.EndCard();
+
+        ModernUi.GroupLabel("QoL");
+        ModernUi.BeginCard();
+        var showNavigationArrow = config.ShowNavigationArrow;
+        if (ModernUi.ToggleRow(Loc.T("Wegweiser-Pfeil anzeigen", "Show navigation arrow"), ref showNavigationArrow))
+        {
+            config.ShowNavigationArrow = showNavigationArrow;
+            config.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(Loc.T(
+                "Zeigt einen verschiebbaren Pfeil zum aktuellen Ziel (Automation, \"Hinlaufen\"-Icon oder Karten-Link) - verschwindet bei Ankunft oder per Rechtsklick.",
+                "Shows a movable arrow pointing to the current target (automation, \"go to\" icon or map link) - disappears on arrival or right-click."));
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var useSprint = config.UseSprintOnCooldown;
+        if (ModernUi.ToggleRow(Loc.T("Sprint auf Cooldown nutzen", "Use Sprint on cooldown"), ref useSprint))
+        {
+            config.UseSprintOnCooldown = useSprint;
+            config.Save();
+        }
+        ModernUi.EndCard();
+
+        ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
+        ModernUi.BeginCard();
+        DrawAetheryteMountPicker(config);
         ModernUi.EndCard();
     }
 
@@ -655,7 +734,7 @@ public class MainWindow : Window
             Loc.T("Anzeige", "Display"),
             Loc.T("Reihenfolge und Darstellung im kompakten Overlay anpassen.", "Adjust the order and look of the compact overlay."));
 
-        ModernUi.GroupLabel(Loc.T("Aussehen", "Appearance"));
+        ModernUi.GroupLabel(Loc.T("Overlay-Aussehen", "Overlay appearance"));
         ModernUi.BeginCard();
         var transparency = config.CompactTransparency;
         ModernUi.LabelRow(Loc.T("Transparenz", "Transparency"), 280f);
@@ -728,33 +807,39 @@ public class MainWindow : Window
 
             ImGui.EndCombo();
         }
+        ModernUi.EndCard();
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-        var showWallet = config.ShowCurrencyWallet;
-        if (ModernUi.ToggleRow(Loc.T("Währungen anzeigen", "Show currencies"), ref showWallet))
+        ModernUi.GroupLabel(Loc.T("Pfeil-Aussehen", "Arrow appearance"));
+        ModernUi.BeginCard();
+        var arrowWidth = config.NavigationArrowWidth;
+        ModernUi.LabelRow(Loc.T("Pfeil-Breite", "Arrow width"), 280f);
+        if (ImGui.SliderFloat("##NavigationArrowWidth", ref arrowWidth, 40f, 300f, "%.0f"))
         {
-            config.ShowCurrencyWallet = showWallet;
+            config.NavigationArrowWidth = arrowWidth;
             config.Save();
         }
 
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
-        var showGoToIcon = config.ShowGoToIcon;
-        if (ModernUi.ToggleRow(Loc.T("\"Hinlaufen\"-Icon anzeigen", "Show \"go to\" icon"), ref showGoToIcon))
+
+        var arrowHeight = config.NavigationArrowHeight;
+        ModernUi.LabelRow(Loc.T("Pfeil-Höhe", "Arrow height"), 280f);
+        if (ImGui.SliderFloat("##NavigationArrowHeight", ref arrowHeight, 40f, 300f, "%.0f"))
         {
-            config.ShowGoToIcon = showGoToIcon;
+            config.NavigationArrowHeight = arrowHeight;
             config.Save();
         }
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
-        var locked = config.CompactLocked;
-        if (ModernUi.ToggleRow(Loc.T("Fenster sperren", "Lock window"), ref locked))
+
+        var arrowColor = config.NavigationArrowColor;
+        ModernUi.LabelRow(Loc.T("Pfeil-Farbe", "Arrow color"), 280f);
+        if (ImGui.ColorEdit4("##NavigationArrowColor", ref arrowColor, ImGuiColorEditFlags.AlphaBar | ImGuiColorEditFlags.NoInputs))
         {
-            config.CompactLocked = locked;
+            config.NavigationArrowColor = arrowColor;
             config.Save();
         }
         ModernUi.EndCard();
@@ -777,7 +862,19 @@ public class MainWindow : Window
             }
 
             ImGui.SameLine();
-            ImGui.TextUnformatted(Loc.TypeName(type));
+            if (Plugin.IsTypeCurrentlyPossible(type))
+            {
+                ImGui.TextUnformatted(Loc.TypeName(type));
+            }
+            else
+            {
+                // Noch nicht möglich in der aktuellen Zone (z.B. Sightseeing/Hunting Log ohne
+                // freigeschaltetes Fliegen) - Eintrag bleibt in der Liste, nur ausgegraut, siehe
+                // Plugin.IsTypeCurrentlyPossible.
+                ImGui.TextColored(new Vector4(0.5f, 0.5f, 0.5f, 1f), Loc.TypeName(type));
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(Plugin.GetTypeNotPossibleReason(type));
+            }
 
             // Breite dynamisch aus der aktuellen Button-/Abstandsgröße berechnen, statt eines festen
             // Werts - sonst verschieben sich die Pfeile bei jeder Änderung an FramePadding/ItemSpacing
@@ -811,46 +908,30 @@ public class MainWindow : Window
         ModernUi.EndCard();
     }
 
-    private void DrawQoLTab()
-    {
-        var config = plugin.Configuration;
-
-        ModernUi.SectionHeader("QoL", Loc.T("Komfortfunktionen für die Automationen.", "Convenience features for the automations."));
-
-        ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
-        ModernUi.BeginCard();
-        var useSprint = config.UseSprintOnCooldown;
-        if (ModernUi.ToggleRow(Loc.T("Sprint auf Cooldown nutzen", "Use Sprint on cooldown"), ref useSprint))
-        {
-            config.UseSprintOnCooldown = useSprint;
-            config.Save();
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        DrawAetheryteMountPicker(config);
-        ModernUi.EndCard();
-    }
-
     /// <summary>
     /// Mount-Auswahl für die Aetheryten-Automation: "Kein Mount" (aus, Standard), "Mount Roulette"
     /// (zufällige Auswahl unter den eigenen freigeschalteten Mounts, siehe
     /// Plugin.TryRequestAetheryteMount) oder ein konkretes Mount - ausgegraut, solange gar kein
-    /// Mount freigeschaltet ist, da dann keine der Optionen etwas bewirken könnte.
+    /// Mount freigeschaltet ist, da dann keine der Optionen etwas bewirken könnte. "Mount Roulette"
+    /// wird erst ab zwei freigeschalteten Mounts angeboten (mit nur einem gäbe es nichts
+    /// auszuwürfeln) - siehe Plugin.EnsureAetheryteMountAutoDefault für die dazu passende
+    /// einmalige Vorbelegung.
     /// </summary>
     private void DrawAetheryteMountPicker(Configuration config)
     {
+        plugin.EnsureAetheryteMountAutoDefault();
+
         var unlockedMounts = plugin.GetUnlockedMounts();
         var noMountsUnlocked = unlockedMounts.Count == 0;
+        var rouletteAvailable = unlockedMounts.Count >= 2;
 
         var noneLabel = Loc.T("Kein Mount (zu Fuß)", "No mount (on foot)");
         var rouletteLabel = Loc.T("Mount Roulette", "Mount Roulette");
         var currentLabel = config.AetheryteMountId switch
         {
             null => noneLabel,
-            0 => rouletteLabel,
+            0 when rouletteAvailable => rouletteLabel,
+            0 => noneLabel,
             var id => unlockedMounts.FirstOrDefault(m => m.Id == (uint)id.Value)?.Name ?? noneLabel,
         };
 
@@ -866,7 +947,7 @@ public class MainWindow : Window
                 config.Save();
             }
 
-            if (ImGui.Selectable(rouletteLabel, config.AetheryteMountId == 0))
+            if (rouletteAvailable && ImGui.Selectable(rouletteLabel, config.AetheryteMountId == 0))
             {
                 config.AetheryteMountId = 0;
                 config.Save();
@@ -915,6 +996,7 @@ public class MainWindow : Window
             Loc.T("Debug", "Debug"),
             Loc.T("Nur relevant, wenn im Overlay etwas nicht wie erwartet angezeigt wird.", "Only relevant if something in the overlay doesn't show as expected."));
 
+        ModernUi.GroupLabel(Loc.T("Allgemein", "General"));
         ModernUi.BeginCard();
         var showDebug = config.ShowDebugInfo;
         if (ModernUi.ToggleRow(Loc.T("Debug-Infos im Overlay anzeigen", "Show debug info in overlay"), ref showDebug))
@@ -922,87 +1004,23 @@ public class MainWindow : Window
             config.ShowDebugInfo = showDebug;
             config.Save();
         }
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        ModernUi.EndCard();
 
-        if (ImGui.Button(Loc.T("Aetheryten-/Quest-Cache zurücksetzen", "Reset aetheryte/quest cache")))
-            plugin.ResetLiveEntriesCache();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Aetheryten-Debug-Dump ins Log schreiben", "Write aetheryte debug dump to log")))
-            plugin.DumpAetheryteDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        var simulateAll = plugin.AetheryteAutomation.SimulateAllCrystals;
-        if (ModernUi.ToggleRow(
-            Loc.T("Aetheryten-Automation: alle Kristalle simulieren", "Aetheryte automation: simulate all crystals"),
-            ref simulateAll))
+        ModernUi.GroupLabel(Loc.T("Debug-Dumps (ins Log schreiben)", "Debug dumps (write to log)"));
+        ModernUi.BeginCard();
+        DrawWrappedButtonRow(new (string Label, Action OnClick)[]
         {
-            plugin.AetheryteAutomation.SimulateAllCrystals = simulateAll;
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Hunting-Log-Debug-Dump ins Log schreiben", "Write hunting log debug dump to log")))
-            Plugin.DumpHuntingLogDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Sightseeing-Debug-Dump ins Log schreiben", "Write sightseeing debug dump to log")))
-            plugin.DumpSightseeingDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Framer's-Kit-Debug-Dump ins Log schreiben", "Write framer's kit debug dump to log")))
-            Plugin.DumpFrameKitDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Chocobokeep-Debug-Dump ins Log schreiben", "Write chocobokeep debug dump to log")))
-            Plugin.DumpChocobokeepDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Dungeon-Zonen-Debug-Dump ins Log schreiben", "Write dungeon zone debug dump to log")))
-            Plugin.DumpZoneEnrichmentDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Saisonevent-Debug-Dump ins Log schreiben", "Write seasonal event debug dump to log")))
-            Plugin.DumpSeasonalEventDebugInfo();
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        if (ImGui.Button(Loc.T("Ätherströmungs-Debug-Dump ins Log schreiben", "Write aether current debug dump to log")))
-            Plugin.DumpAetherCurrentDebugInfo();
-
-        ImGui.SameLine();
-        // Funktioniert auch mit einem reinen ARR-Charakter ohne freigeschaltete Erweiterung -
-        // TerritoryType/MapMarker sind statische Spieldaten, kein Live-Spielstand (siehe Kommentar
-        // an DumpAetherCurrentDebugInfoAllZones).
-        if (ImGui.Button(Loc.T("...für alle Zonen", "...for all zones")))
-            Plugin.DumpAetherCurrentDebugInfoAllZones();
+            (Loc.T("Aetheryten", "Aetherytes"), () => plugin.DumpAetheryteDebugInfo()),
+            (Loc.T("Hunting Log", "Hunting log"), Plugin.DumpHuntingLogDebugInfo),
+            (Loc.T("Sightseeing", "Sightseeing"), () => plugin.DumpSightseeingDebugInfo()),
+            (Loc.T("Framer's Kit", "Framer's kit"), Plugin.DumpFrameKitDebugInfo),
+            (Loc.T("Chocobokeep", "Chocobokeep"), Plugin.DumpChocobokeepDebugInfo),
+            (Loc.T("Händler-Positionen", "Vendor positions"), Plugin.DumpVendorPositionEnrichmentDebugInfo),
+            (Loc.T("Dungeon-Zonen", "Dungeon zones"), Plugin.DumpZoneEnrichmentDebugInfo),
+            (Loc.T("Saisonevent", "Seasonal event"), Plugin.DumpSeasonalEventDebugInfo),
+            (Loc.T("Ätherströmungen (aktuelle Zone)", "Aether currents (current zone)"), Plugin.DumpAetherCurrentDebugInfo),
+            (Loc.T("Ätherströmungen (alle Zonen)", "Aether currents (all zones)"), Plugin.DumpAetherCurrentDebugInfoAllZones),
+        });
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
@@ -1023,6 +1041,31 @@ public class MainWindow : Window
                                     $"{playerPos.Value.Z.ToString(CultureInfo.InvariantCulture)}f");
         }
         ModernUi.EndCard();
+    }
+
+    /// <summary>
+    /// Zeichnet eine Reihe gleichartiger Knöpfe, die bei Bedarf in weitere Zeilen umbrechen (statt
+    /// wie vorher jeden einzeln mit eigenem Separator untereinander) - für die Debug-Dump-Knöpfe, die
+    /// sonst eine sehr lange, unübersichtliche Liste ergäben.
+    /// </summary>
+    private static void DrawWrappedButtonRow((string Label, Action OnClick)[] buttons)
+    {
+        var windowVisibleX2 = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
+        for (var i = 0; i < buttons.Length; i++)
+        {
+            var (label, onClick) = buttons[i];
+            if (ImGui.Button(label))
+                onClick();
+
+            if (i + 1 >= buttons.Length)
+                continue;
+
+            var lastButtonX2 = ImGui.GetItemRectMax().X;
+            var nextButtonWidth = ImGui.CalcTextSize(buttons[i + 1].Label).X + ImGui.GetStyle().FramePadding.X * 2f;
+            var nextButtonX2 = lastButtonX2 + ImGui.GetStyle().ItemSpacing.X + nextButtonWidth;
+            if (nextButtonX2 < windowVisibleX2)
+                ImGui.SameLine();
+        }
     }
 
     private static readonly (string InternalName, string DisplayName, string DescriptionDe, string DescriptionEn, bool Required)[] Dependencies =

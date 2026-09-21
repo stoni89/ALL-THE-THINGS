@@ -86,6 +86,15 @@ public sealed class HuntingLogAutomation
     private Vector3 currentTargetPosition;
     private DateTime stateEnteredAt;
     private bool hasSeenPathRunning;
+    private DateTime lastRemountAttempt = DateTime.MinValue;
+    private readonly NavigationStuckDetector stuckDetector = new();
+
+    // Siehe Stop()/ForceStop() - statt MITTEN im Kampf RotationSolver abzuschalten (Charakter bliebe
+    // angeschlagen und wehrlos stehen), wird der eigentliche Stopp zurückgehalten, bis der aktuell
+    // laufende Kampf zu Ende ist.
+    private bool stopRequested;
+    private DateTime stopRequestedAt;
+    private static readonly TimeSpan StopAfterCombatTimeout = TimeSpan.FromMinutes(2);
     private DateTime lastDiagnosticLogAt = DateTime.MinValue;
     private static readonly TimeSpan DiagnosticLogInterval = TimeSpan.FromSeconds(5);
 
@@ -207,17 +216,43 @@ public sealed class HuntingLogAutomation
         currentTargetEntry = null;
         skippedIds.Clear();
         attemptCounts.Clear();
+        stopRequested = false;
         StatusText = Loc.T("Automation gestartet...", "Automation started...");
     }
 
+    /// <summary>
+    /// Wird MITTEN in einem Kampf (state == Fighting, tatsächlich im Kampf laut Spiel) nicht sofort
+    /// ausgeführt, sonst bliebe der Charakter angeschlagen und ohne Gegenwehr stehen (RotationSolver
+    /// wäre schon abgeschaltet) - stattdessen erst gemerkt (siehe Update/ForceStop) und der aktuelle
+    /// Kampf zu Ende gebracht, bevor wirklich gestoppt wird. In jedem anderen Zustand (noch am
+    /// Laufen/Suchen, kein echter Kampf) unverändert sofortiger Stopp wie bisher.
+    /// </summary>
     public void Stop()
+    {
+        if (state == State.Fighting && Plugin.Condition[ConditionFlag.InCombat])
+        {
+            if (stopRequested)
+                return;
+
+            stopRequested = true;
+            stopRequestedAt = DateTime.UtcNow;
+            StatusText = Loc.T("Beende aktuellen Kampf, dann Stopp...", "Finishing current fight, then stopping...");
+            return;
+        }
+
+        ForceStop();
+    }
+
+    private void ForceStop()
     {
         IsActive = false;
         state = State.Idle;
         currentTargetEntry = null;
+        stopRequested = false;
         StopPath();
         ClearRotationSolverPriority();
         SetRotationSolverAutoMode(false);
+        Plugin.ClearNavigationTarget();
     }
 
     public void MarkUnavailable()
@@ -235,12 +270,25 @@ public sealed class HuntingLogAutomation
         if (!IsActive)
             return;
 
+        // Zurückgehaltener Stopp (siehe Stop()) - sobald wirklich kein Kampf mehr läuft (oder die
+        // Notbremse StopAfterCombatTimeout greift, falls InCombat aus irgendeinem Grund hängen
+        // bleibt), jetzt tatsächlich stoppen, bevor der normale Zustandsautomat weiterläuft.
+        if (stopRequested && (!Plugin.Condition[ConditionFlag.InCombat] || DateTime.UtcNow - stopRequestedAt > StopAfterCombatTimeout))
+        {
+            ForceStop();
+            return;
+        }
+
         try
         {
             switch (state)
             {
                 case State.Idle:
-                    TryStartNext(huntingLogEntriesInZone);
+                    // Nicht mit dem nächsten Ziel weitermachen, während ein Stopp aussteht - nur
+                    // noch abwarten, bis der oben geprüfte Kampf-Zustand den eigentlichen Stopp
+                    // auslöst.
+                    if (!stopRequested)
+                        TryStartNext(huntingLogEntriesInZone);
                     break;
 
                 case State.Mounting:
@@ -356,7 +404,10 @@ public sealed class HuntingLogAutomation
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
 
-        if (mounted)
+        // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
+        // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
+        // sinnlos am Boden herum statt zu laufen.
+        if (mounted && Plugin.CanFly)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
 
         if (!accepted)
@@ -371,6 +422,7 @@ public sealed class HuntingLogAutomation
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
+        stuckDetector.Reset();
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -401,6 +453,19 @@ public sealed class HuntingLogAutomation
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
             if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
                 Plugin.TryUseSprint();
+
+            // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
+            // erreicht ist, erneut aufsitzen.
+            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[HuntingLogAutomation] UpdateMoving({currentTargetEntry.Name}): scheinbar steckengeblieben - Laufweg wird neu angefordert.");
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
                 SkipCurrent(Loc.T("Laufweg dauert zu lange", "Path is taking too long"));
@@ -509,6 +574,13 @@ public sealed class HuntingLogAutomation
         if (distance <= AttackRange)
         {
             StopPath();
+
+            // Beritten lassen sich die meisten Klassen-Aktionen (und damit RotationSolver) gar nicht
+            // ausführen - das Absteigen passiert nicht von allein, nur weil man in Reichweite ist
+            // (erst ein tatsächlicher Kampfbeginn würde es erzwingen, aber genau dafür braucht es ja
+            // erst die Aktionen).
+            Plugin.TryDismount();
+
             Plugin.SetTarget(monster);
             currentPriorityNameId = currentTargetEntry.BNpcNameId;
             var rsrPriorityOk = false;
@@ -601,6 +673,11 @@ public sealed class HuntingLogAutomation
         // stehen, obwohl der Zähler im Hunting Log längst hochgezählt hat.
         var freshName = FindCurrent(entries, currentTargetEntry.Id)?.Name ?? currentTargetEntry.Name;
         StatusText = Loc.T($"Kämpfe: {freshName}...", $"Fighting: {freshName}...");
+
+        // Sicherheitsnetz - falls der erste Absteige-Versuch beim Eintritt in den Kampf (siehe
+        // UpdateApproachingMonster) aus irgendeinem Grund nicht gegriffen hat (z.B. Aktion war in
+        // genau dem Frame noch nicht bereit). Wirkungslos/kein Aufruf, wenn schon abgestiegen.
+        Plugin.TryDismount();
 
         var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
         var monster = Plugin.FindNearestLiveMonster(currentTargetEntry.BNpcNameId!.Value, playerPos, MonsterSearchRadius);

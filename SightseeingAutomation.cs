@@ -52,6 +52,8 @@ public sealed class SightseeingAutomation
     private Vector3 currentTargetPosition;
     private DateTime stateEnteredAt;
     private bool hasSeenPathRunning;
+    private DateTime lastRemountAttempt = DateTime.MinValue;
+    private readonly NavigationStuckDetector stuckDetector = new();
     private bool hasSentEmote;
 
     public bool IsActive { get; private set; }
@@ -122,6 +124,7 @@ public sealed class SightseeingAutomation
         state = State.Idle;
         currentTargetEntry = null;
         StopPath();
+        Plugin.ClearNavigationTarget();
     }
 
     public void MarkUnavailable()
@@ -238,7 +241,10 @@ public sealed class SightseeingAutomation
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
 
-        if (mounted)
+        // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
+        // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
+        // sinnlos am Boden herum statt zu laufen.
+        if (mounted && Plugin.CanFly)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
 
         if (!accepted)
@@ -253,6 +259,7 @@ public sealed class SightseeingAutomation
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
+        stuckDetector.Reset();
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -289,6 +296,19 @@ public sealed class SightseeingAutomation
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
             if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
                 Plugin.TryUseSprint();
+
+            // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
+            // erreicht ist, erneut aufsitzen.
+            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[SightseeingAutomation] UpdateMoving({currentTargetEntry.Name}): scheinbar steckengeblieben - Laufweg wird neu angefordert.");
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
                 SkipCurrent(Loc.T("Laufweg dauert zu lange", "Path is taking too long"));
@@ -337,7 +357,10 @@ public sealed class SightseeingAutomation
             {
                 try
                 {
-                    Plugin.CommandManager.ProcessCommand(currentTargetEntry.RequiredEmoteCommand);
+                    // Echter Spiel-Emote-Befehl (z.B. "/sit"), kein von einem Plugin registrierter
+                    // Befehl - siehe Plugin.SendGameChatCommand, ICommandManager.ProcessCommand würde
+                    // hier kommentarlos nichts bewirken.
+                    Plugin.SendGameChatCommand(currentTargetEntry.RequiredEmoteCommand);
                     Plugin.Log.Info($"[SightseeingAutomation] UpdateWaitingForUnlock({currentTargetEntry.Name}): Emote '{currentTargetEntry.RequiredEmoteCommand}' ausgeführt.");
                 }
                 catch (Exception ex)
