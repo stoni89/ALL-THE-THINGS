@@ -1,0 +1,22 @@
+[
+  {
+    "Author": "stoni89",
+    "Name": "All The Things",
+    "InternalName": "AllTheThings",
+    "AssemblyVersion": "0.3.0.0",
+    "Description": "Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories, Triple-Triad-Karten und Framer's Kits in der aktuellen Zone noch fehlen.",
+    "Punchline": "Sammel-Tracker pro Karte, inspiriert von \"All the Things\"",
+    "ApplicableVersion": "any",
+    "Tags": [
+      "collection",
+      "tracker",
+      "utility",
+      "allthethings"
+    ],
+    "DalamudApiLevel": 15,
+    "RepoUrl": "https://github.com/stoni89/ALL-THE-THINGS",
+    "DownloadLinkInstall": "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip",
+    "DownloadLinkTesting": "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
+  }
+]

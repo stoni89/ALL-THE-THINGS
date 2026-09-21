@@ -2,11 +2,11 @@
   <PropertyGroup>
     <Version>0.3.0</Version>
     <!-- Manifest-Felder (siehe https://github.com/goatcorp/DalamudPackager) -->
-    <Author>Dein Name</Author>
+    <Author>stoni89</Author>
     <Name>All The Things</Name>
     <Punchline>Sammel-Tracker pro Karte, inspiriert von "All the Things"</Punchline>
     <Description>Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories, Triple-Triad-Karten und Framer's Kits in der aktuellen Zone noch fehlen.</Description>
-    <RepoUrl></RepoUrl>
+    <RepoUrl>https://github.com/stoni89/ALL-THE-THINGS</RepoUrl>
     <Tags>collection;tracker;utility;allthethings</Tags>
   </PropertyGroup>
 

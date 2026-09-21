@@ -1,0 +1,94 @@
+name: Release
+
+# Baut das Plugin bei jedem Push auf main neu, veröffentlicht ein GitHub Release mit dem
+# gepackten Plugin-Zip als Asset und aktualisiert repo.json (das Dalamud-Custom-Repository-Feed)
+# mit der neuen Versionsnummer, damit Dalamud automatisch ein Update anzeigt.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Download Dalamud
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile dalamud-latest.zip
+          Expand-Archive -Path dalamud-latest.zip -DestinationPath dalamud
+        shell: pwsh
+
+      - name: Build (Release)
+        run: dotnet build --configuration Release
+        shell: pwsh
+        env:
+          DALAMUD_HOME: ${{ github.workspace }}\dalamud
+
+      - name: Read plugin version
+        id: version
+        run: |
+          $xml = [xml](Get-Content AllTheThings.csproj)
+          $version = ($xml.Project.PropertyGroup.Version | Select-Object -First 1)
+          Write-Host "Plugin version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Create/update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          files: bin/Release/AllTheThings/latest.zip
+          generate_release_notes: true
+
+      - name: Update repo.json
+        run: |
+          $manifest = Get-Content bin/Release/AllTheThings/AllTheThings.json | ConvertFrom-Json
+
+          $repoEntry = [ordered]@{
+            Author              = $manifest.Author
+            Name                = $manifest.Name
+            InternalName        = $manifest.InternalName
+            AssemblyVersion     = $manifest.AssemblyVersion
+            Description         = $manifest.Description
+            Punchline           = $manifest.Punchline
+            ApplicableVersion   = $manifest.ApplicableVersion
+            Tags                = $manifest.Tags
+            DalamudApiLevel     = $manifest.DalamudApiLevel
+            RepoUrl             = "https://github.com/stoni89/ALL-THE-THINGS"
+            DownloadLinkInstall = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
+            DownloadLinkUpdate  = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
+            DownloadLinkTesting = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
+          }
+
+          @($repoEntry) | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 repo.json
+        shell: pwsh
+
+      - name: Commit repo.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo.json
+          $status = git status --porcelain
+          if ($status) {
+            git commit -m "Update repo.json to v$($env:VERSION)"
+            git push
+          } else {
+            Write-Host "repo.json unchanged, nothing to commit."
+          }
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
