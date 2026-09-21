@@ -3,7 +3,7 @@
     "Author": "Stoni",
     "Name": "All The Things",
     "InternalName": "AllTheThings",
-    "AssemblyVersion": "0.3.0.0",
+    "AssemblyVersion": "0.4.0.0",
     "Description": "Shows which mounts, minions, orchestrion rolls, bardings, emotes, facewear, fashion accessories, Triple Triad cards, and portrait frames are still missing in your current zone.",
     "Punchline": "Zone Completion, inspired by \"All the Things\" from WoW",
     "ApplicableVersion": "any",
