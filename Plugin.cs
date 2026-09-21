@@ -7,13 +7,17 @@ using Dalamud.Game.Command;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.IoC;
 using Dalamud.Plugin;
+using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.System.Framework;
+using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using LuminaSupplemental.Excel.Model;
 using LuminaSupplemental.Excel.Services;
@@ -43,11 +47,18 @@ public sealed class Plugin : IDalamudPlugin
     // es gibt zur Laufzeit ohnehin immer nur genau eine.
     private static Plugin instance = null!;
 
+    // Für OpenVendorMap (Wegweiser-Pfeil-Zielposition) - dieselbe IPC, die auch jede Automation für
+    // ihre eigenen Laufaufträge nutzt (siehe z.B. AetheryteAutomation.queryFlagToPoint), damit der
+    // Pfeil exakt denselben begehbaren Punkt anzeigt, den vnavmesh auch tatsächlich ansteuern würde -
+    // nicht eine eigene, möglicherweise leicht abweichende Umrechnung der Kartenkoordinate.
+    private static ICallGateSubscriber<Vector3?>? navigationFlagToPointQuery;
+
     public Configuration Configuration { get; init; }
 
     public readonly WindowSystem WindowSystem = new("AllTheThings");
     private MainWindow MainWindow { get; init; }
     public CompactOverlayWindow CompactOverlayWindow { get; init; }
+    public NavigationArrowWindow NavigationArrowWindow { get; init; }
     public QuestAutomation QuestAutomation { get; init; }
     public AetheryteAutomation AetheryteAutomation { get; init; }
     public GoToAutomation GoToAutomation { get; init; }
@@ -63,6 +74,8 @@ public sealed class Plugin : IDalamudPlugin
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.SanitizeTypeOrder();
 
+        navigationFlagToPointQuery = PluginInterface.GetIpcSubscriber<Vector3?>("vnavmesh.Query.Mesh.FlagToPoint");
+
         QuestAutomation = new QuestAutomation();
         AetheryteAutomation = new AetheryteAutomation();
         GoToAutomation = new GoToAutomation();
@@ -76,6 +89,9 @@ public sealed class Plugin : IDalamudPlugin
 
         CompactOverlayWindow = new CompactOverlayWindow(this) { IsOpen = Configuration.ShowCompactOverlay };
         WindowSystem.AddWindow(CompactOverlayWindow);
+
+        NavigationArrowWindow = new NavigationArrowWindow(this) { IsOpen = true };
+        WindowSystem.AddWindow(NavigationArrowWindow);
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
@@ -127,6 +143,34 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
+    /// Schließt ein nach der Chocobokeep-Interaktion aufpoppendes SelectString-Menü ("Hire a
+    /// chocobo porter. / Learn about chocobo porters. / Nothing.") automatisch, indem der LETZTE
+    /// Eintrag angeklickt wird - die Ablehnen-Option ("Nichts.") steht dort immer als letztes.
+    /// Bewusst kein Textabgleich (z.B. gegen Lumina "Addon"-Sheet Row 622, wie ursprünglich
+    /// versucht) - Groß-/Kleinschreibung, Zeichensetzung oder unsichtbare Formatierungszeichen in
+    /// der rohen SeString machten den exakten Vergleich zu fragil, der Eintrag wurde nie gefunden.
+    /// Ohne das bleibt die Automation stehen, weil das offene Menü weitere Eingaben blockiert und
+    /// UIState.IsChocoboTaxiStandUnlocked dadurch nie geprüft werden kann. Gibt true zurück, wenn
+    /// ein Eintrag angeklickt wurde.
+    /// </summary>
+    public static unsafe bool TryDismissChocobokeepSelectString()
+    {
+        var addon = (AddonSelectString*)GameGui.GetAddonByName("SelectString").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        var entryCount = addon->PopupMenu.EntryCount;
+        if (entryCount <= 0)
+            return false;
+
+        var lastIndex = entryCount - 1;
+        var entryText = addon->PopupMenu.EntryNames[lastIndex].ToString();
+        addon->AtkUnitBase.FireCallbackInt(lastIndex);
+        Log.Info($"[ChocobokeepAutomation] TryDismissChocobokeepSelectString: letzter Eintrag '{entryText}' (#{lastIndex}) automatisch gewählt.");
+        return true;
+    }
+
+    /// <summary>
     /// Ob ein einzelner Chocobo-Reitstand (Lumina "ChocoboTaxiStand"-RowId, siehe
     /// GetChocobokeepEntries) bereits freigeschaltet ist - doch ein echter Spielstand-Flag
     /// (UIState.IsChocoboTaxiStandUnlocked), keine eigene Merkliste nötig. Eigenständig aufrufbar
@@ -141,6 +185,29 @@ public sealed class Plugin : IDalamudPlugin
     /// (der Entdecken-Cast braucht ein paar Sekunden, bis er durchläuft).
     /// </summary>
     public static unsafe bool IsAetheryteUnlocked(uint aetheryteId) => UIState.Instance()->IsAetheryteUnlocked(aetheryteId);
+
+    /// <summary>
+    /// Ob gerade tatsächlich geflogen werden darf (Zone freigeschaltet UND Fliegen dort überhaupt
+    /// erlaubt, z.B. nicht in Innenräumen) - live vom Spiel gepflegtes Flag. Von allen vnavmesh-
+    /// Laufaufträgen (Aetheryte/Chocobokeep/HuntingLog/AetherCurrent/Sightseeing/GoTo) genutzt, bevor
+    /// mit fly=true angefragt wird: vnavmesh nimmt einen Flugauftrag sonst teils trotzdem an, obwohl
+    /// der Charakter gar nicht abheben kann - das Ergebnis war ein sinnloses Herumhüpfen am Boden
+    /// statt eines sauberen Fußwegs.
+    /// </summary>
+    public static unsafe bool CanFly => PlayerState.Instance()->CanFly;
+
+    /// <summary>
+    /// Ob eine Aetheryte-RowId einen GROSSEN Aetheryten (row.IsAetheryte == true - eigener Kristall
+    /// mit deutlich größerem Sockel/Kollisionsmodell) statt eines kleinen Aethernetz-Kristalls
+    /// bezeichnet. Für AetheryteAutomation, die für große Aetheryten einen größeren Interaktions-
+    /// Abstand braucht (siehe dortige FinalApproachDistance-Kommentare) - ein zu enger Abstand ließ
+    /// den Charakter gegen den größeren Sockel laufen, statt sauber davor stehen zu bleiben.
+    /// </summary>
+    public static bool IsBigAetheryte(uint aetheryteId)
+    {
+        var sheet = DataManager.GetExcelSheet<Aetheryte>();
+        return sheet != null && sheet.TryGetRow(aetheryteId, out var row) && row.IsAetheryte;
+    }
 
     /// <summary>
     /// Ob eine einzelne Ätherströmung (Lumina "AetherCurrent"-Zeile) bereits entdeckt wurde -
@@ -168,6 +235,37 @@ public sealed class Plugin : IDalamudPlugin
     /// dokumentiert, "!= 0" bedeutet aber zuverlässig "noch gar nicht freigeschaltet" vs. "schon".
     /// </summary>
     public static unsafe bool IsSightseeingLogUnlocked() => PlayerState.Instance()->SightseeingLogUnlockState != 0;
+
+    /// <summary>
+    /// Ob ein Sammel-Typ in der aktuellen Zone gerade überhaupt machbar ist - für Sightseeing
+    /// braucht man dafür Fliegen (viele Punkte sind sonst gar nicht erreichbar) und das
+    /// freigeschaltete Log selbst (siehe IsSightseeingLogUnlocked). Bewusst NICHT für AetherCurrent -
+    /// genau umgekehrtes Henne-Ei-Problem: Ätherströmungen muss man erst einsammeln, UM Fliegen in
+    /// der Zone überhaupt erst freizuschalten (siehe AetherCurrentAutomation.BeginPathfind) - sie
+    /// hinter CanFly zu verstecken würde das Feature genau dann unbrauchbar machen, wenn man es am
+    /// meisten braucht. Auch NICHT für HuntingLog (auf expliziten Wunsch wieder entfernt). Wird
+    /// nicht zum Ausfiltern benutzt (Einträge bleiben sichtbar), sondern nur zum Ausgrauen in
+    /// Liste/Filter/Reihenfolge.
+    /// </summary>
+    public static bool IsTypeCurrentlyPossible(CollectibleType type) => type switch
+    {
+        CollectibleType.Sightseeing => IsSightseeingLogUnlocked() && CanFly,
+        _ => true,
+    };
+
+    /// <summary>
+    /// Erklärtext fürs Ausgrauen (siehe IsTypeCurrentlyPossible). Für Sightseeing bewusst immer
+    /// derselbe Text (nicht mehr zwischen "Log nicht freigeschaltet" und "Fliegen nicht
+    /// freigeschaltet" unterschieden) - CanFly kann in Zonen ohne jede Flug-Freischaltung leicht
+    /// fälschlich als Grund erscheinen, obwohl eigentlich das Log selbst fehlt.
+    /// </summary>
+    public static string GetTypeNotPossibleReason(CollectibleType type)
+    {
+        if (type == CollectibleType.Sightseeing)
+            return Loc.T("Sightseeing Log noch nicht freigeschaltet", "Sightseeing Log not unlocked yet");
+
+        return Loc.T("Noch nicht möglich", "Not possible yet");
+    }
 
     private static Dictionary<string, (uint TerritoryId, uint MapId)>? zoneByPlaceNameCache;
 
@@ -229,6 +327,116 @@ public sealed class Plugin : IDalamudPlugin
         Log.Info($"[ZoneEnrichmentDebug] {dungeonEntries.Count} Dungeon-Einträge insgesamt, {stillMissing.Count} davon noch ohne Zone:");
         foreach (var entry in stillMissing)
             Log.Info($"[ZoneEnrichmentDebug]   {entry.Type} \"{entry.Name}\": Source=\"{entry.Source}\"");
+    }
+
+    /// <summary>
+    /// Viele JSON-Einträge (Mounts/Minions/Orchestrionrollen/Triple-Triad-Karten/...) kennen zwar
+    /// ihren Händler als Klartext (Vendor) und die richtige Zone (TerritoryTypeId/MapId), aber KEINE
+    /// Kartenkoordinate (VendorMapX/Y stehen auf 0/0) - dadurch griff HasVendorLocation nie, und
+    /// "Auf Karte anzeigen"/"Hinlaufen" fehlten (siehe z.B. "Jonathas" in Old Gridania, dessen
+    /// Achievement-Certificate-Minions alle betroffen waren). Löst das GENERISCH über den Namen auf
+    /// (Level-Sheet-NPC-Suche, dieselbe Technik wie schon bei EnrichFrameKitVendors/
+    /// GetChocobokeepEntries) - eine Zeile pro (Name, Zone)-Kombination, da NPCs mit demselben Namen
+    /// theoretisch in mehreren Zonen stehen könnten.
+    /// </summary>
+    public static void EnrichEntriesWithVendorPosition(List<CollectibleEntry> entries)
+    {
+        var candidates = entries
+            .Where(e => !string.IsNullOrEmpty(e.Vendor) && e.TerritoryTypeId != 0 && e.VendorMapX == 0 && e.VendorMapY == 0)
+            .ToList();
+        if (candidates.Count == 0)
+            return;
+
+        try
+        {
+            var npcResidentSheet = DataManager.GetExcelSheet<ENpcResident>();
+            var npcBaseSheet = DataManager.GetExcelSheet<ENpcBase>();
+            var levelSheet = DataManager.GetExcelSheet<Level>();
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            if (npcResidentSheet == null || npcBaseSheet == null || levelSheet == null || mapSheet == null)
+                return;
+
+            var neededNames = candidates.Select(e => e.Vendor).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            // Name -> NPC-RowId(s) - mehrere NPCs können denselben Anzeigenamen tragen (z.B. generische
+            // Stadtwachen), deshalb eine Liste statt eines einzelnen Werts pro Name.
+            var npcIdsByName = new Dictionary<string, List<uint>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var npc in npcResidentSheet)
+            {
+                var name = npc.Singular.ToString();
+                if (string.IsNullOrEmpty(name) || !neededNames.Contains(name))
+                    continue;
+
+                if (!npcIdsByName.TryGetValue(name, out var list))
+                    npcIdsByName[name] = list = new List<uint>();
+                list.Add(npc.RowId);
+            }
+
+            if (npcIdsByName.Count == 0)
+                return;
+
+            var allNeededNpcIds = npcIdsByName.Values.SelectMany(l => l).ToHashSet();
+
+            // (Name, TerritoryTypeId) -> Kartenkoordinate - ein NPC kann an mehreren Stellen platziert
+            // sein (siehe GetChocobokeepEntries-Kommentar), hier reicht der ERSTE Treffer je Zone.
+            var positionByNameAndTerritory = new Dictionary<(string Name, uint TerritoryId), (float X, float Y)>();
+            foreach (var level in levelSheet)
+            {
+                try
+                {
+                    if (level.Type != 8 || !allNeededNpcIds.Contains(level.Object.RowId))
+                        continue;
+
+                    var territoryId = level.Territory.RowId;
+                    var mapId = level.Map.RowId;
+                    if (territoryId == 0 || mapId == 0 || !mapSheet.TryGetRow(mapId, out var map))
+                        continue;
+
+                    var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+                        new Vector2(level.X, level.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+
+                    foreach (var (name, npcIds) in npcIdsByName)
+                    {
+                        if (!npcIds.Contains(level.Object.RowId))
+                            continue;
+
+                        positionByNameAndTerritory.TryAdd((name, territoryId), (mapCoords.X, mapCoords.Y));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler bei Level-Zeile {level.RowId} (Händler-Positionsauflösung) - übersprungen.");
+                }
+            }
+
+            foreach (var entry in candidates)
+            {
+                if (positionByNameAndTerritory.TryGetValue((entry.Vendor, entry.TerritoryTypeId), out var pos))
+                {
+                    entry.VendorMapX = pos.X;
+                    entry.VendorMapY = pos.Y;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Auflösen von Händler-Kartenkoordinaten aus dem Namen.");
+        }
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump zur Kalibrierung von EnrichEntriesWithVendorPosition - listet jeden
+    /// Eintrag mit Händlernamen, dem auch danach noch eine Kartenkoordinate fehlt.
+    /// </summary>
+    public static void DumpVendorPositionEnrichmentDebugInfo()
+    {
+        var entries = CollectionData.GetAllEntries();
+        var withVendor = entries.Where(e => !string.IsNullOrEmpty(e.Vendor)).ToList();
+        var stillMissing = withVendor.Where(e => e.VendorMapX == 0 && e.VendorMapY == 0).ToList();
+
+        Log.Info($"[VendorPositionDebug] {withVendor.Count} Einträge mit Händlernamen insgesamt, {stillMissing.Count} davon noch ohne Kartenkoordinate:");
+        foreach (var entry in stillMissing)
+            Log.Info($"[VendorPositionDebug]   {entry.Type} \"{entry.Name}\": Vendor=\"{entry.Vendor}\", Zone={entry.TerritoryTypeId}");
     }
 
     private static List<CollectibleEntry>? frameKitEntriesCache;
@@ -933,6 +1141,48 @@ public sealed class Plugin : IDalamudPlugin
         new(1179740, 1188, new(-450.8124f, 121.6325f, 323.1461f)),
     };
 
+    /// <summary>
+    /// Ermittelt den lokalen Gebietsnamen (z.B. "Hyrstmill") am nächsten zur übergebenen Weltposition
+    /// in einer Zone - für die Anzeige "Chocobokeep (Gebiet)" in GetChocobokeepEntries, da
+    /// ChocobokeepLocations selbst keinen Namen kennt (nur Position). Vergleicht gegen jeden
+    /// Aetheryten/Aethernetz-Kristall der Zone (deren Weltposition ohnehin schon über
+    /// ResolveAetheryteWorldPosition auflösbar ist), nicht nur die kleinen Kristalle - ein
+    /// Chocobokeep kann auch näher an einem großen Aetheryten stehen als an einem Aethernetz-Punkt.
+    /// </summary>
+    private static string? ResolveNearestAetherytePlaceName(uint territoryId, Vector3 position)
+    {
+        var aetheryteSheet = DataManager.GetExcelSheet<Aetheryte>();
+        if (aetheryteSheet == null)
+            return null;
+
+        string? bestName = null;
+        var bestDistance = float.MaxValue;
+        var positionXZ = new Vector2(position.X, position.Z);
+
+        foreach (var row in aetheryteSheet)
+        {
+            if (row.Territory.RowId != territoryId)
+                continue;
+
+            var worldPos = ResolveAetheryteWorldPosition(row.RowId);
+            if (worldPos == null)
+                continue;
+
+            var distance = Vector2.Distance(new Vector2(worldPos.Value.X, worldPos.Value.Z), positionXZ);
+            if (distance >= bestDistance)
+                continue;
+
+            var placeName = row.PlaceName.ValueNullable?.Name.ToString();
+            if (string.IsNullOrEmpty(placeName))
+                continue;
+
+            bestDistance = distance;
+            bestName = placeName;
+        }
+
+        return bestName;
+    }
+
     private static List<CollectibleEntry>? chocobokeepEntriesCache;
 
     /// <summary>
@@ -966,10 +1216,13 @@ public sealed class Plugin : IDalamudPlugin
                 var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
                     new Vector2(loc.Position.X, loc.Position.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
 
+                var areaName = ResolveNearestAetherytePlaceName(loc.TerritoryId, loc.Position);
+                var name = string.IsNullOrEmpty(areaName) ? "Chocobokeep" : $"Chocobokeep ({areaName})";
+
                 result.Add(new CollectibleEntry
                 {
                     Id = loc.ChocoboTaxiStandId,
-                    Name = "Chocobokeep",
+                    Name = name,
                     Type = CollectibleType.Chocobokeep,
                     Category = Loc.T("Chocobokeep", "Chocobokeep"),
                     TerritoryTypeId = loc.TerritoryId,
@@ -1163,14 +1416,42 @@ public sealed class Plugin : IDalamudPlugin
     /// </summary>
     private static readonly Dictionary<uint, uint[]> SplitCityTerritories = new()
     {
-        [130] = new[] { 130u, 131u },   // Ul'dah (Steps of Nald / Steps of Thal)
-        [131] = new[] { 130u, 131u },
-        [128] = new[] { 128u, 129u },   // Limsa Lominsa (Upper / Lower Decks)
-        [129] = new[] { 128u, 129u },
-        [132] = new[] { 132u, 133u },   // Gridania (New / Old)
-        [133] = new[] { 132u, 133u },
-        [418] = new[] { 418u, 419u },   // Ishgard (Foundation / The Pillars)
-        [419] = new[] { 418u, 419u },
+        [130] = new[] { 130u, 131u, 599u, 178u },   // Ul'dah (Steps of Nald / Steps of Thal / Flame Barracks / The Hourglass)
+        [131] = new[] { 130u, 131u, 599u, 178u },
+        [599] = new[] { 130u, 131u, 599u, 178u },
+        [178] = new[] { 130u, 131u, 599u, 178u },
+        [128] = new[] { 128u, 129u, 597u, 177u },   // Limsa Lominsa (Upper / Lower Decks / Maelstrom Barracks / Mizzenmast Inn)
+        [129] = new[] { 128u, 129u, 597u, 177u },
+        [597] = new[] { 128u, 129u, 597u, 177u },
+        [177] = new[] { 128u, 129u, 597u, 177u },
+        [132] = new[] { 132u, 133u, 534u, 598u, 179u },   // Gridania (New / Old / Twin Adder Barracks / Serpent Barracks / The Roost)
+        [133] = new[] { 132u, 133u, 534u, 598u, 179u },
+        [534] = new[] { 132u, 133u, 534u, 598u, 179u },
+        [598] = new[] { 132u, 133u, 534u, 598u, 179u },
+        [179] = new[] { 132u, 133u, 534u, 598u, 179u },
+        [418] = new[] { 418u, 419u, 886u, 433u, 429u },   // Ishgard (Foundation / The Pillars / Firmament / Fortemps Manor / Cloud Nine)
+        [419] = new[] { 418u, 419u, 886u, 433u, 429u },
+        [886] = new[] { 418u, 419u, 886u, 433u, 429u },
+        [433] = new[] { 418u, 419u, 886u, 433u, 429u },
+        [429] = new[] { 418u, 419u, 886u, 433u, 429u },
+        [144] = new[] { 144u, 388u },   // The Gold Saucer / Chocobo Square
+        [388] = new[] { 144u, 388u },
+        [628] = new[] { 628u, 629u },   // Kugane / Bokairo Inn
+        [629] = new[] { 628u, 629u },
+        [819] = new[] { 819u, 843u, 844u },   // The Crystarium / The Pendants Personal Suite / The Ocular
+        [843] = new[] { 819u, 843u, 844u },
+        [844] = new[] { 819u, 843u, 844u },
+        [962] = new[] { 962u, 990u, 1337u },   // Old Sharlayan / Andron / The Maiden's Home
+        [990] = new[] { 962u, 990u, 1337u },
+        [1337] = new[] { 962u, 990u, 1337u },
+        [1185] = new[] { 1185u, 1205u },   // Tuliyollal / The For'ard Cabins
+        [1205] = new[] { 1185u, 1205u },
+        [1186] = new[] { 1186u, 1207u, 1223u, 1224u },   // Solution Nine / The Backroom / Tritalis Training / Greenroom
+        [1207] = new[] { 1186u, 1207u, 1223u, 1224u },
+        [1223] = new[] { 1186u, 1207u, 1223u, 1224u },
+        [1224] = new[] { 1186u, 1207u, 1223u, 1224u },
+        [156] = new[] { 156u, 351u },   // Mor Dhona / The Rising Stones
+        [351] = new[] { 156u, 351u },
     };
 
     /// <summary>
@@ -1205,16 +1486,6 @@ public sealed class Plugin : IDalamudPlugin
     /// Klassen-Einschränkung, keine Stammes-/wiederholbaren Quests) - es gibt dafür keine
     /// fertige Prüfung im Spielclient, siehe Kommentare unten.
     /// </summary>
-    /// <summary>
-    /// Verwirft den Zonen-Cache für Aetheryten/Quests, damit die nächste Abfrage neu berechnet
-    /// wird (z.B. für den "Cache zurücksetzen"-Knopf im Debug-Tab).
-    /// </summary>
-    public void ResetLiveEntriesCache()
-    {
-        liveEntriesZoneId = null;
-        liveEntriesCache = new List<CollectibleEntry>();
-    }
-
     public List<CollectibleEntry> GetLiveZoneEntries(uint territoryId)
     {
         if (liveEntriesZoneId == territoryId)
@@ -1246,6 +1517,106 @@ public sealed class Plugin : IDalamudPlugin
         liveEntriesCache = result;
         return result;
     }
+
+    /// <summary>
+    /// Manuell erfasste Zusatz-Voraussetzungen für Quests, die NICHT über die üblichen
+    /// PreviousQuest/QuestLock-Mechanismen abgebildet sind (Recherche ergab: für Achievement-/
+    /// Besitz-Voraussetzungen gibt es KEINE auslesbare Verknüpfung in den Lumina-Spieldaten, weder
+    /// im Quest- noch im Achievement-Sheet) - daher von Hand gepflegt, Quest-Anzeigename (Englisch,
+    /// exakt wie im Spiel) -> benötigte Mount-Namen. Wird nur ergänzt, wenn der Nutzer eine konkrete
+    /// Quest + Voraussetzung nennt, siehe GetRequirementInfo.
+    /// </summary>
+    private static readonly Dictionary<string, string[]> QuestRequiredMounts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Fiery Wings, Fiery Hearts"] = new[]
+        {
+            "Rose Lanner", "White Lanner", "Round Lanner", "Warring Lanner", "Dark Lanner", "Sophic Lanner", "Demonic Lanner",
+        },
+    };
+
+    /// <summary>
+    /// Umgekehrte Richtung - Mount-Name -> Name der Quest, die zuerst abgeschlossen sein muss (z.B.
+    /// "Firebird" braucht "Fiery Wings, Fiery Hearts"). Ebenfalls von Hand gepflegt, siehe
+    /// QuestRequiredMounts-Kommentar.
+    /// </summary>
+    private static readonly Dictionary<string, string> MountRequiredQuest = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Firebird"] = "Fiery Wings, Fiery Hearts",
+    };
+
+    private static Dictionary<string, uint>? questIdsByNameCache;
+
+    /// <summary>
+    /// Löst einen Quest-Anzeigenamen (Englisch, exakt wie im Spiel) auf seine RowId auf - für
+    /// QuestManager.IsQuestComplete, das nur RowIds akzeptiert. Einmalig über das ganze Quest-Sheet
+    /// aufgebaut und danach gecacht (Namen ändern sich nicht zur Laufzeit).
+    /// </summary>
+    private static uint? ResolveQuestIdByName(string questName)
+    {
+        if (questIdsByNameCache == null)
+        {
+            questIdsByNameCache = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+            var questSheet = DataManager.GetExcelSheet<Quest>();
+            if (questSheet != null)
+            {
+                foreach (var row in questSheet)
+                {
+                    var rowName = row.Name.ToString();
+                    if (!string.IsNullOrEmpty(rowName))
+                        questIdsByNameCache.TryAdd(rowName, row.RowId);
+                }
+            }
+        }
+
+        return questIdsByNameCache.TryGetValue(questName, out var id) ? id : null;
+    }
+
+    /// <summary>
+    /// Hinweistext + Wiki-Link für Einträge mit manuell erfasster Zusatz-Voraussetzung (siehe
+    /// QuestRequiredMounts/MountRequiredQuest) - bewusst NICHT im CollectibleEntry selbst gespeichert
+    /// (die Mount-Liste kommt aus der einmal geladenen/für die ganze Sitzung gecachten
+    /// CollectionData.GetAllEntries() und würde sonst nach Erfüllen der Voraussetzung nicht mehr
+    /// aktualisiert), sondern jeden Frame frisch geprüft, genau wie IsOwned/CanAfford. Gibt (null,
+    /// null) zurück, wenn keine Voraussetzung bekannt ist oder sie bereits erfüllt ist.
+    /// </summary>
+    public unsafe (string? Note, string? WikiUrl) GetRequirementInfo(CollectibleEntry entry)
+    {
+        if (entry.Type == CollectibleType.Quest && QuestRequiredMounts.TryGetValue(entry.Name, out var requiredMounts))
+        {
+            var mountIdsByName = CollectionData.GetAllEntries()
+                .Where(e => e.Type == CollectibleType.Mount)
+                .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var mountName in requiredMounts)
+            {
+                if (!mountIdsByName.TryGetValue(mountName, out var mountId) || !PlayerState.Instance()->IsMountUnlocked(mountId))
+                    return (Loc.T("(Voraussetzung nicht erfüllt)", "(requirement not met)"), GetWikiUrl(entry.Name));
+            }
+
+            return (null, null);
+        }
+
+        if (entry.Type == CollectibleType.Mount && MountRequiredQuest.TryGetValue(entry.Name, out var requiredQuest))
+        {
+            var questId = ResolveQuestIdByName(requiredQuest);
+            if (questId == null || !QuestManager.IsQuestComplete((ushort)questId.Value))
+                return ($"(Quest: {requiredQuest})", GetWikiUrl(requiredQuest));
+
+            return (null, null);
+        }
+
+        return (null, null);
+    }
+
+    /// <summary>
+    /// Wiki-Seite für eine Quest mit Zusatz-Voraussetzung (siehe QuestRequiredMounts/
+    /// MountRequiredQuest) - das Consolegameswiki verwendet als URL einfach den Quest-Anzeigenamen
+    /// mit Leerzeichen durch Unterstriche ersetzt (Satzzeichen wie Kommas bleiben unverändert
+    /// stehen), siehe z.B. https://ffxiv.consolegameswiki.com/wiki/Fiery_Wings,_Fiery_Hearts.
+    /// </summary>
+    private static string GetWikiUrl(string questName) =>
+        "https://ffxiv.consolegameswiki.com/wiki/" + questName.Replace(' ', '_');
 
     /// <summary>
     /// Prüft alle Freischalt-/Annehmbarkeits-Bedingungen einer Quest AUSSER dem Vergabeort (den
@@ -1653,6 +2024,94 @@ public sealed class Plugin : IDalamudPlugin
         [42] = new Vector3(-58.275673f, 42f, -131.06003f),       // Limsa Lominsa Upper Decks: Culinarians' Guild
         [48] = new Vector3(-3.3218017f, 43.999992f, -217.23248f), // Limsa Lominsa Upper Decks: Marauders' Guild
         [41] = new Vector3(14.184732f, 40f, 70.58942f),          // Limsa Lominsa Upper Decks: The Aftcastle
+        [62] = new Vector3(0.024659282f, 1.0425026f, -4.0411267f),   // The Gold Saucer: Gold Saucer Aetheryte Plaza (großer Aetheryte)
+        [63] = new Vector3(-63.253986f, 0.044274688f, 52.463417f),   // The Gold Saucer: Entrance & Card Squares
+        [64] = new Vector3(58.626476f, 20.99973f, 61.28264f),        // The Gold Saucer: Wonder Square East
+        [65] = new Vector3(0.7764596f, 20.999727f, 59.995113f),      // The Gold Saucer: Wonder Square West
+        [66] = new Vector3(93.61656f, -5.0000005f, -70.9733f),       // The Gold Saucer: Event Square
+        [67] = new Vector3(113.93691f, 12.999999f, -39.78969f),      // The Gold Saucer: Cactpot Board
+        [68] = new Vector3(-24.051819f, 3.273533f, -83.88178f),      // The Gold Saucer: Round Square
+        [69] = new Vector3(-14.04731f, -5.9604645e-07f, -34.106762f), // Chocobo Square: Chocobo Square
+        [89] = new Vector3(50.673454f, -2.026558e-06f, 21.841373f),   // Chocobo Square: Minion Square
+        [2] = new Vector3(28.862434f, 2.010144f, 30.561651f),         // New Gridania: Gridania Aetheryte Plaza (großer Aetheryte)
+        [25] = new Vector3(164.4172f, -2.3711808f, 85.57306f),        // New Gridania: Archers' Guild
+        [26] = new Vector3(102.793236f, 8.593217f, -110.11618f),      // New Gridania: Leatherworkers' Guild & Shaded Bower
+        [27] = new Vector3(119.54223f, 11.556623f, -230.58084f),      // Old Gridania: Lancers' Guild
+        [28] = new Vector3(-146.36765f, 4f, -13.672467f),             // New Gridania: Conjurers' Guild
+        [29] = new Vector3(-309.5592f, 7.0605545f, -176.70325f),      // Old Gridania: Botanists' Guild
+        [30] = new Vector3(-71.352844f, 7.267789f, -139.29424f),      // Old Gridania: Mih Khetto's Amphitheatre
+        [70] = new Vector3(-66.24398f, 8.113304f, 49.884026f),        // Foundation: Ishgard Aetheryte Plaza (großer Aetheryte)
+        [80] = new Vector3(47.78436f, 23.979128f, -0.61288136f),      // Foundation: The Forgotten Knight
+        [81] = new Vector3(-106.0554f, 15.140585f, -31.97764f),       // Foundation: Skysteel Manufactory
+        [82] = new Vector3(48.699932f, -12.020877f, 68.83059f),       // Foundation: The Brume
+        [83] = new Vector3(135.3319f, -9.234926f, -63.408485f),       // The Pillars: Athenaeum Astrologicum
+        [84] = new Vector3(-136.28429f, -12.634914f, -17.067507f),    // The Pillars: The Jeweled Crozier
+        [85] = new Vector3(-79.4322f, 10.054904f, -124.68877f),       // The Pillars: Saint Reymanaud's Cathedral
+        [86] = new Vector3(79.41425f, 10.054904f, -124.84091f),       // The Pillars: The Tribunal
+        [87] = new Vector3(-0.48842534f, 15.965048f, -34.27581f),     // The Pillars: The Last Vigil
+        [75] = new Vector3(71.294464f, 209.25f, -15.635567f),         // Idyllshire: Idyllshire Aetheryte Plaza (großer Aetheryte)
+        [90] = new Vector3(-74.0923f, 209.4413f, -22.290205f),        // Idyllshire: West Idyllshire
+        [111] = new Vector3(45.558308f, 4.199996f, -39.884335f),      // Kugane: Kugane Aetheryte Plaza (großer Aetheryte)
+        [112] = new Vector3(-75.36073f, -6.999999f, -77.26171f),      // Kugane: Shiokaze Hostelry
+        [113] = new Vector3(-113.89092f, -5.005731f, 153.13283f),     // Kugane: Pier #1
+        [114] = new Vector3(28.635242f, 8f, 143.1382f),               // Kugane: Thavnairian Consulate
+        [115] = new Vector3(26.535408f, 4.000001f, 71.60172f),        // Kugane: Kogane Dori Markets
+        [116] = new Vector3(-76.326256f, 18f, -163.22801f),           // Kugane: Bokairo Inn
+        [117] = new Vector3(130.46959f, 12.000001f, 83.20998f),       // Kugane: The Ruby Bazaar
+        [118] = new Vector3(119.33526f, 11.999337f, -90.61815f),      // Kugane: Sekiseigumi Barracks
+        [119] = new Vector3(26.013487f, 5.9916945f, -151.63597f),     // Kugane: Rakuza District
+        [104] = new Vector3(82.44814f, 0.029867768f, 98.40538f),      // Rhalgr's Reach: Rhalgr's Reach Aetheryte Plaza (großer Aetheryte)
+        [121] = new Vector3(-82.69922f, 0f, 8.892529f),                // Rhalgr's Reach: Western Rhalgr's Reach
+        [122] = new Vector3(101.2953f, 2.90765f, -112.726654f),        // Rhalgr's Reach: Northeastern Rhalgr's Reach
+        [127] = new Vector3(40.730907f, 1.3328607f, -12.541619f),      // The Doman Enclave: Doman Enclave Aetheryte Plaza (großer Aetheryte)
+        [129] = new Vector3(11.176858f, -1.1920929e-07f, -104.29073f), // The Doman Enclave: The Northern Enclave
+        [130] = new Vector3(-60.81499f, 0f, 88.50076f),                // The Doman Enclave: The Southern Enclave
+        [162] = new Vector3(98.28721f, -4.1787133f, 79.60301f),        // The Doman Enclave: Ferry Docks
+        [133] = new Vector3(-62.953644f, 2.921092f, -4.317079f),       // The Crystarium: The Crystarium Aetheryte Plaza (großer Aetheryte)
+        [149] = new Vector3(-6.015611f, -7.7036285f, 146.8549f),       // The Crystarium: Musica Universalis Markets
+        [150] = new Vector3(-108.76381f, 0f, -59.562263f),             // The Crystarium: Temenos Rookery
+        [151] = new Vector3(63.53169f, -2.3841858e-07f, -17.810028f),  // The Crystarium: The Dossal Gate
+        [152] = new Vector3(35.869473f, 0f, 220.61555f),               // The Crystarium: The Pendants
+        [153] = new Vector3(67.03844f, 35.999683f, -132.53917f),       // The Crystarium: The Amaro Launch
+        [154] = new Vector3(-50.98299f, 19.999794f, -172.28f),         // The Crystarium: The Crystalline Mean
+        [155] = new Vector3(-55.08784f, -37.7f, -239.60663f),          // The Crystarium: The Cabinet of Curiosity
+        [134] = new Vector3(-0.29844308f, 82f, -3.4165506f),           // Eulmore: Eulmore Aetheryte Plaza (großer Aetheryte)
+        [135] = new Vector3(70.43707f, -10.349164f, 65.53914f),        // Eulmore: Southeast Derelicts
+        [157] = new Vector3(11.119778f, 36f, -5.7763677f),             // Eulmore: The Mainstay
+        [158] = new Vector3(-55.931984f, -0.82081413f, 52.275536f),    // Eulmore: Nightsoil Pots
+        [159] = new Vector3(4.954765f, 5.9452057f, -57.317192f),       // Eulmore: The Glory Gate
+        [182] = new Vector3(-0.828484f, 3.2749999f, -3.4330347f),      // Old Sharlayan: Old Sharlayan Aetheryte Plaza (großer Aetheryte)
+        [184] = new Vector3(-289.31375f, 20.013304f, -74.640045f),     // Old Sharlayan: The Studium
+        [185] = new Vector3(-90.862885f, 2.1191945f, 31.47671f),       // Old Sharlayan: The Baldesion Annex
+        [186] = new Vector3(-38.64221f, 41.375996f, -158.23409f),      // Old Sharlayan: The Rostra
+        [187] = new Vector3(206.5285f, 21.828178f, -119.5187f),        // Old Sharlayan: The Leveilleur Estate
+        [188] = new Vector3(207.76955f, 1.8613925f, 15.380046f),       // Old Sharlayan: Journey's End
+        [189] = new Vector3(14.47839f, -16.247f, 127.66104f),          // Old Sharlayan: Scholar's Harbor
+        [183] = new Vector3(29.529707f, 0.8999984f, -27.122984f),      // Radz-at-Han: Radz-at-Han Aetheryte Plaza (großer Aetheryte)
+        [191] = new Vector3(-366.71188f, 45.001728f, -29.534893f),     // Radz-at-Han: Meghaduta
+        [192] = new Vector3(-158.65683f, 36f, 28.179693f),             // Radz-at-Han: Ruveydah Fibers
+        [193] = new Vector3(-144.93687f, 27.999994f, 200.03326f),      // Radz-at-Han: Airship Landing
+        [194] = new Vector3(8.2280855f, -2.0000007f, 109.46653f),      // Radz-at-Han: Alzadaal's Peace
+        [195] = new Vector3(-139.59232f, 3.9997995f, -96.95679f),      // Radz-at-Han: Hall of the Radiant Host
+        [196] = new Vector3(-44.230145f, 4.7683716e-07f, -197.55643f), // Radz-at-Han: Mehryde's Meyhane
+        [198] = new Vector3(131.40958f, 26.99999f, 14.134306f),        // Radz-at-Han: Kama
+        [199] = new Vector3(58.984554f, -24.693443f, -211.90494f),     // Radz-at-Han: The High Crucible of Al-Kimiya
+        [216] = new Vector3(-26.05755f, 0.5f, 2.3995228f),             // Tuliyollal: Tuliyollal Aetheryte Plaza (großer Aetheryte)
+        [218] = new Vector3(-415.8316f, 3.0000002f, -46.42874f),       // Tuliyollal: Dirigible Landing
+        [219] = new Vector3(-185.3738f, 39.94251f, 4.928123f),         // Tuliyollal: The Resplendent Quarter
+        [220] = new Vector3(-148.82771f, -14.999287f, 196.75035f),     // Tuliyollal: The For'ard Cabins
+        [221] = new Vector3(-14.250872f, -10.00001f, 137.96169f),      // Tuliyollal: Bayside Bevy Marketplace
+        [222] = new Vector3(-97.63969f, 100.75f, -220.9536f),          // Tuliyollal: Vollok Shoonsa
+        [223] = new Vector3(165.9286f, -17.9643f, 37.00588f),          // Tuliyollal: Wachumeqimeqi
+        [224] = new Vector3(70.14987f, 46.999996f, -331.98785f),       // Tuliyollal: Brightploom Post
+        [217] = new Vector3(0.030465692f, 8.442986f, -8.074915f),      // Solution Nine: Solution Nine Aetheryte Plaza (großer Aetheryte)
+        [230] = new Vector3(-30.557829f, -6.050003f, 211.05759f),      // Solution Nine: Information Center
+        [231] = new Vector3(382.00623f, 60f, 74.703575f),              // Solution Nine: True Vue
+        [232] = new Vector3(259.9351f, 50.75f, 147.13205f),            // Solution Nine: Neon Stein
+        [233] = new Vector3(372.3516f, 60.124996f, 326.0636f),         // Solution Nine: The Arcadion
+        [234] = new Vector3(-30.803701f, 38.0566f, -343.41434f),       // Solution Nine: Resolution
+        [235] = new Vector3(-159.09541f, 6.4373016e-06f, 23.499605f),  // Solution Nine: Nexus Arcade
+        [236] = new Vector3(-376.37665f, 14.030001f, 137.58334f),      // Solution Nine: Residential Sector
     };
 
     /// <summary>
@@ -1865,6 +2324,34 @@ public sealed class Plugin : IDalamudPlugin
         var territoryForFlag = entry.FlagTerritoryTypeId ?? entry.TerritoryTypeId;
         var payload = new MapLinkPayload(territoryForFlag, entry.MapId, entry.VendorMapX, entry.VendorMapY);
         GameGui.OpenMapWithMapLink(payload);
+
+        // Für den Wegweiser-Pfeil (siehe NavigationTargetPosition) - bevorzugt über dieselbe vnavmesh-
+        // IPC aufgelöst, die die Automationen auch fürs tatsächliche Laufen benutzen (steht nur zur
+        // Verfügung, wenn man gerade in genau dieser Zone steht, da vnavmesh die Flagge gegen das
+        // aktuell geladene Navmesh auflöst) - das zeigt garantiert exakt denselben Punkt, den die
+        // Automation ansteuern würde. Sonst Fallback auf die eigene Umrechnung der Kartenkoordinate
+        // zurück in eine rohe Weltposition (Umkehrung von MapUtil.WorldToMap, dieselbe Formel wie in
+        // HuntingLogPositions.cs dokumentiert/ResolveAetheryteWorldPosition benutzt).
+        Vector3? navigationWorldPosition = null;
+        if (ClientState.TerritoryType == territoryForFlag && navigationFlagToPointQuery is { HasFunction: true } query)
+        {
+            try { navigationWorldPosition = query.InvokeFunc(); }
+            catch { /* vnavmesh nicht bereit - siehe Fallback unten */ }
+        }
+
+        if (navigationWorldPosition == null)
+        {
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            if (mapSheet != null && mapSheet.TryGetRow(entry.MapId, out var map) && map.SizeFactor != 0)
+            {
+                var worldX = (entry.VendorMapX - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetX;
+                var worldZ = (entry.VendorMapY - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetY;
+                navigationWorldPosition = new Vector3(worldX, 0, worldZ);
+            }
+        }
+
+        if (navigationWorldPosition.HasValue)
+            SetNavigationTarget(navigationWorldPosition.Value, entry.Name, territoryForFlag);
     }
 
     /// <summary>
@@ -1896,6 +2383,29 @@ public sealed class Plugin : IDalamudPlugin
         var territoryForFlag = entry.FlagTerritoryTypeId ?? entry.TerritoryTypeId;
         var payload = new MapLinkPayload(territoryForFlag, entry.MapId, mapCoords.X, mapCoords.Y);
         GameGui.OpenMapWithMapLink(payload);
+
+        SetNavigationTarget(worldPosition, entry.Name, territoryForFlag);
+    }
+
+    // Aktuelles Ziel des Wegweiser-Pfeils (siehe Windows/NavigationArrowWindow.cs) - gesetzt beim
+    // Start einer Automation, beim Klick aufs "Hinlaufen"-Icon (GoToAutomation) oder beim Öffnen
+    // eines Karten-Links (siehe OpenVendorMap/OpenEntryMap), zurückgesetzt beim Ankommen (siehe
+    // NavigationArrowWindow) oder per Rechtsklick auf den Pfeil.
+    public static Vector3? NavigationTargetPosition { get; private set; }
+    public static string NavigationTargetName { get; private set; } = string.Empty;
+    public static uint NavigationTargetTerritoryId { get; private set; }
+
+    public static void SetNavigationTarget(Vector3 worldPosition, string name, uint territoryId)
+    {
+        NavigationTargetPosition = worldPosition;
+        NavigationTargetName = name;
+        NavigationTargetTerritoryId = territoryId;
+    }
+
+    public static void ClearNavigationTarget()
+    {
+        NavigationTargetPosition = null;
+        NavigationTargetName = string.Empty;
     }
 
     /// <summary>
@@ -1990,6 +2500,29 @@ public sealed class Plugin : IDalamudPlugin
         actionManager->UseAction(ActionType.GeneralAction, SprintGeneralActionId);
     }
 
+    // General Action "Dismount" - feste Spiel-ID (verifiziert per GeneralAction-Sheet-Dump beim
+    // Mount-Roulette-Feature), kein Excel-Sheet-Lookup nötig.
+    private const uint DismountGeneralActionId = 23;
+
+    /// <summary>
+    /// Steigt sofort ab, falls gerade beritten - für Automationen, die am Ziel kämpfen müssen (z.B.
+    /// HuntingLogAutomation): die meisten Klassen-Aktionen (und damit auch RotationSolver) lassen
+    /// sich beritten gar nicht ausführen, ein automatisches Absteigen beim Ankommen passiert aber
+    /// nicht von selbst, wenn man nicht auch tatsächlich in einen Kampf verwickelt wird (bloßes
+    /// Anvisieren reicht dafür nicht).
+    /// </summary>
+    public static unsafe void TryDismount()
+    {
+        if (!Condition[ConditionFlag.Mounted])
+            return;
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return;
+
+        actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
+    }
+
     /// <summary>
     /// Liefert die aktuell freigeschalteten Mounts (Id + Name) - für die Mount-Auswahl der
     /// Aetheryten-Automation (siehe MainWindow QoL-Tab). Bewusst live berechnet statt gecacht -
@@ -2001,6 +2534,53 @@ public sealed class Plugin : IDalamudPlugin
             .Where(e => e.Type == CollectibleType.Mount && IsOwned(e))
             .OrderBy(e => e.Name)
             .ToList();
+
+    /// <summary>
+    /// Setzt einmalig (siehe Configuration.AetheryteMountAutoDefaultApplied) eine sinnvolle
+    /// Vorbelegung für die Mount-Auswahl der Aetheryten-Automation, sobald der Spieler mindestens
+    /// ein Mount besitzt - sonst stünde die Automation dauerhaft auf "Kein Mount", obwohl sie längst
+    /// einsatzbereit wäre. "Mount Roulette" (AetheryteMountId == 0, siehe DrawAetheryteMountPicker
+    /// und TryRequestAetheryteMount) ergibt erst ab zwei Mounts Sinn - vorher gäbe es nichts
+    /// auszuwürfeln, daher wird bis dahin direkt das erste freigeschaltete Mount vorbelegt. Läuft
+    /// nur einmal; eine spätere manuelle Änderung (auch zurück auf "Kein Mount") bleibt danach
+    /// unangetastet.
+    /// </summary>
+    public void EnsureAetheryteMountAutoDefault()
+    {
+        if (Configuration.AetheryteMountAutoDefaultApplied)
+            return;
+
+        var unlockedMounts = GetUnlockedMounts();
+        if (unlockedMounts.Count == 0)
+            return;
+
+        Configuration.AetheryteMountId = unlockedMounts.Count >= 2 ? 0 : (int)unlockedMounts[0].Id;
+        Configuration.AetheryteMountAutoDefaultApplied = true;
+        Configuration.Save();
+    }
+
+    private static readonly TimeSpan RemountAfterForcedDismountRetryInterval = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Für alle Automationen mit vnavmesh-Laufwegen (Aetheryte/Chocobokeep/HuntingLog/AetherCurrent/
+    /// Sightseeing/GoTo) - viele Mounts steigen beim Schwimmen im tiefen Wasser zwangsweise ab, ohne
+    /// dass die Automation das selbst anstößt. Läuft der Weg über Land weiter, blieb man bisher bis
+    /// zum Ziel unberitten. Wird pro Update-Tick aus UpdateMoving aufgerufen (solange der Laufweg
+    /// noch aktiv ist) und versucht - gedrosselt über lastAttempt, damit nicht bei jedem Frame ein
+    /// neuer "/mount"-Ruf rausgeht, während der vorherige noch in der Aufstiegs-Animation steckt -
+    /// erneut aufzusitzen, sobald wieder festen Boden unter den Füßen ist.
+    /// </summary>
+    public static void TryRemountAfterForcedDismount(ref DateTime lastAttempt)
+    {
+        if (Condition[ConditionFlag.Mounted] || Condition[ConditionFlag.Swimming] || Condition[ConditionFlag.Diving])
+            return;
+
+        if (DateTime.UtcNow - lastAttempt < RemountAfterForcedDismountRetryInterval)
+            return;
+
+        lastAttempt = DateTime.UtcNow;
+        TryRequestAetheryteMount();
+    }
 
     /// <summary>
     /// Stößt (falls in den Optionen ein Mount für die Aetheryten-Automation ausgewählt und man
@@ -2019,10 +2599,27 @@ public sealed class Plugin : IDalamudPlugin
     {
         var mountId = instance.Configuration.AetheryteMountId;
         if (!mountId.HasValue)
+        {
+            Log.Info("[MountDebug] Abbruch: kein Mount konfiguriert (AetheryteMountId == null).");
             return false;
+        }
 
         if (Condition[ConditionFlag.Mounted])
+        {
+            Log.Info("[MountDebug] Abbruch: bereits beritten.");
             return false;
+        }
+
+        // In Städten (und anderen Mount-gesperrten Zonen, z.B. manchen Innenräumen) lässt sich gar
+        // nicht aufsitzen - ohne diese Prüfung würde hier trotzdem "/mount" gesendet (bewirkt dort
+        // nichts) und die Automation wartet danach noch MountWaitTimeout lang sinnlos auf ein
+        // Aufsteigen, das nie passiert, bevor sie auf Fußweg umschaltet.
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null || !territorySheet.TryGetRow(ClientState.TerritoryType, out var territory) || !territory.Mount)
+        {
+            Log.Info($"[MountDebug] Abbruch: Zone={ClientState.TerritoryType} erlaubt kein Aufsitzen (TerritoryType.Mount=false oder Sheet-Zeile nicht gefunden).");
+            return false;
+        }
 
         var mountSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Mount>();
         if (mountSheet == null)
@@ -2049,13 +2646,20 @@ public sealed class Plugin : IDalamudPlugin
         if (!mountSheet.TryGetRow(resolvedMountId, out var mount))
             return false;
 
-        var mountName = mount.Singular.ToString();
+        // Lumina liefert "Singular" komplett kleingeschrieben (roher Grammatik-Baustein für
+        // Satzkonstruktion, z.B. "du hast ein company chocobo erhalten") - für den "/mount"-Text-
+        // befehl muss aber der tatsächliche Anzeigename (Title Case) übergeben werden, sonst
+        // ignoriert das Spiel den Befehl kommentarlos (siehe MountDebug-Log: Befehl wurde gesendet,
+        // aber nie aufgestiegen).
+        var mountName = CapitalizeChatCommandName(mount.Singular.ToString());
         if (string.IsNullOrEmpty(mountName))
             return false;
 
+        Log.Info($"[MountDebug] Sende '/mount \"{mountName}\"' über SendGameChatCommand (mountId={resolvedMountId}).");
+
         try
         {
-            CommandManager.ProcessCommand($"/mount \"{mountName}\"");
+            SendGameChatCommand($"/mount \"{mountName}\"");
         }
         catch (Exception ex)
         {
@@ -2064,6 +2668,119 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Schickt einen echten, vom Spiel selbst verarbeiteten Chat-/Text-Befehl (z.B. "/mount ...",
+    /// ein Emote wie "/sit") ab - NICHT über Dalamuds ICommandManager.ProcessCommand, das nur an
+    /// von Plugins selbst registrierte Befehle weiterleitet (funktioniert z.B. für "/rotation" oder
+    /// "/qst", weil das andere Plugins sind, aber niemals für native Spielbefehle - der Aufruf
+    /// schlägt dabei nicht mal fehl, er bewirkt einfach nichts, siehe MountDebug-Log). Stattdessen
+    /// wie ein Tastatur-Enter in der Chatbox direkt über UIModule.ProcessChatBoxEntry simuliert
+    /// (Standardtechnik vieler Automations-Plugins, z.B. auch in "ECommons" so implementiert).
+    /// </summary>
+    public static unsafe void SendGameChatCommand(string command)
+    {
+        var message = Utf8String.FromString(command);
+        try
+        {
+            Framework.Instance()->GetUIModule()->ProcessChatBoxEntry(message, IntPtr.Zero, false);
+        }
+        finally
+        {
+            message->Dtor(true);
+        }
+    }
+
+    /// <summary>
+    /// Klickt ein offenes NPC-Gespräch ("Talk"-Fenster, z.B. beim Chocobokeep) einen Schritt weiter -
+    /// exakt dieselbe Technik, die auch die Fremdplugins "TextAdvance"/"ECommons"
+    /// (AddonMaster.Talk.Click) für automatisches Wegklicken von Dialogtext nutzen: ein simulierter
+    /// Maus-Klick (MouseDown/MouseClick/MouseUp) auf das Fenster selbst, worauf das Spiel wie bei
+    /// einem echten Klick zur nächsten Zeile springt bzw. das Fenster schließt. War zunächst über
+    /// TextAdvances eigene IPC (EnableExternalControl) versucht - dessen TalkSkip griff aber nicht
+    /// zuverlässig (vermutlich Serialisierungsproblem beim komplexen Parametertyp über die
+    /// Plugin-Grenze), daher stattdessen direkt selbst nachgebaut.
+    /// </summary>
+    private static DateTime lastTalkDialogueDebugLog = DateTime.MinValue;
+
+    public static unsafe bool TryAdvanceTalkDialogue()
+    {
+        var addon = (AddonTalk*)GameGui.GetAddonByName("Talk").Address;
+
+        // Temporäre Diagnose (max. 1x/Sekunde) - zeigt, ob "Talk" überhaupt gefunden/sichtbar ist,
+        // wenn der Dialog beim Chocobokeep offen ist.
+        if (DateTime.UtcNow - lastTalkDialogueDebugLog > TimeSpan.FromSeconds(1))
+        {
+            lastTalkDialogueDebugLog = DateTime.UtcNow;
+            Log.Info($"[ChocobokeepAutomation] TryAdvanceTalkDialogue: addon={(nint)addon:X}, IsVisible={(addon != null ? addon->IsVisible : (bool?)null)}.");
+        }
+
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        Log.Info("[ChocobokeepAutomation] TryAdvanceTalkDialogue: Talk-Fenster sichtbar - klicke weiter.");
+
+        var atkEvent = new AtkEvent
+        {
+            Listener = (AtkEventListener*)addon,
+            Target = &AtkStage.Instance()->AtkEventTarget,
+            State = new AtkEventState { StateFlags = (AtkEventStateFlags)132 },
+        };
+        var atkEventData = default(AtkEventData);
+
+        addon->AtkUnitBase.ReceiveEvent(AtkEventType.MouseDown, 0, &atkEvent, &atkEventData);
+        addon->AtkUnitBase.ReceiveEvent(AtkEventType.MouseClick, 0, &atkEvent, &atkEventData);
+        addon->AtkUnitBase.ReceiveEvent(AtkEventType.MouseUp, 0, &atkEvent, &atkEventData);
+        return true;
+    }
+
+    /// <summary>
+    /// Ob gerade ein "Talk"- oder "SelectString"-Fenster offen ist - für ChocobokeepAutomation, die
+    /// sonst (weil UIState.IsChocoboTaxiStandUnlocked schon beim Interagieren selbst true wird, noch
+    /// bevor der NPC überhaupt zu reden anfängt, und ConditionFlag.OccupiedInEvent/Occupied dabei gar
+    /// nicht gesetzt werden) den Erfolg sofort verbucht und danach nie mehr TryAdvanceTalkDialogue/
+    /// TryDismissChocobokeepSelectString aufruft - das offene Gespräch bliebe dann für immer stehen,
+    /// weil niemand mehr weiterklickt.
+    /// </summary>
+    public static unsafe bool IsChocobokeepDialogueOpen()
+    {
+        var talk = (AddonTalk*)GameGui.GetAddonByName("Talk").Address;
+        if (talk != null && talk->IsVisible)
+            return true;
+
+        var selectString = (AddonSelectString*)GameGui.GetAddonByName("SelectString").Address;
+        return selectString != null && selectString->IsVisible;
+    }
+
+    /// <summary>
+    /// Großschreibung jedes Worts (nach Leerzeichen/Bindestrich) - macht aus Luminas rohem,
+    /// kleingeschriebenem "Singular"-Grammatikfeld (siehe TryRequestAetheryteMount) wieder den
+    /// tatsächlichen Anzeigenamen für Text-Befehle wie "/mount".
+    /// </summary>
+    private static string CapitalizeChatCommandName(string raw)
+    {
+        if (string.IsNullOrEmpty(raw))
+            return raw;
+
+        var chars = raw.ToCharArray();
+        var capitalizeNext = true;
+        for (var i = 0; i < chars.Length; i++)
+        {
+            if (char.IsWhiteSpace(chars[i]) || chars[i] == '-')
+            {
+                capitalizeNext = true;
+                continue;
+            }
+
+            if (capitalizeNext)
+            {
+                chars[i] = char.ToUpperInvariant(chars[i]);
+                capitalizeNext = false;
+            }
+        }
+
+        return new string(chars);
     }
 
     /// <summary>
@@ -2193,6 +2910,25 @@ public sealed class Plugin : IDalamudPlugin
         {
             var manual = HasManualAetheryteWorldPosition(entry.Id) ? ", hat bereits manuelle Position" : "";
             Log.Info($"[AetheryteDebug]   {entry.Name}(#{entry.Id}): unlocked={IsAetheryteUnlocked(entry.Id)}{manual}");
+        }
+
+        // Temporäre Diagnose - direkt aus dem Lumina-Sheet, ungefiltert (auch Invisible/namenlose
+        // Zeilen), für die gerade in SplitCityTerritories gemergten Zonen. Zeigt, ob "fehlende"
+        // Kristalle wirklich unter dieser TerritoryId im Sheet stehen oder ob Firmament/Fortemps
+        // Manor ihre Aetheryten unter einer ANDEREN TerritoryId führen.
+        var rawAetheryteSheet = DataManager.GetExcelSheet<Aetheryte>();
+        if (rawAetheryteSheet != null)
+        {
+            var siblingIds = GetSplitCityTerritories(effectiveTerritoryId);
+            Log.Info($"[AetheryteDebug] Ungefilterter Sheet-Dump für Zonen [{string.Join(", ", siblingIds)}]:");
+            foreach (var row in rawAetheryteSheet)
+            {
+                if (!siblingIds.Contains(row.Territory.RowId))
+                    continue;
+
+                var rawName = row.IsAetheryte ? row.PlaceName.ValueNullable?.Name.ToString() : row.AethernetName.ValueNullable?.Name.ToString();
+                Log.Info($"[AetheryteDebug]   RowId={row.RowId} Territory={row.Territory.RowId} IsAetheryte={row.IsAetheryte} Invisible={row.Invisible} Name=\"{rawName}\"");
+            }
         }
     }
 
@@ -2470,6 +3206,7 @@ public sealed class Plugin : IDalamudPlugin
         WindowSystem.RemoveAllWindows();
         MainWindow.Dispose();
         CompactOverlayWindow.Dispose();
+        NavigationArrowWindow.Dispose();
         QuestAutomation.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
@@ -2477,5 +3214,51 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw -= DrawUI;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUI;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUI;
+    }
+}
+
+/// <summary>
+/// Erkennt "gegen eine Wand/Geometriekante festhängen" während eines aktiven vnavmesh-Laufwegs -
+/// die lokale Steuerung von vnavmesh (SimpleMove) kann an Ecken/schmalen Durchgängen steckenbleiben,
+/// obwohl Path.IsRunning weiterhin true bleibt und der Weg an sich gültig wäre. Jede Automation mit
+/// eigenem Laufweg hält eine eigene Instanz (Reset() beim Start eines neuen Wegabschnitts,
+/// CheckStuck() pro Tick während pathIsRunning true ist) - siehe z.B. AetheryteAutomation.BeginPathfind/
+/// UpdateMoving für die Verdrahtung.
+/// </summary>
+public sealed class NavigationStuckDetector
+{
+    private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(4);
+    private const float MinProgressDistance = 1.5f;
+
+    private Vector3? lastPosition;
+    private DateTime lastCheckAt = DateTime.MinValue;
+
+    public void Reset()
+    {
+        lastPosition = null;
+        lastCheckAt = DateTime.MinValue;
+    }
+
+    /// <summary>
+    /// true, wenn sich der Charakter seit der letzten Prüfung (CheckInterval) um weniger als
+    /// MinProgressDistance bewegt hat. Startet nach jedem Reset()/true-Ergebnis wieder bei null, prüft
+    /// also nur alle paar Sekunden statt jeden Frame.
+    /// </summary>
+    public bool CheckStuck(Vector3 currentPosition)
+    {
+        if (lastCheckAt == DateTime.MinValue)
+        {
+            lastPosition = currentPosition;
+            lastCheckAt = DateTime.UtcNow;
+            return false;
+        }
+
+        if (DateTime.UtcNow - lastCheckAt < CheckInterval)
+            return false;
+
+        var stuck = lastPosition.HasValue && Vector3.Distance(lastPosition.Value, currentPosition) < MinProgressDistance;
+        lastPosition = currentPosition;
+        lastCheckAt = DateTime.UtcNow;
+        return stuck;
     }
 }

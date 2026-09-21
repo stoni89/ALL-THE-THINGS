@@ -77,6 +77,8 @@ public sealed class GoToAutomation
     private Vector3 currentTargetPosition;
     private DateTime stateEnteredAt;
     private bool hasSeenPathRunning;
+    private DateTime lastRemountAttempt = DateTime.MinValue;
+    private readonly NavigationStuckDetector stuckDetector = new();
     private DateTime? districtTravelFinishedAt;
 
     public GoToAutomation()
@@ -203,6 +205,7 @@ public sealed class GoToAutomation
         currentEntryId = null;
         currentEntryType = null;
         districtTravelFinishedAt = null;
+        Plugin.ClearNavigationTarget();
     }
 
     private void Finish()
@@ -212,6 +215,7 @@ public sealed class GoToAutomation
         currentEntryId = null;
         currentEntryType = null;
         districtTravelFinishedAt = null;
+        Plugin.ClearNavigationTarget();
     }
 
     /// <summary>Muss jeden Frame (während das Overlay offen ist) aufgerufen werden.</summary>
@@ -301,7 +305,10 @@ public sealed class GoToAutomation
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
 
-        if (mounted)
+        // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
+        // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
+        // sinnlos am Boden herum statt zu laufen.
+        if (mounted && Plugin.CanFly)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
 
         if (!accepted)
@@ -317,6 +324,7 @@ public sealed class GoToAutomation
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
+        stuckDetector.Reset();
     }
 
     private void UpdateMounting()
@@ -400,6 +408,19 @@ public sealed class GoToAutomation
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
             if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
                 Plugin.TryUseSprint();
+
+            // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
+            // erreicht ist, erneut aufsitzen.
+            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[GoToAutomation] UpdateMoving({currentEntryName}): scheinbar steckengeblieben - Laufweg wird neu angefordert.");
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
             {

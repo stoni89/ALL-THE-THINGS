@@ -41,6 +41,14 @@ public sealed class ChocobokeepAutomation
     // (siehe Plugin.IsChocoboTaxiStandUnlocked) - danach gilt der Versuch als gescheitert.
     private static readonly TimeSpan UnlockWaitTimeout = TimeSpan.FromSeconds(15);
 
+    // UIState.IsChocoboTaxiStandUnlocked wird oft schon true, BEVOR das Talk-Fenster überhaupt
+    // sichtbar wird (nicht erst danach, wie ursprünglich angenommen) - eine reine
+    // "Fenster gerade nicht offen"-Prüfung direkt nach der Interaktion sieht daher fälschlich
+    // "nichts offen", obwohl der Dialog nur noch nicht aufgepoppt ist. Deshalb wird nach dem
+    // Interagieren immer mindestens so lange gewartet (und dabei weiter TryAdvanceTalkDialogue/
+    // TryDismissChocobokeepSelectString aufgerufen), bevor überhaupt geprüft wird, ob alles zu ist.
+    private static readonly TimeSpan MinInteractionSettleDuration = TimeSpan.FromSeconds(2);
+
     // Verhindert eine Endlosschleife, falls ein Chocobokeep aus irgendeinem Grund nicht erreicht/
     // gefunden werden kann - nach so vielen Versuchen wird derselbe Eintrag übersprungen.
     private const int MaxAttemptsPerTarget = 2;
@@ -61,6 +69,8 @@ public sealed class ChocobokeepAutomation
     private bool didFinalApproach;
     private bool hasSeenPathRunning;
     private DateTime? interactObjectNotFoundSince;
+    private DateTime lastRemountAttempt = DateTime.MinValue;
+    private readonly NavigationStuckDetector stuckDetector = new();
 
     public bool IsActive { get; private set; }
 
@@ -131,6 +141,7 @@ public sealed class ChocobokeepAutomation
         state = State.Idle;
         currentTargetEntry = null;
         StopPath();
+        Plugin.ClearNavigationTarget();
     }
 
     public void MarkUnavailable()
@@ -254,7 +265,10 @@ public sealed class ChocobokeepAutomation
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
 
-        if (mounted)
+        // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
+        // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
+        // sinnlos am Boden herum statt zu laufen.
+        if (mounted && Plugin.CanFly)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
 
         if (!accepted)
@@ -269,6 +283,7 @@ public sealed class ChocobokeepAutomation
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
+        stuckDetector.Reset();
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -300,6 +315,19 @@ public sealed class ChocobokeepAutomation
             if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
                 Plugin.TryUseSprint();
 
+            // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
+            // erreicht ist, erneut aufsitzen.
+            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[ChocobokeepAutomation] UpdateMoving({currentTargetEntry.Name}): scheinbar steckengeblieben - Laufweg wird neu angefordert.");
+                StopPath();
+                BeginPathfind();
+                return;
+            }
+
             if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
                 SkipCurrent(Loc.T("Laufweg dauert zu lange", "Path is taking too long"));
 
@@ -328,7 +356,11 @@ public sealed class ChocobokeepAutomation
             return;
         }
 
-        var gameObject = FindNearestChocobokeepObject(currentTargetPosition, 15f);
+        // Bewusst die von Hand erfasste Position aus ChocobokeepLocations als Suchanker (nicht
+        // currentTargetPosition, den vnavmesh-aufgelösten Bodenpunkt) - in mehrstöckigen Zonen kann
+        // FlagToPoint einen Punkt auf einer anderen Ebene/Plattform liefern (hier z.B. 25y zu hoch),
+        // während der NPC selbst fast exakt an der manuell erfassten Koordinate steht.
+        var gameObject = FindNearestChocobokeepObject(currentTargetEntry.WorldPosition!.Value, 15f);
         if (gameObject == null)
         {
             interactObjectNotFoundSince ??= DateTime.UtcNow;
@@ -366,21 +398,44 @@ public sealed class ChocobokeepAutomation
         {
             if (!Plugin.IsCurrentTarget(gameObject))
             {
+                Plugin.Log.Info($"[ChocobokeepAutomation] UpdateInteracting(#{currentTargetEntry.Id}): setze Ziel auf '{gameObject.Name}'.");
                 Plugin.SetTarget(gameObject);
                 return;
             }
 
+            Plugin.Log.Info($"[ChocobokeepAutomation] UpdateInteracting(#{currentTargetEntry.Id}): interagiere mit '{gameObject.Name}' @ {gameObject.Position} (Distanz={Vector3.Distance(Plugin.ObjectTable.LocalPlayer?.Position ?? gameObject.Position, gameObject.Position)}).");
             Plugin.InteractWithGameObject(gameObject);
             hasInteractedThisCycle = true;
             stateEnteredAt = DateTime.UtcNow;
             return;
         }
 
+        // Anders als bei Aetheryten poppt hier nach der Interaktion erst ein mehrzeiliges NPC-
+        // Gespräch ("Well met, traveler!..."), danach ein SelectString-Menü ("Reitvogel-
+        // Passagierdienst nutzen?") auf - beides blockiert die Freischaltung, bis es geschlossen
+        // wird. Jeden Frame erneut versucht, bis keins von beidem mehr offen ist (einmaliger Aufruf
+        // würde bei mehrzeiligem Text nicht reichen).
+        Plugin.TryAdvanceTalkDialogue();
+        Plugin.TryDismissChocobokeepSelectString();
+
         // Wie bei Aetheryten: die Freischaltung selbst braucht nach der Interaktion noch einen
         // Moment (z.B. eine Bestätigung im Auswahlmenü), bevor UIState.IsChocoboTaxiStandUnlocked
         // wirklich auf true springt - erst danach als erledigt werten.
         if (Plugin.IsChocoboTaxiStandUnlocked(currentTargetEntry.Id))
         {
+            // Der Flag wird oft schon true, WÄHREND der NPC gerade erst zu reden anfängt (nicht erst
+            // danach) - eine reine "Fenster gerade nicht offen"-Prüfung direkt nach der Interaktion
+            // sieht dann fälschlich "nichts offen", obwohl der Dialog nur noch nicht aufgepoppt ist
+            // (siehe MinInteractionSettleDuration). Ohne die zusätzliche Prüfung auf ein noch offenes
+            // Talk-/SelectString-Fenster würde hier sofort "fertig" gemeldet und niemand würde das
+            // Gespräch weiterklicken - es bliebe für immer offen stehen, weil UpdateInteracting
+            // danach nicht mehr aufgerufen wird.
+            if (DateTime.UtcNow - stateEnteredAt < MinInteractionSettleDuration)
+                return;
+
+            if (Plugin.IsChocobokeepDialogueOpen() || Plugin.Condition[ConditionFlag.OccupiedInEvent] || Plugin.Condition[ConditionFlag.Occupied])
+                return;
+
             Plugin.Log.Info($"[ChocobokeepAutomation] UpdateInteracting(#{currentTargetEntry.Id}): freigeschaltet.");
             currentTargetEntry = null;
             state = State.Idle;

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -7,6 +8,7 @@ using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface;
 using Dalamud.Interface.Textures;
 using Dalamud.Interface.Windowing;
+using Dalamud.Utility;
 using Dalamud.Bindings.ImGui;
 
 namespace AllTheThings.Windows;
@@ -193,7 +195,28 @@ public class CompactOverlayWindow : Window
         if (ImGui.IsItemClicked())
             plugin.OpenOptions();
 
-        if (DrawCloseButtonTopRight())
+        // Beide Knöpfe gleich groß und direkt nebeneinander ganz am rechten Rand - die reine
+        // Frame-Höhe war schmaler als die tatsächlichen Icon-Glyphen (Schloss/Times), wodurch beide
+        // in ihrem eigenen Knopf beschnitten wirkten. Größe daher an der breiteren der beiden Icon-
+        // Glyphen ausgerichtet, plus ein kleiner rechter Rand, damit "x" nicht am Fensterrand klebt.
+        float topRightIconWidth;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            topRightIconWidth = MathF.Max(
+                ImGui.CalcTextSize(FontAwesomeIcon.Lock.ToIconString()).X,
+                ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X);
+        }
+
+        var topRightButtonSize = MathF.Max(ImGui.GetFrameHeight(), topRightIconWidth + ImGui.GetStyle().FramePadding.X * 2f);
+        const float TopRightMargin = 4f;
+
+        if (DrawLockButtonTopRight(config.CompactLocked, topRightButtonSize, TopRightMargin))
+        {
+            config.CompactLocked = !config.CompactLocked;
+            config.Save();
+        }
+
+        if (DrawCloseButtonTopRight(topRightButtonSize, TopRightMargin))
         {
             IsOpen = false;
             config.ShowCompactOverlay = false;
@@ -242,12 +265,9 @@ public class CompactOverlayWindow : Window
 
         // Bewusst die ganze Stadt (inkl. Kristalle aus Nachbarbezirken einer geteilten Hauptstadt,
         // siehe allForZone) - die Automation reist bei Bedarf selbst mit Lifestream zwischen den
-        // Bezirken hin und her (siehe AetheryteAutomation.cs). Im Debug-Simulationsmodus werden
-        // bewusst auch schon freigeschaltete Kristalle mitgenommen, um den Laufweg/die Reihenfolge
-        // ohne Fortschrittsverlust zu überprüfen.
+        // Bezirken hin und her (siehe AetheryteAutomation.cs).
         var missingAetherytesCity = allForZone
-            .Where(e => e.Type == CollectibleType.Aetheryte
-                        && (plugin.AetheryteAutomation.SimulateAllCrystals || !plugin.IsOwned(e)))
+            .Where(e => e.Type == CollectibleType.Aetheryte && !plugin.IsOwned(e))
             .ToList();
         plugin.AetheryteAutomation.Update(missingAetherytesCity);
 
@@ -295,34 +315,39 @@ public class CompactOverlayWindow : Window
         // Reihe der Automations-Knöpfe bricht bei Bedarf selbst in eine zweite Zeile um (statt über
         // den Fensterrand hinauszulaufen), wenn das kompakte Fenster nicht breit genug gezogen
         // wurde - jeder Knopf entscheidet VOR dem eigentlichen Zeichnen anhand seiner (aus dem
-        // Label vorab berechneten) Breite, ob er noch auf die aktuelle Zeile passt.
-        var automationRowContentMaxX = ImGui.GetWindowContentRegionMax().X;
-        var automationStopLabel = Loc.T("Automation stoppen", "Stop automation");
-
-        void ContinueAutomationRow(bool isActive, string startLabel)
+        // Label vorab berechneten) Breite, ob er noch auf die aktuelle Zeile passt. Die Automationen
+        // selbst laufen unabhängig von config.ShowAutomationButtons weiter (siehe .Update-Aufrufe
+        // oben) - nur diese Knopfreihe wird ein-/ausgeblendet.
+        if (config.ShowAutomationButtons)
         {
-            var label = isActive ? automationStopLabel : startLabel;
-            var width = ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f;
-            ImGui.SameLine();
-            if (ImGui.GetCursorPosX() + width > automationRowContentMaxX)
-                ImGui.NewLine();
+            var automationRowContentMaxX = ImGui.GetWindowContentRegionMax().X;
+            var automationStopLabel = Loc.T("Automation stoppen", "Stop automation");
+
+            void ContinueAutomationRow(bool isActive, string startLabel)
+            {
+                var label = isActive ? automationStopLabel : startLabel;
+                var width = ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f;
+                ImGui.SameLine();
+                if (ImGui.GetCursorPosX() + width > automationRowContentMaxX)
+                    ImGui.NewLine();
+            }
+
+            DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
+            ContinueAutomationRow(plugin.AetheryteAutomation.IsActive, Loc.T("Auto Aetheryte", "Auto Aetheryte"));
+            DrawAetheryteAutomationButton(hasActionableAetherytes);
+            ContinueAutomationRow(plugin.HuntingLogAutomation.IsActive, Loc.T("Auto Hunting Log", "Auto Hunting Log"));
+            DrawHuntingLogAutomationButton(hasActionableHuntingLog);
+            ContinueAutomationRow(plugin.AetherCurrentAutomation.IsActive, Loc.T("Auto Ätherströmung", "Auto Aether Current"));
+            DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
+            ContinueAutomationRow(plugin.SightseeingAutomation.IsActive, Loc.T("Auto Sightseeing", "Auto Sightseeing"));
+            DrawSightseeingAutomationButton(hasActionableSightseeing);
+            ContinueAutomationRow(plugin.ChocobokeepAutomation.IsActive, Loc.T("Auto Chocobokeep", "Auto Chocobokeep"));
+            DrawChocobokeepAutomationButton(hasActionableChocobokeeps);
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.Spacing();
         }
-
-        DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
-        ContinueAutomationRow(plugin.AetheryteAutomation.IsActive, Loc.T("Auto Aetheryte", "Auto Aetheryte"));
-        DrawAetheryteAutomationButton(hasActionableAetherytes);
-        ContinueAutomationRow(plugin.HuntingLogAutomation.IsActive, Loc.T("Auto Hunting Log", "Auto Hunting Log"));
-        DrawHuntingLogAutomationButton(hasActionableHuntingLog);
-        ContinueAutomationRow(plugin.AetherCurrentAutomation.IsActive, Loc.T("Auto Ätherströmung", "Auto Aether Current"));
-        DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
-        ContinueAutomationRow(plugin.SightseeingAutomation.IsActive, Loc.T("Auto Sightseeing", "Auto Sightseeing"));
-        DrawSightseeingAutomationButton(hasActionableSightseeing);
-        ContinueAutomationRow(plugin.ChocobokeepAutomation.IsActive, Loc.T("Auto Chocobokeep", "Auto Chocobokeep"));
-        DrawChocobokeepAutomationButton(hasActionableChocobokeeps);
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
 
         if (plugin.QuestAutomation.ShouldShowStatusText)
             OutlineText(plugin.QuestAutomation.StatusText, plugin.QuestAutomation.IsActive ? AffordableColor : VendorLinkColor);
@@ -368,10 +393,21 @@ public class CompactOverlayWindow : Window
             foreach (var type in config.TypeOrder)
             {
                 var enabled = config.ShowType.GetValueOrDefault(type, true);
+                var isNotYetPossible = !Plugin.IsTypeCurrentlyPossible(type);
+                if (isNotYetPossible)
+                    ImGui.PushStyleColor(ImGuiCol.Text, NotYetPossibleColor);
+
                 if (ImGui.Checkbox($"{Loc.TypeName(type)}##CompactTypeFilterEntry", ref enabled))
                 {
                     config.ShowType[type] = enabled;
                     config.Save();
+                }
+
+                if (isNotYetPossible)
+                {
+                    ImGui.PopStyleColor();
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(Plugin.GetTypeNotPossibleReason(type));
                 }
             }
 
@@ -409,13 +445,43 @@ public class CompactOverlayWindow : Window
             DrawGoToColumn(entry);
 
             var isUnsupportedQuest = entry.Type == CollectibleType.Quest && plugin.QuestAutomation.IsKnownUnsupported(entry.Id);
-            var typeColor = isUnsupportedQuest ? UnsupportedColor : TypeColors.GetValueOrDefault(entry.Type, NormalColor);
+            // Noch nicht möglich (z.B. Sightseeing/Hunting Log ohne freigeschaltetes Fliegen in
+            // dieser Zone) - Eintrag bleibt bewusst sichtbar (nicht rausgefiltert), nur ausgegraut,
+            // siehe Plugin.IsTypeCurrentlyPossible.
+            var isNotYetPossible = !isUnsupportedQuest && !Plugin.IsTypeCurrentlyPossible(entry.Type);
+            var typeColor = isUnsupportedQuest ? UnsupportedColor : isNotYetPossible ? NotYetPossibleColor : TypeColors.GetValueOrDefault(entry.Type, NormalColor);
             OutlineText($"[{Loc.TypeName(entry.Type)}]", typeColor);
             if (isUnsupportedQuest && ImGui.IsItemHovered())
                 ImGui.SetTooltip("Not supported with Questionable");
+            else if (isNotYetPossible && ImGui.IsItemHovered())
+                ImGui.SetTooltip(Plugin.GetTypeNotPossibleReason(entry.Type));
 
             ImGui.SameLine();
-            DrawClickableName(entry);
+            DrawClickableName(entry, isNotYetPossible);
+
+            // Bewusst separat vom (klickbaren, ggf. eingefärbten) Namen - wie die Währungsanzeige
+            // unten, aber in Rot statt weiß, da es immer eine noch nicht erfüllte Voraussetzung
+            // signalisiert. Live berechnet (nicht im Entry gespeichert), siehe
+            // Plugin.GetRequirementInfo. Per Strg+Klick zur Wiki-Seite mit der Voraussetzung -
+            // normaler Klick macht bewusst nichts, damit man beim Vorbeiscrollen/Hovern nicht
+            // versehentlich den Browser öffnet.
+            var (requirementNote, requirementWikiUrl) = plugin.GetRequirementInfo(entry);
+            if (!string.IsNullOrEmpty(requirementNote))
+            {
+                ImGui.SameLine();
+                OutlineText(requirementNote, UnsupportedColor);
+
+                if (!string.IsNullOrEmpty(requirementWikiUrl) && ImGui.IsItemHovered())
+                {
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                    ImGui.SetTooltip(Loc.T(
+                        "Strg+Klick, um die Wiki-Seite mit der Voraussetzung zu öffnen",
+                        "Ctrl+click to open the wiki page with the requirement"));
+
+                    if (ImGui.GetIO().KeyCtrl && ImGui.IsItemClicked())
+                        Util.OpenLink(requirementWikiUrl);
+                }
+            }
 
             if (!string.IsNullOrEmpty(entry.Currency))
             {
@@ -713,7 +779,9 @@ public class CompactOverlayWindow : Window
                         "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
                         "No hunting log targets with a known position in this zone.")
                     : automation.IsActive
-                        ? Loc.T("Bricht Laufen/Kämpfen sofort ab und stoppt die Automation.", "Immediately stops moving/fighting and the automation.")
+                        ? Loc.T(
+                            "Stoppt die Automation - ein laufender Kampf wird noch zu Ende gebracht, statt den Charakter wehrlos stehen zu lassen.",
+                            "Stops the automation - an ongoing fight is finished first instead of leaving the character defenseless.")
                         : Loc.T(
                             "Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit RotationSolver Reborn.",
                             "Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with RotationSolver Reborn."));
@@ -940,7 +1008,7 @@ public class CompactOverlayWindow : Window
         }
     }
 
-    private void DrawClickableName(CollectibleEntry entry)
+    private void DrawClickableName(CollectibleEntry entry, bool isNotYetPossible = false)
     {
         var affordable = plugin.CanAfford(entry);
 
@@ -951,11 +1019,11 @@ public class CompactOverlayWindow : Window
         // vorne in der Zeile (siehe DrawGoToColumn).
         if (!entry.HasGoToTarget)
         {
-            OutlineText(entry.Name, affordable ? AffordableColor : NormalColor);
+            OutlineText(entry.Name, isNotYetPossible ? NotYetPossibleColor : affordable ? AffordableColor : NormalColor);
             return;
         }
 
-        OutlineText(entry.Name, affordable ? AffordableColor : VendorLinkColor);
+        OutlineText(entry.Name, isNotYetPossible ? NotYetPossibleColor : affordable ? AffordableColor : VendorLinkColor);
         if (ImGui.IsItemHovered())
         {
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
@@ -970,13 +1038,18 @@ public class CompactOverlayWindow : Window
 
     /// <summary>
     /// Ganz vorne in jeder Zeile (vor dem [Typ]-Tag) statt des früheren Aufzählungspunkts - zeigt
-    /// das "Hinlaufen"-Icon (siehe DrawGoToIcon), oder wenn keins gezeigt wird (Einstellung aus,
-    /// oder der Eintrag hat kein Laufziel) einen gleich breiten Platzhalter, damit der [Typ]-Tag
-    /// in jeder Zeile an derselben X-Position beginnt.
+    /// das "Hinlaufen"-Icon (siehe DrawGoToIcon), oder wenn keins gezeigt wird, weil DIESER Eintrag
+    /// kein Laufziel hat (Einstellung aber an), einen gleich breiten Platzhalter, damit der [Typ]-Tag
+    /// in jeder Zeile an derselben X-Position beginnt. Ist die Einstellung GLOBAL aus, wird gar keine
+    /// Spalte reserviert - dann rutscht der [Typ]-Tag ganz an den Zeilenanfang, statt eine für immer
+    /// leere Lücke stehen zu lassen.
     /// </summary>
     private void DrawGoToColumn(CollectibleEntry entry)
     {
-        if (plugin.Configuration.ShowGoToIcon && entry.HasGoToTarget)
+        if (!plugin.Configuration.ShowGoToIcon)
+            return;
+
+        if (entry.HasGoToTarget)
         {
             DrawGoToIcon(entry);
         }
@@ -1066,20 +1139,57 @@ public class CompactOverlayWindow : Window
         return handle is { Available: true } ? handle.Push() : null;
     }
 
-    private bool DrawCloseButtonTopRight()
+    /// <summary>
+    /// Schloss-Icon links neben dem Schließen-Knopf - sperrt/entsperrt dieselbe Einstellung wie
+    /// "Fenster sperren" im Optionsfenster (config.CompactLocked), nur direkt im Overlay erreichbar,
+    /// ohne dafür extra die Optionen öffnen zu müssen.
+    /// </summary>
+    private bool DrawLockButtonTopRight(bool locked, float buttonSize, float rightMargin)
     {
-        var buttonWidth = ImGui.CalcTextSize("x").X + ImGui.GetStyle().FramePadding.X * 2f;
-        var regionMaxX = ImGui.GetWindowContentRegionMax().X;
-        ImGui.SameLine(regionMaxX - buttonWidth);
+        var icon = locked ? FontAwesomeIcon.Lock : FontAwesomeIcon.LockOpen;
+        var regionMaxX = ImGui.GetWindowContentRegionMax().X - rightMargin;
+        ImGui.SameLine(regionMaxX - buttonSize * 2f - ImGui.GetStyle().ItemSpacing.X);
 
-        var size = new Vector2(buttonWidth, ImGui.GetFrameHeight());
+        var size = new Vector2(buttonSize, buttonSize);
         if (IsOccluded(size))
         {
             ImGui.Dummy(size);
             return false;
         }
 
-        return ImGui.SmallButton("x##CloseCompact");
+        bool clicked;
+        ImGui.PushStyleColor(ImGuiCol.Text, locked ? GoToActiveColor : AffordableColor);
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            clicked = ImGui.Button($"{icon.ToIconString()}##LockCompact", size);
+        ImGui.PopStyleColor();
+
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(locked
+                ? Loc.T("Fenster entsperren", "Unlock window")
+                : Loc.T("Fenster sperren (Position fixieren)", "Lock window (fix position)"));
+        }
+
+        return clicked;
+    }
+
+    private bool DrawCloseButtonTopRight(float buttonSize, float rightMargin)
+    {
+        var regionMaxX = ImGui.GetWindowContentRegionMax().X - rightMargin;
+        ImGui.SameLine(regionMaxX - buttonSize);
+
+        var size = new Vector2(buttonSize, buttonSize);
+        if (IsOccluded(size))
+        {
+            ImGui.Dummy(size);
+            return false;
+        }
+
+        bool clicked;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            clicked = ImGui.Button($"{FontAwesomeIcon.Times.ToIconString()}##CloseCompact", size);
+
+        return clicked;
     }
 
     private static readonly Vector4 TitleColor = new(0.55f, 0.8f, 1f, 1f);
@@ -1088,6 +1198,7 @@ public class CompactOverlayWindow : Window
     private static readonly Vector4 VendorLinkColor = new(0.5f, 0.8f, 1f, 1f);
     private static readonly Vector4 AffordableColor = new(0.55f, 0.95f, 0.55f, 1f);
     private static readonly Vector4 UnsupportedColor = new(1f, 0.3f, 0.3f, 1f);
+    private static readonly Vector4 NotYetPossibleColor = new(0.5f, 0.5f, 0.5f, 1f);
     private static readonly Vector4 GoToActiveColor = new(1f, 0.65f, 0.2f, 1f);
 
     private static readonly Dictionary<CollectibleType, Vector4> TypeColors = new()

@@ -70,6 +70,8 @@ public sealed class AetherCurrentAutomation
     private Vector3 currentTargetPosition;
     private DateTime stateEnteredAt;
     private bool hasSeenPathRunning;
+    private DateTime lastRemountAttempt = DateTime.MinValue;
+    private readonly NavigationStuckDetector stuckDetector = new();
     private bool hasInteractedThisCycle;
     private DateTime? interactObjectNotFoundSince;
 
@@ -141,6 +143,7 @@ public sealed class AetherCurrentAutomation
         state = State.Idle;
         currentTargetEntry = null;
         StopPath();
+        Plugin.ClearNavigationTarget();
     }
 
     public void MarkUnavailable()
@@ -268,11 +271,14 @@ public sealed class AetherCurrentAutomation
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
 
-        // Fliegend zuerst versuchen - Ätherströmungen liegen oft erhöht/an schwer zu Fuß
-        // erreichbaren Stellen, wofür man eigentlich erst noch das Fliegen freischalten müsste
-        // (Henne-Ei-Problem). Lehnt vnavmesh das Fliegen ab (z.B. weil noch gar nicht freigeschaltet),
-        // fällt es automatisch auf zu Fuß zurück, genau wie bei den anderen Automationen.
-        if (mounted)
+        // Fliegend zuerst versuchen, aber nur wenn Plugin.CanFly gerade true ist (Fliegen in dieser
+        // Zone bereits freigeschaltet) - vnavmesh nimmt einen Flugauftrag sonst teils trotzdem an,
+        // obwohl der Charakter gar nicht abheben kann, und hüpft nur sinnlos am Boden herum statt zu
+        // laufen. Ätherströmungen liegen zwar oft erhöht/schwer zu Fuß erreichbar, aber genau die
+        // ersten einer Zone müssen ohnehin ohne Fliegen erreichbar sein (Henne-Ei: Fliegen schaltet
+        // erst frei, wenn alle Strömungen der Zone eingesammelt sind) - zu Fuß ist also immer ein
+        // gültiger Fallback.
+        if (mounted && Plugin.CanFly)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
 
         if (!accepted)
@@ -287,6 +293,7 @@ public sealed class AetherCurrentAutomation
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
+        stuckDetector.Reset();
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -323,6 +330,19 @@ public sealed class AetherCurrentAutomation
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
             if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
                 Plugin.TryUseSprint();
+
+            // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
+            // erreicht ist, erneut aufsitzen.
+            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[AetherCurrentAutomation] UpdateMoving({currentTargetEntry.Name}): scheinbar steckengeblieben - Laufweg wird neu angefordert.");
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
                 SkipCurrent(Loc.T("Laufweg dauert zu lange", "Path is taking too long"));

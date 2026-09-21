@@ -2,6 +2,7 @@ using Dalamud.Configuration;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 
 namespace AllTheThings;
 
@@ -47,6 +48,11 @@ public class Configuration : IPluginConfiguration
     // "Hinlaufen"-Icon neben verlinkten Einträgen (siehe CompactOverlayWindow.DrawClickableName) -
     // läuft per vnavmesh/Lifestream automatisch zum Fundort, siehe GoToAutomation.
     public bool ShowGoToIcon { get; set; } = true;
+
+    // Reihe der Automation-Start/Stopp-Knöpfe (Quest/Aetheryte/Hunting Log/Ätherströmung/Sightseeing/
+    // Chocobokeep) im Overlay - die Automationen selbst laufen unabhängig davon weiter, nur die
+    // Knöpfe zum Starten/Stoppen werden ein-/ausgeblendet.
+    public bool ShowAutomationButtons { get; set; } = true;
     public float CompactFontScale { get; set; } = 1.3f;
     public CompactFontMode CompactFontMode { get; set; } = CompactFontMode.Standard;
     public string CompactCustomFontPath { get; set; } = string.Empty;
@@ -62,6 +68,20 @@ public class Configuration : IPluginConfiguration
     // hier im Plugin gemacht statt über das Spiel-eigene Mount-Roulette-Feature), sonst die
     // Lumina-RowId eines konkreten, bereits freigeschalteten Mounts.
     public int? AetheryteMountId { get; set; } = null;
+
+    // true, sobald Plugin.EnsureAetheryteMountAutoDefault einmal eine Vorbelegung für AetheryteMountId
+    // gesetzt hat (siehe dort) - verhindert, dass eine spätere manuelle Rückstellung auf "Kein Mount"
+    // bei jedem weiteren Öffnen des Optionsfensters wieder überschrieben wird.
+    public bool AetheryteMountAutoDefaultApplied { get; set; } = false;
+
+    // TomTom-artiger Wegweiser-Pfeil (siehe Windows/NavigationArrowWindow.cs) - Default aus, da er
+    // eine zusätzliche, ständig sichtbare UI-Fläche wäre, die nicht jeder will.
+    public bool ShowNavigationArrow { get; set; } = false;
+    public float NavigationArrowWidth { get; set; } = 170f;
+    public float NavigationArrowHeight { get; set; } = 170f;
+
+    // #FFC200FF
+    public Vector4 NavigationArrowColor { get; set; } = new(1f, 0.7607843f, 0f, 1f);
 
     // Debug
     public bool ShowDebugInfo { get; set; } = false;
