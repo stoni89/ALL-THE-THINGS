@@ -631,7 +631,7 @@ public class MainWindow : Window
         ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.20f, 0.22f, 0.25f, 1f));
         ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.10f, 0.11f, 0.13f, 1f));
         if (IconTextButton("AboutGitHub", FontAwesomeIcon.CodeBranch, githubText, buttonSize))
-            Util.OpenLink("https://github.com/stoni89/ALL-THE-THINGS");
+            Util.OpenLink("https://github.com/stoni89/explorers-codex");
         ImGui.PopStyleColor(3);
     }
 

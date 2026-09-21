@@ -68,10 +68,10 @@ jobs:
             ApplicableVersion   = $manifest.ApplicableVersion
             Tags                = $manifest.Tags
             DalamudApiLevel     = $manifest.DalamudApiLevel
-            RepoUrl             = "https://github.com/stoni89/ALL-THE-THINGS"
-            DownloadLinkInstall = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
-            DownloadLinkUpdate  = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
-            DownloadLinkTesting = "https://github.com/stoni89/ALL-THE-THINGS/releases/latest/download/latest.zip"
+            RepoUrl             = "https://github.com/stoni89/explorers-codex"
+            DownloadLinkInstall = "https://github.com/stoni89/explorers-codex/releases/latest/download/latest.zip"
+            DownloadLinkUpdate  = "https://github.com/stoni89/explorers-codex/releases/latest/download/latest.zip"
+            DownloadLinkTesting = "https://github.com/stoni89/explorers-codex/releases/latest/download/latest.zip"
           }
 
           # -AsArray erzwingt "[ {...} ]" statt "{...}" - Dalamud erwartet fuer Custom-Repositories
