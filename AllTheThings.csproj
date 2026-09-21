@@ -2,10 +2,10 @@
   <PropertyGroup>
     <Version>0.3.0</Version>
     <!-- Manifest-Felder (siehe https://github.com/goatcorp/DalamudPackager) -->
-    <Author>stoni89</Author>
+    <Author>Stoni</Author>
     <Name>All The Things</Name>
-    <Punchline>Sammel-Tracker pro Karte, inspiriert von "All the Things"</Punchline>
-    <Description>Zeigt an, welche Mounts, Minions, Orchestrionrollen, Bardings, Emotes, Facewear, Fashion Accessories, Triple-Triad-Karten und Framer's Kits in der aktuellen Zone noch fehlen.</Description>
+    <Punchline>Zone Completion, inspired by "All the Things" from WoW</Punchline>
+    <Description>Shows which mounts, minions, orchestrion rolls, bardings, emotes, facewear, fashion accessories, Triple Triad cards, and portrait frames are still missing in your current zone.</Description>
     <RepoUrl>https://github.com/stoni89/ALL-THE-THINGS</RepoUrl>
     <Tags>collection;tracker;utility;allthethings</Tags>
   </PropertyGroup>
