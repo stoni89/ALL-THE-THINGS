@@ -1016,6 +1016,7 @@ public class MainWindow : Window
             (Loc.T("Framer's Kit", "Framer's kit"), Plugin.DumpFrameKitDebugInfo),
             (Loc.T("Chocobokeep", "Chocobokeep"), Plugin.DumpChocobokeepDebugInfo),
             (Loc.T("Händler-Positionen", "Vendor positions"), Plugin.DumpVendorPositionEnrichmentDebugInfo),
+            (Loc.T("GK-Bardinghändler", "GC barding vendors"), Plugin.DumpGrandCompanyBardingVendorDebugInfo),
             (Loc.T("Dungeon-Zonen", "Dungeon zones"), Plugin.DumpZoneEnrichmentDebugInfo),
             (Loc.T("Saisonevent", "Seasonal event"), Plugin.DumpSeasonalEventDebugInfo),
             (Loc.T("Ätherströmungen (aktuelle Zone)", "Aether currents (current zone)"), Plugin.DumpAetherCurrentDebugInfo),

@@ -462,6 +462,52 @@ public sealed class Plugin : IDalamudPlugin
             Log.Info($"[VendorPositionDebug]   {entry.Type} \"{entry.Name}\": Vendor=\"{entry.Vendor}\", Zone={entry.TerritoryTypeId}");
     }
 
+    /// <summary>
+    /// Einmaliger Debug-Dump zur Kalibrierung der Großen-Kompanie-Bardinghändler (siehe
+    /// bardings.json "Quartermaster"-Einträge, Zone 534/597/599) - der geratene Vendor-Name
+    /// "Quartermaster" hat bei EnrichEntriesWithVendorPosition nicht gegriffen (kein passender NPC
+    /// gefunden), daher hier stattdessen ALLE NPCs auflisten, die laut Level-Sheet tatsächlich in
+    /// einer der drei Kasernen-Zonen stehen - der richtige Händlername lässt sich daraus ablesen.
+    /// </summary>
+    public static unsafe void DumpGrandCompanyBardingVendorDebugInfo()
+    {
+        var territoryIds = new HashSet<uint> { 534, 597, 599 };
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        var npcResidentSheet = DataManager.GetExcelSheet<ENpcResident>();
+        var levelSheet = DataManager.GetExcelSheet<Level>();
+        if (territorySheet == null || npcResidentSheet == null || levelSheet == null)
+        {
+            Log.Error("[GCBardingVendorDebug] Benötigtes Lumina-Sheet nicht verfügbar.");
+            return;
+        }
+
+        Log.Info("[GCBardingVendorDebug] Alle NPCs in den Großen-Kompanie-Kasernen (Zone 534/597/599):");
+        foreach (var level in levelSheet)
+        {
+            try
+            {
+                if (level.Type != 8 || !territoryIds.Contains(level.Territory.RowId))
+                    continue;
+
+                if (!npcResidentSheet.TryGetRow(level.Object.RowId, out var npc))
+                    continue;
+
+                var name = npc.Singular.ToString();
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                var zoneName = territorySheet.TryGetRow(level.Territory.RowId, out var territory)
+                    ? territory.PlaceName.ValueNullable?.Name.ToString() ?? $"#{level.Territory.RowId}"
+                    : $"#{level.Territory.RowId}";
+                Log.Info($"[GCBardingVendorDebug]   Zone={level.Territory.RowId} ({zoneName}): \"{name}\" (ENpcResident #{npc.RowId})");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Fehler bei Level-Zeile {level.RowId} (GC-Bardinghändler-Debug) - übersprungen.");
+            }
+        }
+    }
+
     private static List<CollectibleEntry>? frameKitEntriesCache;
 
     /// <summary>
