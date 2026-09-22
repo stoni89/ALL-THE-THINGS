@@ -312,6 +312,29 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
+    /// Trägt MapId nach für Einträge, die von Hand nur mit TerritoryTypeId angelegt wurden (z.B. die
+    /// Großen-Kompanie-Barding-Händler) - MapId ist für jede Zone eindeutig durch TerritoryType.Map
+    /// bestimmt, muss also nie von Hand gepflegt werden. Ohne MapId bliebe HasVendorLocation auch
+    /// nach einer erfolgreich aufgelösten Händlerposition (siehe EnrichEntriesWithVendorPosition)
+    /// false, und "Auf Karte anzeigen"/"Hinlaufen" würden fehlen.
+    /// </summary>
+    public static void EnrichEntriesWithMapIdFromTerritory(List<CollectibleEntry> entries)
+    {
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null)
+            return;
+
+        foreach (var entry in entries)
+        {
+            if (entry.TerritoryTypeId == 0 || entry.MapId != 0)
+                continue;
+
+            if (territorySheet.TryGetRow(entry.TerritoryTypeId, out var territory))
+                entry.MapId = territory.Map.RowId;
+        }
+    }
+
+    /// <summary>
     /// Einmaliger Debug-Dump zur Kalibrierung von EnrichEntriesWithZoneFromSource - listet jeden
     /// "Dungeon"-Eintrag (Category enthält "Dungeon"), dem auch nach der Anreicherung noch eine
     /// Zone fehlt, mitsamt seinem Source-Text, damit sich nicht erkannte Zonennamen gezielt

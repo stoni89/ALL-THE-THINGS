@@ -157,6 +157,11 @@ public static class CollectionData
         // Community-Export nötig.
         Plugin.EnrichEntriesWithZoneFromSource(entries);
 
+        // Einträge, die von Hand direkt mit TerritoryTypeId angelegt wurden (z.B. Großen-Kompanie-
+        // Bardinghändler), aber ohne MapId - die ist für jede Zone eindeutig und muss daher nie von
+        // Hand gepflegt werden.
+        Plugin.EnrichEntriesWithMapIdFromTerritory(entries);
+
         // Viele Händlereinträge kennen zwar Vendor+Zone als Klartext, aber keine Kartenkoordinate
         // (VendorMapX/Y = 0) - dadurch fehlten "Auf Karte anzeigen"/"Hinlaufen" (siehe z.B.
         // "Jonathas" in Old Gridania). Nach EnrichEntriesWithZoneFromSource, damit auch Einträge
