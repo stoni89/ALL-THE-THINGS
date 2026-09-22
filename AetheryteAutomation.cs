@@ -24,6 +24,7 @@ public sealed class AetheryteAutomation
         MovingTo,
         Interacting,
         TravelingToDistrict,
+        SimulationWaitingForWindowClose,
     }
 
     // Wie lange maximal aufs Aufsteigen gewartet wird (Ruf-Animation), bevor trotzdem
@@ -47,6 +48,33 @@ public sealed class AetheryteAutomation
     private static float GetFinalApproachDistance(uint aetheryteId) =>
         Plugin.IsBigAetheryte(aetheryteId) ? BigAetheryteFinalApproachDistance : SmallAetheryteFinalApproachDistance;
 
+    // Deutlich engere Zusatz-Annäherung NUR direkt vor dem eigentlichen Interact-Aufruf (siehe
+    // UpdateInteracting) - Verdacht: der tatsächliche Klick-Radius des Spiels für "Menü öffnen"
+    // liegt enger als GetFinalApproachDistance (die bewusst großzügig ist, um nicht gegen den
+    // Sockel zu laufen). Bewusst mit eigenem, kurzem Timeout statt der vollen MovingTo-
+    // Zustandsmaschine - kann vnavmesh diese Distanz wegen Sockel-Kollision gar nicht erreichen
+    // (siehe Kommentar bei SmallAetheryteFinalApproachDistance), soll die Automation nach kurzer
+    // Zeit trotzdem aus der bestmöglich erreichten Entfernung interagieren, statt endlos gegen den
+    // Sockel zu laufen.
+    private const float TightInteractApproachDistance = 3f;
+
+    // Kurz gehalten: Empirisch bringt langes Weiterbumpen gegen den Sockel keinen Vorteil - vnavmesh
+    // erreicht die physisch nächstmögliche Position bereits nach einem Bruchteil dieser Zeit, der
+    // Rest wäre nur sichtbar sinnloses Gegenlaufen. Nach Ablauf wird trotzdem aus der bestmöglich
+    // erreichten Entfernung interagiert (siehe oben).
+    private static readonly TimeSpan TightInteractApproachTimeout = TimeSpan.FromSeconds(1.2);
+
+    // Wie oft geprüft wird, ob sich der Charakter während des engen Heranlaufens überhaupt noch
+    // spürbar bewegt (siehe TightApproachStuckMinProgress) - kürzer als TightInteractApproachTimeout,
+    // damit ein Steckenbleiben am Sockel (Kollision) nicht erst nach dem vollen Timeout, sondern
+    // deutlich früher erkannt und abgebrochen wird. Sichtbar kürzeres "Gegenlaufen" gegen den Sockel.
+    private static readonly TimeSpan TightApproachStuckCheckInterval = TimeSpan.FromMilliseconds(350);
+
+    // Unterhalb dieser Bewegung (Yalms) seit der letzten Prüfung gilt der Charakter als am Sockel
+    // steckengeblieben - bewusst klein (deutlich kleiner als NavigationStuckDetector.
+    // MinProgressDistance), weil hier viel häufiger/früher geprüft wird als dort.
+    private const float TightApproachStuckMinProgress = 0.3f;
+
     // Innerhalb dieser Entfernung (Yalms) zum Ziel wird kein Sprint mehr benutzt - wird Sprint
     // genau in dem Moment aktiviert, in dem vnavmesh eigentlich anhalten und den Aetheryten
     // anklicken will, verpasst der Klick das Objekt und die Automation bleibt ohne erkennbaren
@@ -68,6 +96,28 @@ public sealed class AetheryteAutomation
     // Wie lange nach der Interaktion auf den tatsächlichen Freischalt-Abschluss gewartet wird
     // (der "Entdecken"-Cast braucht ein paar Sekunden) - danach gilt der Versuch als gescheitert.
     private static readonly TimeSpan UnlockWaitTimeout = TimeSpan.FromSeconds(15);
+
+    // Kurze Anlaufzeit nach dem Testklick auf einen bereits freigeschalteten Aetheryten
+    // (Simulation-Modus), bevor zum ersten Mal geprüft wird, ob das dabei geöffnete native Menü
+    // ("SelectString"/"Teleport") schon wieder zu ist - das Fenster braucht ein paar Frames, um
+    // überhaupt zu erscheinen. Ohne diese Gnadenfrist würde der allererste Check (Fenster noch gar
+    // nicht gerendert) fälschlich sofort als "schon wieder geschlossen" gewertet.
+    private static readonly TimeSpan SimulationWindowOpenGracePeriod = TimeSpan.FromMilliseconds(800);
+
+    // Kurze Nachlaufzeit, NACHDEM das native Menü wieder zu ist, bevor der nächste Schritt
+    // (insbesondere der Mount-Ruf fürs nächste Ziel, siehe TryRequestAetheryteMount) losgeschickt
+    // wird - beobachtet: ein Chat-Befehl (SendGameChatCommand/ProcessChatBoxEntry), der GENAU in dem
+    // Moment abgesetzt wird, in dem ein natives Fenster gerade erst zugeht, scheint von der
+    // Schließ-Animation/dem UI-Fokuswechsel verschluckt zu werden - der Mount-Ruf wird zwar gesendet
+    // (siehe MountDebug-Log), bewirkt aber nichts, und die Automation läuft danach fälschlich zu Fuß
+    // statt zu fliegen.
+    private static readonly TimeSpan SimulationWindowCloseSettleDelay = TimeSpan.FromMilliseconds(700);
+
+    // Wie lange nach dem Absteigen gewartet wird, bevor überhaupt versucht wird zu interagieren -
+    // Condition[Mounted] wird schon VOR dem Ende der sichtbaren Absteige-/Lande-Animation false
+    // (reines Prüfen darauf reicht also nicht) - ein Interact-Versuch mitten in dieser Animation
+    // greift nicht (identisches Problem/Lösung wie in ChocobokeepAutomation).
+    private static readonly TimeSpan DismountSettleDelay = TimeSpan.FromSeconds(1);
 
     // Wie lange maximal auf eine Lifestream-Reise in einen Nachbarbezirk gewartet wird (Ladebildschirm
     // + eventuelles eigenes Laufen von Lifestream zum Ziel-Aetheryten).
@@ -122,6 +172,33 @@ public sealed class AetheryteAutomation
     private DateTime stateEnteredAt;
     private bool hasInteractedThisCycle;
     private bool didFinalApproach;
+    private bool currentTargetWasUnlockedAtStart;
+    private bool didTightInteractApproach;
+    private DateTime? tightInteractApproachStartedAt;
+    private Vector3? tightApproachStuckCheckPosition;
+    private DateTime? tightApproachStuckCheckAt;
+
+    // Verhindert, dass Plugin.TryRemountAfterForcedDismount (gedacht für unfreiwilliges Absteigen
+    // beim Schwimmen) den Charakter wieder aufsitzen lässt, nachdem WIR ihn absichtlich zum
+    // Interagieren abgestiegen haben (siehe UpdateMoving/UpdateInteracting, wo Plugin.TryDismount()
+    // aufgerufen wird) - sonst versucht er auf dem letzten Stück zum Kristall ständig wieder
+    // aufzumounten, statt zu Fuß zu interagieren.
+    private bool hasIntentionallyDismounted;
+    private DateTime? simulationWindowClosedAt;
+
+    // Ab wann Condition[Mounted] erstmals false war, nachdem wir absichtlich abgestiegen sind
+    // (siehe DismountSettleDelay) - null, solange noch beritten.
+    private DateTime? dismountedAt;
+
+    // Einmal in UpdateInteracting gefundenes Weltobjekt wird für den Rest des Zyklus an dieser
+    // Adresse festgehalten, statt jeden Frame neu per Nähe zu suchen - in Aetheryte-Plätzen stehen
+    // oft mehrere Aetheryte-Objekte (großer Aetheryte + mehrere Aethernetz-Kristalle) nur wenige
+    // Yalm auseinander. Ohne dieses Festhalten kann FindNearestAetheryteObject je nach winziger
+    // Positionsänderung frameweise zwischen zwei Objekten hin- und herspringen - dann wird nie 2
+    // Frames hintereinang dasselbe Objekt als aktuelles Ziel gesetzt (siehe IsCurrentTarget-Prüfung
+    // unten) und der eigentliche Interact-Aufruf wird nie erreicht (Charakter zielt sichtbar, ohne
+    // je zu interagieren).
+    private nint? currentInteractObjectAddress;
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
@@ -293,6 +370,10 @@ public sealed class AetheryteAutomation
                 case State.TravelingToDistrict:
                     UpdateTravelingToDistrict();
                     break;
+
+                case State.SimulationWaitingForWindowClose:
+                    UpdateSimulationWaitingForWindowClose();
+                    break;
             }
         }
         catch (Exception ex)
@@ -435,7 +516,7 @@ public sealed class AetheryteAutomation
         // findet, weil die Karten-Flagge intern anders/großzügiger auf die Navmesh gerastert wird.
         if (floorPoint == null && next.HasVendorLocation)
         {
-            Plugin.OpenVendorMap(next);
+            Plugin.OpenVendorMap(next, showMapWindow: false);
             floorPoint = queryFlagToPoint.InvokeFunc();
             Plugin.Log.Info($"[AetheryteAutomation] StartMovingTo({next.Name}): FlagToPoint() = {floorPoint}");
         }
@@ -462,6 +543,20 @@ public sealed class AetheryteAutomation
         currentTargetPosition = floorPoint.Value;
         currentArrivalTolerance = tolerance;
         didFinalApproach = false;
+        didTightInteractApproach = false;
+        tightInteractApproachStartedAt = null;
+        tightApproachStuckCheckPosition = null;
+        tightApproachStuckCheckAt = null;
+        hasIntentionallyDismounted = false;
+        dismountedAt = null;
+        currentInteractObjectAddress = null;
+
+        // Merken, ob dieses Ziel schon VOR diesem Anlauf freigeschaltet war (z.B. im Simulation-
+        // Modus, siehe Configuration.SimulateAetheryteAutomation, der bewusst auch schon
+        // freigeschaltete Aetheryten zu Testzwecken anlaufen lässt) - sonst würde die
+        // "bereits durch Nähe freigeschaltet"-Abkürzung in UpdateInteracting sofort greifen, noch
+        // bevor überhaupt sichtbar abgestiegen/interagiert wurde (siehe currentTargetWasUnlockedAtStart).
+        currentTargetWasUnlockedAtStart = Plugin.IsAetheryteUnlocked(next.Id);
 
         // Mount rufen (falls in den QoL-Einstellungen ausgewählt und noch nicht beritten) - der
         // eigentliche Laufauftrag an vnavmesh geht erst raus, nachdem entweder aufgestiegen wurde
@@ -660,8 +755,13 @@ public sealed class AetheryteAutomation
                 Plugin.TryUseSprint();
 
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
-            // erreicht ist, erneut aufsitzen.
-            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+            // erreicht ist, erneut aufsitzen. NICHT, nachdem wir selbst absichtlich zum Interagieren
+            // abgestiegen sind (siehe hasIntentionallyDismounted, gesetzt bei Plugin.TryDismount()
+            // unten) - sonst versucht der Charakter genau auf dem letzten Stück zum Kristall
+            // (Final-/Tight-Approach-Laufwege, beide laufen über UpdateMoving) wieder aufzusitzen,
+            // obwohl er absichtlich abgestiegen ist, um interagieren zu können.
+            if (!hasIntentionallyDismounted)
+                Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
 
             // Steckengeblieben (z.B. gegen eine Wand/Kante, vnavmeshs lokale Steuerung kommt nicht
             // weiter) - NICHT dasselbe wie "Distanz zum Ziel nimmt nicht ab" (siehe Kommentar unten,
@@ -693,6 +793,14 @@ public sealed class AetheryteAutomation
             Plugin.Log.Info($"[AetheryteAutomation] UpdateMoving(#{currentTargetId}): Path.IsRunning wurde false. playerPos={playerPos}, target={currentTargetPosition}, distance={distance}, tolerance={currentArrivalTolerance + 2f}");
             if (distance <= currentArrivalTolerance + 2f)
             {
+                // Anders als bei ChocobokeepAutomation HIER bewusst schon absteigen: Ätheryten haben
+                // (anders als offene NPC-Standorte) eine spielseitige Kein-Flug-Zone direkt um sich
+                // herum - ein Versuch, per vnavmesh nah heranzufliegen, bleibt dort einfach hängen
+                // (beobachtet: stoppt ~9y entfernt, der Stuck-Detector startet den Flug immer wieder
+                // neu, ohne je näherzukommen). Deshalb hier zu Fuß weiter, wie ursprünglich.
+                Plugin.TryDismount();
+                hasIntentionallyDismounted = true;
+
                 state = State.Interacting;
                 stateEnteredAt = DateTime.UtcNow;
                 hasInteractedThisCycle = false;
@@ -730,10 +838,20 @@ public sealed class AetheryteAutomation
         // BaseId ist bei kleinen Aethernetz-Kristallen offenbar kein verlässlicher 1:1-Schlüssel
         // zur Aetheryte-RowId (auch Lifestream verlässt sich dafür nicht darauf, sondern auf
         // Positionsnähe) - da wir gerade exakt an dieser Position angekommen sind, ist das
-        // nächstgelegene Aetheryte-Objekt zuverlässig der richtige Kristall.
-        var gameObject = FindNearestAetheryteObject(currentTargetPosition, 15f);
+        // nächstgelegene Aetheryte-Objekt zuverlässig der richtige Kristall. Aber NUR beim ersten
+        // Mal in diesem Zyklus neu suchen (siehe currentInteractObjectAddress) - in Aetheryte-
+        // Plätzen stehen oft mehrere Aetheryte-Objekte dicht beieinander (großer Aetheryte +
+        // Aethernetz-Kristalle), da würde eine jeden Frame neue Nähe-Suche zwischen zwei Objekten
+        // hin- und herspringen können, sodass nie zwei Frames hintereinander dasselbe Ziel gesetzt
+        // wird und der Interact-Aufruf unten nie erreicht wird (Charakter zielt sichtbar, ohne je zu
+        // interagieren).
+        var gameObject = currentInteractObjectAddress.HasValue
+            ? Plugin.ObjectTable.FirstOrDefault(o => o.ObjectKind == ObjectKind.Aetheryte && o.Address == currentInteractObjectAddress.Value)
+            : null;
+        gameObject ??= FindNearestAetheryteObject(currentTargetPosition, 15f);
         if (gameObject == null)
         {
+            currentInteractObjectAddress = null;
             // Jetzt am Ziel angekommen sollte das Objekt eigentlich sofort geladen sein - eine
             // kurze Gnadenfrist trotzdem, für den seltenen Fall eines Frames Verzögerung.
             interactObjectNotFoundSince ??= DateTime.UtcNow;
@@ -744,10 +862,15 @@ public sealed class AetheryteAutomation
             return;
         }
 
+        currentInteractObjectAddress = gameObject.Address;
+
         // Manche Feld-Aetheryten scheinen sich schon durch reine Nähe selbst zu entdecken, noch
         // bevor überhaupt interagiert wurde - dann direkt fertig, statt trotzdem noch zu versuchen
         // zu interagieren (und ggf. dabei gegen den Sockel zu laufen, siehe GetFinalApproachDistance).
-        if (Plugin.IsAetheryteUnlocked(currentTargetId.Value))
+        // NICHT anwenden, wenn das Ziel schon VOR diesem Anlauf freigeschaltet war (siehe
+        // currentTargetWasUnlockedAtStart) - sonst würde dieser Check sofort greifen, ohne dass der
+        // Charakter überhaupt sichtbar abgestiegen/interagiert wäre (z.B. im Simulation-Modus).
+        if (!currentTargetWasUnlockedAtStart && Plugin.IsAetheryteUnlocked(currentTargetId.Value))
         {
             Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): bereits durch Nähe freigeschaltet, ohne explizite Interaktion.");
             currentTargetId = null;
@@ -771,6 +894,10 @@ public sealed class AetheryteAutomation
                 currentTargetPosition = gameObject.Position;
                 currentArrivalTolerance = finalApproachDistance;
 
+                // Bewusst zu Fuß (fly=false), nicht fliegend - anders als bei Chocobokeep-NPCs
+                // haben Ätheryten eine spielseitige Kein-Flug-Zone direkt um sich herum, in der
+                // vnavmesh beim Fliegen einfach hängen bleibt, ohne näherzukommen (siehe
+                // UpdateMoving, wo deshalb schon vorher abgestiegen wird).
                 var accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, false, finalApproachDistance);
                 Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): zu weit vom echten Objekt entfernt (distance={distanceToObject}, BaseId={gameObject.BaseId} @ {gameObject.Position}) - laufe gezielt näher heran, accepted={accepted}.");
                 if (!accepted)
@@ -782,6 +909,84 @@ public sealed class AetheryteAutomation
                 state = State.MovingTo;
                 stateEnteredAt = DateTime.UtcNow;
                 hasSeenPathRunning = false;
+                return;
+            }
+        }
+
+        // Sicherheitsnetz - eigentlich schon beim Ankommen in UpdateMoving abgestiegen; falls das
+        // aus irgendeinem Grund nicht gegriffen hat (z.B. Aktion war in genau dem Frame noch nicht
+        // bereit), hier nochmal versuchen, bevor der folgende enge Klick-Annäherungsschritt zu Fuß
+        // Bodenkontakt voraussetzt.
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            Plugin.TryDismount();
+            hasIntentionallyDismounted = true;
+            dismountedAt = null;
+            return;
+        }
+
+        // Condition[Mounted] wird schon VOR dem Ende der sichtbaren Absteige-/Lande-Animation
+        // false - ein Bewegungs-/Interact-Versuch mitten in dieser Animation greift nicht. Deshalb
+        // zusätzlich noch kurz warten (siehe DismountSettleDelay).
+        dismountedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - dismountedAt.Value < DismountSettleDelay)
+            return;
+
+        // Zusätzliche, deutlich engere Annäherung NUR direkt vor dem Interact-Versuch (siehe
+        // TightInteractApproachDistance) - Verdacht: der tatsächliche Spiel-Klickradius für
+        // "Menü öffnen" ist enger als GetFinalApproachDistance oben. Bleibt bewusst in
+        // State.Interacting (keine eigene MovingTo-Runde) und pollt selbst, mit kurzem Timeout,
+        // falls vnavmesh diese Distanz wegen Sockel-Kollision gar nicht physisch erreichen kann.
+        if (!hasInteractedThisCycle && !didTightInteractApproach)
+        {
+            var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
+            var distanceToObject = Vector3.Distance(playerPos, gameObject.Position);
+            if (distanceToObject <= TightInteractApproachDistance)
+            {
+                didTightInteractApproach = true;
+            }
+            else if (tightInteractApproachStartedAt == null)
+            {
+                tightInteractApproachStartedAt = DateTime.UtcNow;
+                tightApproachStuckCheckPosition = playerPos;
+                tightApproachStuckCheckAt = DateTime.UtcNow;
+                var accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, false, TightInteractApproachDistance);
+                Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): versuche noch enger für den Klick heranzulaufen (distance={distanceToObject}, Ziel<= {TightInteractApproachDistance}), accepted={accepted}.");
+                if (!accepted)
+                    didTightInteractApproach = true;
+                else
+                    return;
+            }
+            else if (DateTime.UtcNow - tightInteractApproachStartedAt.Value > TightInteractApproachTimeout)
+            {
+                Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): enges Heranlaufen nach {TightInteractApproachTimeout.TotalSeconds}s abgebrochen (distance={distanceToObject}) - interagiere trotzdem aus aktueller Entfernung.");
+                StopPath();
+                didTightInteractApproach = true;
+            }
+            else if (tightApproachStuckCheckAt.HasValue && DateTime.UtcNow - tightApproachStuckCheckAt.Value >= TightApproachStuckCheckInterval)
+            {
+                // Deutlich früher als der volle Timeout prüfen, ob überhaupt noch spürbare
+                // Bewegung stattfindet - läuft der Charakter gerade gegen den (kollidierenden)
+                // Sockel, bewegt er sich seit der letzten Prüfung kaum noch. Dann sofort abbrechen
+                // und interagieren, statt sichtbar bis zum vollen Timeout weiter dagegenzulaufen.
+                var movedSinceLastCheck = tightApproachStuckCheckPosition.HasValue
+                    ? Vector3.Distance(tightApproachStuckCheckPosition.Value, playerPos)
+                    : float.MaxValue;
+                if (movedSinceLastCheck < TightApproachStuckMinProgress)
+                {
+                    Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): enges Heranlaufen steckengeblieben (Sockel?, bewegt={movedSinceLastCheck}) - interagiere aus aktueller Entfernung.");
+                    StopPath();
+                    didTightInteractApproach = true;
+                }
+                else
+                {
+                    tightApproachStuckCheckPosition = playerPos;
+                    tightApproachStuckCheckAt = DateTime.UtcNow;
+                    return;
+                }
+            }
+            else
+            {
                 return;
             }
         }
@@ -808,7 +1013,34 @@ public sealed class AetheryteAutomation
         // Wartezeit einfach anzunehmen, dass es geklappt hat.
         if (Plugin.IsAetheryteUnlocked(currentTargetId.Value))
         {
+            // War das Ziel schon VOR diesem Anlauf freigeschaltet (Simulation-Modus), öffnet der
+            // gerade erfolgte Klick (siehe oben) das echte Teleport-Menü des Aetheryten (erst ein
+            // "SelectString"-Auswahlmenü, danach ggf. die eigentliche "Teleport"-Zielliste) - direkt
+            // zum nächsten Ziel weiterzumachen würde durch die dafür nötige Bewegung dieses Menü
+            // sofort wieder schließen (Interaktionsfenster schließen sich in FFXIV beim Loslaufen),
+            // bevor man es überhaupt sehen könnte. Stattdessen warten, bis der Spieler es selbst
+            // wieder wegklickt (siehe UpdateSimulationWaitingForWindowClose), und DANACH von selbst
+            // zum nächsten Ziel in der Zone weiterziehen - kein manueller Neustart nötig.
+            if (currentTargetWasUnlockedAtStart)
+            {
+                Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): Simulation - angeklickt, warte auf Schließen des Menüs...");
+                StatusText = Loc.T(
+                    "Simulation: angeklickt - Menü schließen zum Weitermachen...",
+                    "Simulation: clicked - close the window to continue...");
+                state = State.SimulationWaitingForWindowClose;
+                stateEnteredAt = DateTime.UtcNow;
+                return;
+            }
+
             Plugin.Log.Info($"[AetheryteAutomation] UpdateInteracting(#{currentTargetId}): freigeschaltet.");
+
+            // Sofort als erledigt vermerken (nicht erst auf die vom Aufrufer übergebene
+            // missingAetherytesInZone-Liste verlassen) - die kommt aus Plugin.IsOwned, das den
+            // frisch gesetzten Freischalt-Flag u.U. noch einen Frame lang nicht widerspiegelt. Ohne
+            // das würde TryStartNext direkt danach denselben, gerade erst fertigen Aetheryten erneut
+            // als "nächstgelegenes" (Distanz 0) Ziel wählen - erneutes Mounten/Absteigen/Interagieren,
+            // bevor es endlich zum nächsten weitergeht.
+            skippedIds.Add(currentTargetId.Value);
             currentTargetId = null;
             state = State.Idle;
             return;
@@ -816,6 +1048,46 @@ public sealed class AetheryteAutomation
 
         if (DateTime.UtcNow - stateEnteredAt > UnlockWaitTimeout)
             SkipCurrent(Loc.T("Freischalten hat nicht geklappt", "unlocking did not go through"));
+    }
+
+    /// <summary>
+    /// Nur im Simulation-Modus erreicht (siehe currentTargetWasUnlockedAtStart) - wartet, bis der
+    /// Spieler das durch den Testklick geöffnete native Menü ("SelectString"/"Teleport") selbst
+    /// wieder schließt, und zieht danach automatisch zum nächsten Ziel in der Zone weiter. Öffnet
+    /// sich aus irgendeinem Grund gar kein Menü (z.B. der Klick hat nicht gegriffen), wird nach der
+    /// kurzen Anlaufzeit trotzdem sofort weitergemacht, statt für immer zu warten.
+    /// </summary>
+    private void UpdateSimulationWaitingForWindowClose()
+    {
+        if (DateTime.UtcNow - stateEnteredAt < SimulationWindowOpenGracePeriod)
+            return;
+
+        if (Plugin.IsAnyAddonVisible("SelectString", "Teleport"))
+        {
+            simulationWindowClosedAt = null;
+            return;
+        }
+
+        // Kurze Nachlaufzeit NACH dem Zugehen des Menüs (siehe SimulationWindowCloseSettleDelay) -
+        // ein Chat-Befehl (z.B. der Mount-Ruf fürs nächste Ziel), der direkt im selben Moment
+        // abgesetzt wird, scheint sonst von der Schließ-Animation/dem UI-Fokuswechsel verschluckt zu
+        // werden (beobachtet: /mount wird laut Log gesendet, aber nie aufgestiegen).
+        simulationWindowClosedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - simulationWindowClosedAt.Value < SimulationWindowCloseSettleDelay)
+            return;
+
+        simulationWindowClosedAt = null;
+        Plugin.Log.Info($"[AetheryteAutomation] UpdateSimulationWaitingForWindowClose(#{currentTargetId}): Menü zu (oder nie geöffnet) - weiter zum nächsten Ziel.");
+
+        // Für diesen Durchlauf als erledigt markieren - sonst würde TryStartNext sofort wieder
+        // genau dasselbe, weiterhin "freigeschaltete" Ziel als nächstgelegenes wählen und die
+        // Simulation käme nie über den ersten Kristall hinaus.
+        if (currentTargetId.HasValue)
+            skippedIds.Add(currentTargetId.Value);
+
+        currentTargetId = null;
+        state = State.Idle;
+        StatusText = Loc.T("Simulation: weiter zum nächsten Ziel...", "Simulation: moving to the next target...");
     }
 
     private static Dalamud.Game.ClientState.Objects.Types.IGameObject? FindNearestAetheryteObject(Vector3 nearPosition, float maxDistance)

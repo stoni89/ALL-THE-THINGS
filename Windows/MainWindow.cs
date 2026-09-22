@@ -60,17 +60,22 @@ public class MainWindow : Window
     // DrawCustomHeader-Kommentar dort).
     private const float IconSizeScale = 1.8f;
 
-    // WindowPadding bleibt in beiden Zuständen identisch (siehe PreDraw) - genau das war der Grund
-    // für das gemeldete "Verschieben" der Titelleiste beim Ein-/Ausklappen: Ein unterschiedliches
-    // oberes Padding hätte Icon/Text/Buttons je Zustand an einer anderen Y-Position im Fenster
-    // platziert. Die kompaktere Höhe kommt jetzt ausschließlich aus der kleineren Bandhöhe oben.
     private const float WindowPaddingY = 12f;
+
+    // Eingeklappt bewusst ein eigenes, deutlich knapperes oberes/unteres Innenpolster (statt wie im
+    // ausgeklappten Zustand WindowPaddingY) - macht die eingeklappte Titelleiste insgesamt so
+    // kompakt wie bei anderen Dalamud-Plugins mit nativer Titelleiste. Verursacht keinen
+    // "Verschieben"-Effekt (siehe frühere Version dieses Kommentars): Da im eingeklappten Zustand
+    // ohnehin NICHTS außer der Kopfzeile selbst gezeichnet wird, gibt es nichts, wozu die Kopfzeile
+    // "verrutschen" könnte - sie zentriert sich in beiden Zuständen unabhängig neu innerhalb ihres
+    // eigenen Bandes (siehe DrawCustomHeader).
+    private const float WindowPaddingYCollapsed = 2f;
 
     // Nur so hoch wie die (eingeklappte) Kopfzeile selbst - der Rest (Sidebar/Inhalt) wird beim
     // Einklappen komplett ausgeblendet, siehe PreDraw/Draw. Falls der Inhalt durch Rundungsfehler
     // doch mal 1-2px zu hoch wäre, wird er dank NoScrollbar am Fenster einfach knapp abgeschnitten
     // statt eine Scrollbar zu zeigen.
-    private const float CollapsedHeight = HeaderBandHeightCollapsed + WindowPaddingY * 2f;
+    private const float CollapsedHeight = HeaderBandHeightCollapsed + WindowPaddingYCollapsed * 2f;
 
     // Mindesthöhe bewusst so hoch gewählt, dass selbst der Tab mit dem meisten Inhalt (Anzeige, mit
     // beiden Karten: Aussehen + Reihenfolge mit 8 Zeilen) ohne Scrollbalken hineinpasst - der
@@ -89,9 +94,12 @@ public class MainWindow : Window
 
     private readonly (FontAwesomeIcon Icon, string Label, Action Draw)[] navItems;
 
+    private const ImGuiWindowFlags BaseFlags =
+        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse;
+
     public MainWindow(Plugin plugin) : base(
         $"The Explorer's Codex (v{VersionText})##TheExplorersCodex",
-        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
+        BaseFlags)
     {
         this.plugin = plugin;
 
@@ -135,9 +143,26 @@ public class MainWindow : Window
     {
         SizeConstraints = collapsed ? CollapsedSizeConstraints : ExpandedSizeConstraints;
 
+        // Eingeklappt bewusst NoResize: Bei einer so knappen Fensterhöhe (siehe CollapsedHeight)
+        // überlappt ImGuis eigene Rahmen-Zieh-Trefferzone (für Größenänderung per Maus) praktisch
+        // das GESAMTE Fenster - jeder Klick (auch der Doppelklick zum Wieder-Ausklappen) wurde dann
+        // von dieser Ziehzone abgefangen, statt unser InvisibleButton in DrawCustomHeader zu
+        // erreichen (beobachtet: Einklappen per Doppelklick ging noch, aber nicht mehr zurück).
+        Flags = collapsed ? BaseFlags | ImGuiWindowFlags.NoResize : BaseFlags;
+
         if (!collapsed && collapsedLastFrame)
         {
             Size = expandedSize;
+            SizeCondition = ImGuiCond.Always;
+        }
+        else if (collapsed && !collapsedLastFrame)
+        {
+            // Genau wie beim Ausklappen oben muss die Größe hier explizit gesetzt werden - allein
+            // CollapsedSizeConstraints zu setzen schrumpft ein bereits offenes, größeres Fenster
+            // NICHT von selbst (Größenbeschränkungen wirken nur auf künftiges manuelles Ziehen).
+            // Ohne das blieb das Fenster beim Einklappen optisch auf seiner vorherigen (ausgeklappten)
+            // Höhe stehen, egal wie klein CollapsedHeight gesetzt wurde.
+            Size = new Vector2(expandedSize.X, CollapsedHeight);
             SizeCondition = ImGuiCond.Always;
         }
         else
@@ -149,14 +174,23 @@ public class MainWindow : Window
 
         collapsedLastFrame = collapsed;
 
-        // Bewusst IMMER derselbe Innenabstand (siehe WindowPaddingY-Kommentar oben) - die kompaktere
-        // Höhe im eingeklappten Zustand kommt allein aus der kleineren Kopfzeilen-Bandhöhe.
-        ModernUi.PushStyle(new Vector2(12f, WindowPaddingY));
+        // ImGuis Stil-Standard WindowMinSize (32x32) begrenzt JEDE Fenstergröße nach unten,
+        // unabhängig davon, was Size/SizeConstraints sagen - ohne diesen Override konnte das Fenster
+        // beim Einklappen nie unter ~32px Höhe schrumpfen, egal welchen (kleineren) CollapsedHeight-
+        // Wert wir gesetzt haben. Betrifft auch den ausgeklappten Zustand nicht negativ - dessen
+        // tatsächliche Mindestgröße kommt weiterhin allein aus ExpandedSizeConstraints.
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, new Vector2(1f, 1f));
+
+        // Eingeklappt eigenes, knapperes oberes/unteres Innenpolster (siehe WindowPaddingYCollapsed-
+        // Kommentar oben) - macht die eingeklappte Titelleiste so kompakt wie bei anderen Dalamud-
+        // Plugins mit nativer Titelleiste.
+        ModernUi.PushStyle(new Vector2(12f, collapsed ? WindowPaddingYCollapsed : WindowPaddingY));
     }
 
     public override void PostDraw()
     {
         ModernUi.PopStyle();
+        ImGui.PopStyleVar();
     }
 
     private static IFontHandle? titleFontHandle;
@@ -691,6 +725,21 @@ public class MainWindow : Window
             config.ShowGoToIcon = showGoToIcon;
             config.Save();
         }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showAllItems = config.ShowAllItems;
+        if (ModernUi.ToggleRow(Loc.T("Alle Gegenstände anzeigen", "Show all items"), ref showAllItems))
+        {
+            config.ShowAllItems = showAllItems;
+            config.Save();
+        }
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 5f);
+        TextDisabledWrapped(Loc.T(
+            "Zeige alle Items/Daten, auch wenn sie durch ein nicht erreichtes Achievement oder nicht freigeschaltete Ränge (z.B. bei Beast-Tribe-Händlern) aktuell nicht erreichbar sind.",
+            "Show all items/data, even if they're currently unreachable due to a not-yet-completed achievement or unlocked rank (e.g. with beast tribe vendors)."));
         ModernUi.EndCard();
 
         ModernUi.GroupLabel("QoL");

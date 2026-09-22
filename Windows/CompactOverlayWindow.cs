@@ -65,6 +65,22 @@ public class CompactOverlayWindow : Window
     // irgendwo ein natives Fenster überlappt.
     private List<(Vector2 Min, Vector2 Max)> nativeOverlapRects = new();
 
+    // Eingeklappt = nur die Kopfzeile (Titel + Schloss-/Einklapp-/Schließen-Knopf) sichtbar, der
+    // Rest (Zonenname, Währungen, Sammelobjekt-Liste) wird ausgeblendet - identisches Prinzip wie
+    // beim Optionsfenster (siehe MainWindow.collapsed), hier aber die Zielhöhe NICHT fest verdrahtet,
+    // sondern jeden Frame aus der tatsächlich gezeichneten Kopfzeile gemessen (siehe DrawContent) -
+    // die Schriftgröße dieses Fensters ist über config.CompactFontScale frei einstellbar, eine feste
+    // Höhe wie bei MainWindow würde dort also nicht zu jeder Skalierung passen.
+    private bool collapsed;
+    private bool collapsedLastFrame;
+    private Vector2 expandedSize = new(260, 200);
+
+    // Umschaltet zwischen "Deine Währungen:" (besessene Menge) und "Benötigte Währung:" (Summe der
+    // noch fehlenden Menge über alle aktuell angezeigten, noch nicht besessenen Einträge hinweg) -
+    // siehe DrawCurrencyWallet. Bewusst kein Configuration-Feld, da es sich nur um eine
+    // Sitzungs-Ansicht handelt, kein dauerhaft zu speichernder Zustand.
+    private bool showCurrencyCostMode;
+
     /// <summary>
     /// Ob das Element, das man an der AKTUELLEN Cursor-Position mit der übergebenen Größe zeichnen
     /// würde, unter einem nativen Fenster liegen würde (siehe nativeOverlapRects) - jede
@@ -98,6 +114,13 @@ public class CompactOverlayWindow : Window
     private static readonly Vector4 ResizeGripColor = new(1f, 1f, 1f, 0.25f);
     private static readonly Vector4 ResizeGripHoveredColor = new(1f, 1f, 1f, 0.5f);
     private static readonly Vector4 ResizeGripActiveColor = new(1f, 1f, 1f, 0.7f);
+    private static readonly Vector4 ResizeGripHiddenColor = new(0f, 0f, 0f, 0f);
+
+    // Ungefähre sichtbare Kantenlänge (Yalm... äh, Pixel) des von ImGui selbst in die untere rechte
+    // Fensterecke gezeichneten Greifdreiecks - ImGui legt die genaue Größe intern fest (u.a. an der
+    // Schriftgröße orientiert), ein fester, großzügig bemessener Wert reicht hier aber, da es nur um
+    // die grobe Überlappungsprüfung geht, nicht um pixelgenaues Clipping.
+    private const float ResizeGripVisualSize = 20f;
 
     public override void PreDraw()
     {
@@ -113,8 +136,39 @@ public class CompactOverlayWindow : Window
 
         // Gesperrt = nur die Position fixiert, nicht die Größe - das Fenster bleibt also auch im
         // gesperrten Zustand an der Ecke skalierbar (z.B. wenn ein Mount-Name nicht mehr in die
-        // aktuelle Breite passt), nur das versehentliche Verschieben wird verhindert.
-        Flags = config.CompactLocked ? BaseFlags | ImGuiWindowFlags.NoMove : BaseFlags;
+        // aktuelle Breite passt), nur das versehentliche Verschieben wird verhindert. Eingeklappt
+        // zusätzlich NoResize - bei der dann sehr knappen Höhe würde ImGuis eigene Rahmen-Zieh-
+        // Trefferzone sonst praktisch das ganze Fenster überlappen und Klicks (auch den Klick auf
+        // den Ausklapp-Knopf) abfangen, statt sie durchzulassen (identisches Problem/Lösung wie im
+        // Optionsfenster, siehe MainWindow.PreDraw).
+        var flags = BaseFlags;
+        if (config.CompactLocked)
+            flags |= ImGuiWindowFlags.NoMove;
+        if (collapsed)
+            flags |= ImGuiWindowFlags.NoResize;
+        Flags = flags;
+
+        // Siehe MainWindow.PreDraw (identisches Problem/Lösung): ImGuis Stil-Standard WindowMinSize
+        // (32x32) würde ein Schrumpfen auf die (deutlich kleinere) eingeklappte Kopfzeilenhöhe sonst
+        // verhindern, egal was wir per Größe vorgeben.
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowMinSize, new Vector2(1f, 1f));
+
+        // Zurück zur zuletzt bekannten ausgeklappten Größe - muss VOR Begin() passieren (siehe
+        // MainWindow.PreDraw), sonst kommt die Wiederherstellung erst einen Frame zu spät sichtbar
+        // an. Das Schrumpfen beim EINklappen passiert dagegen bewusst NICHT hier, sondern erst in
+        // DrawContent (nach Begin()) - dort ist die tatsächlich benötigte Höhe der Kopfzeile bekannt
+        // (abhängig von config.CompactFontScale), hier vorher noch nicht.
+        if (!collapsed && collapsedLastFrame)
+        {
+            Size = expandedSize;
+            SizeCondition = ImGuiCond.Always;
+        }
+        else
+        {
+            SizeCondition = ImGuiCond.FirstUseEver;
+        }
+
+        collapsedLastFrame = collapsed;
 
         var alpha = 1f - System.Math.Clamp(config.CompactTransparency, 0f, 1f);
 
@@ -124,15 +178,30 @@ public class CompactOverlayWindow : Window
         // Dieselbe Grundfarbe wie das Optionsfenster (siehe ModernUi.PushStyle) - bei Transparenz=0
         // (voll undurchsichtig) sehen beide Fenster damit identisch aus.
         ImGui.PushStyleColor(ImGuiCol.WindowBg, new Vector4(0.055f, 0.063f, 0.098f, alpha));
-        ImGui.PushStyleColor(ImGuiCol.ResizeGrip, ResizeGripColor);
-        ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, ResizeGripHoveredColor);
-        ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, ResizeGripActiveColor);
+
+        // Genau wie bei der Scrollbar (siehe DrawContent) wird auch das Greifdreieck unten rechts
+        // von ImGui selbst gezeichnet, nicht über die zeilenweise IsOccluded-Prüfung - läge ein
+        // natives Fenster genau unter dieser Ecke, würde es trotzdem weiter sichtbar darüber
+        // gezeichnet. Deshalb hier komplett durchsichtig machen, statt in den normalen Farben, wenn
+        // die (grob abgeschätzte) Greif-Ecke ein natives Fenster überlappt.
+        var gripOverlapped = false;
+        if (lastWindowMax.HasValue)
+        {
+            var gripMin = lastWindowMax.Value - new Vector2(ResizeGripVisualSize, ResizeGripVisualSize);
+            var gripMax = lastWindowMax.Value;
+            gripOverlapped = nativeOverlapRects.Any(r =>
+                r.Min.X < gripMax.X && r.Max.X > gripMin.X && r.Min.Y < gripMax.Y && r.Max.Y > gripMin.Y);
+        }
+
+        ImGui.PushStyleColor(ImGuiCol.ResizeGrip, gripOverlapped ? ResizeGripHiddenColor : ResizeGripColor);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripHovered, gripOverlapped ? ResizeGripHiddenColor : ResizeGripHoveredColor);
+        ImGui.PushStyleColor(ImGuiCol.ResizeGripActive, gripOverlapped ? ResizeGripHiddenColor : ResizeGripActiveColor);
     }
 
     public override void PostDraw()
     {
         ImGui.PopStyleColor(4);
-        ImGui.PopStyleVar(3);
+        ImGui.PopStyleVar(4);
     }
 
     public override void Draw()
@@ -149,6 +218,12 @@ public class CompactOverlayWindow : Window
         // Für die Überlappungsprüfung im NÄCHSTEN Frame merken (siehe PreDraw/nativeOverlapRects).
         lastWindowMin = ImGui.GetWindowPos();
         lastWindowMax = lastWindowMin + ImGui.GetWindowSize();
+
+        // Nur merken, solange NICHT eingeklappt - sonst würde die (künstlich auf Kopfzeilenhöhe
+        // geschrumpfte) Größe versehentlich als "neue ausgeklappte Normalgröße" gespeichert und beim
+        // Ausklappen fälschlich wiederhergestellt (identisches Problem/Lösung wie in MainWindow.Draw).
+        if (!collapsed)
+            expandedSize = ImGui.GetWindowSize();
 
         // Dalamud/ImGui zeichnet grundsätzlich IMMER über dem nativen Spiel-UI (keine echte Z-Order
         // zwischen beiden möglich, siehe Plugin.GetOverlappingNativeWindowRects-Kommentar) - echte
@@ -188,6 +263,11 @@ public class CompactOverlayWindow : Window
         // verwendet werden. Nur für Datenabfragen, nicht für die angezeigte Zonenüberschrift unten.
         var effectiveTerritoryId = Plugin.ResolveEffectiveTerritoryId(currentTerritoryId);
 
+        // Titel + Schloss-/Einklapp-/Schließen-Knopf in einer Gruppe - so lässt sich ihre
+        // tatsächliche Höhe direkt danach per ImGui.GetItemRectSize() messen (siehe collapsed unten),
+        // ohne sie an eine feste, skalierungsabhängige Pixelzahl zu koppeln.
+        ImGui.BeginGroup();
+
         OutlineText("The Explorer's Codex", TitleColor);
         if (ImGui.IsItemHovered())
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
@@ -195,16 +275,18 @@ public class CompactOverlayWindow : Window
         if (ImGui.IsItemClicked())
             plugin.OpenOptions();
 
-        // Beide Knöpfe gleich groß und direkt nebeneinander ganz am rechten Rand - die reine
+        // Alle drei Knöpfe gleich groß und direkt nebeneinander ganz am rechten Rand - die reine
         // Frame-Höhe war schmaler als die tatsächlichen Icon-Glyphen (Schloss/Times), wodurch beide
-        // in ihrem eigenen Knopf beschnitten wirkten. Größe daher an der breiteren der beiden Icon-
-        // Glyphen ausgerichtet, plus ein kleiner rechter Rand, damit "x" nicht am Fensterrand klebt.
+        // in ihrem eigenen Knopf beschnitten wirkten. Größe daher an der breiteren der Icon-Glyphen
+        // ausgerichtet, plus ein kleiner rechter Rand, damit "x" nicht am Fensterrand klebt.
         float topRightIconWidth;
         using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
         {
             topRightIconWidth = MathF.Max(
                 ImGui.CalcTextSize(FontAwesomeIcon.Lock.ToIconString()).X,
-                ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X);
+                MathF.Max(
+                    ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X,
+                    ImGui.CalcTextSize(FontAwesomeIcon.ChevronUp.ToIconString()).X));
         }
 
         var topRightButtonSize = MathF.Max(ImGui.GetFrameHeight(), topRightIconWidth + ImGui.GetStyle().FramePadding.X * 2f);
@@ -216,11 +298,28 @@ public class CompactOverlayWindow : Window
             config.Save();
         }
 
+        if (DrawCollapseButtonTopRight(collapsed, topRightButtonSize, TopRightMargin))
+            collapsed = !collapsed;
+
         if (DrawCloseButtonTopRight(topRightButtonSize, TopRightMargin))
         {
             IsOpen = false;
             config.ShowCompactOverlay = false;
             config.Save();
+        }
+
+        ImGui.EndGroup();
+
+        if (collapsed)
+        {
+            // Fenster auf genau die Höhe der eben gezeichneten Kopfzeile (plus das obere/untere
+            // Innenpolster, siehe PreDraw) schrumpfen - erst jetzt (nach dem Zeichnen) bekannt, siehe
+            // Kommentar bei DrawContent-Aufruf/PreDraw. ImGuiCond.Always wirkt hier sofort, auch
+            // innerhalb desselben Begin()/End(), nicht erst nächsten Frame.
+            var windowPaddingY = ImGui.GetStyle().WindowPadding.Y;
+            var neededHeight = ImGui.GetItemRectSize().Y + windowPaddingY * 2f;
+            ImGui.SetWindowSize(new Vector2(ImGui.GetWindowSize().X, neededHeight), ImGuiCond.Always);
+            return;
         }
 
         OutlineText($"{plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
@@ -240,6 +339,11 @@ public class CompactOverlayWindow : Window
             // Plugin.IsSeasonalEventEntryCurrentlyActive) nur zeigen, wenn das zugehörige Event laut
             // grobem Namensabgleich auch wirklich gerade läuft.
             .Where(Plugin.IsSeasonalEventEntryCurrentlyActive)
+            // Bei deaktiviertem "Alle Gegenstände anzeigen" (Configuration.ShowAllItems, siehe
+            // MainWindow-Einstellungen) Einträge ausblenden, die nur durch eine noch nicht erreichte
+            // Errungenschaft/einen noch nicht freigeschalteten Rang erreichbar sind (siehe
+            // Plugin.AchievementOrRankGatedItems).
+            .Where(e => config.ShowAllItems || !Plugin.IsAchievementOrRankGated(e))
             .ToList();
 
         var afterTypeFilter = allForZone
@@ -424,6 +528,24 @@ public class CompactOverlayWindow : Window
         if (config.ShowCurrencyWallet)
             DrawCurrencyWallet(entries);
 
+        // Die Scrollbar dieser Liste ist ein von ImGui selbst gezeichnetes Chrome-Element, nicht
+        // Teil der einzelnen Zeilen oben (IsOccluded) - läge ein natives Fenster genau unter ihr,
+        // würde sie trotzdem weiter sichtbar darüber gezeichnet (Dalamud/ImGui zeichnet immer über
+        // dem nativen UI, siehe Plugin.GetOverlappingNativeWindowRects-Kommentar), und die
+        // Überdeckungs-Illusion wäre an dieser schmalen Stelle kaputt. Deshalb vorab prüfen, ob die
+        // (aus der bekannten Fenstergröße vorausberechnete) Scrollbar-Spalte überhaupt ein natives
+        // Fenster überlappt, und die Scrollbar in dem Fall für diesen Frame komplett ausblenden
+        // (ScrollbarSize=0) - scrollen per Mausrad bleibt dabei weiterhin möglich.
+        var listMin = ImGui.GetCursorScreenPos();
+        var listSize = ImGui.GetContentRegionAvail();
+        var scrollbarSize = ImGui.GetStyle().ScrollbarSize;
+        var scrollbarMin = new Vector2(listMin.X + listSize.X - scrollbarSize, listMin.Y);
+        var scrollbarMax = listMin + listSize;
+        var scrollbarOccluded = nativeOverlapRects.Any(r =>
+            r.Min.X < scrollbarMax.X && r.Max.X > scrollbarMin.X && r.Min.Y < scrollbarMax.Y && r.Max.Y > scrollbarMin.Y);
+        if (scrollbarOccluded)
+            ImGui.PushStyleVar(ImGuiStyleVar.ScrollbarSize, 0f);
+
         // Nur dieser Teil (die eigentliche Liste) soll scrollen - alles darüber (Titel, Knöpfe,
         // Status, Währungen) bleibt beim Scrollen fest stehen, size.Y=0 füllt dafür einfach den
         // Rest des (frei durch den Spieler skalierbaren) Fensters.
@@ -489,6 +611,11 @@ public class CompactOverlayWindow : Window
                 OutlineText("-", MutedColor);
                 ImGui.SameLine();
 
+                // Icon + Menge zusammen in einer Gruppe, damit EIN Hover-Bereich beide abdeckt -
+                // der Name der Währung (z.B. "Allied Seals") steht nur noch im Tooltip, nicht mehr
+                // permanent ausgeschrieben daneben, um die Zeile kompakter zu halten.
+                ImGui.BeginGroup();
+
                 if (entry.CurrencyIconId != 0)
                 {
                     var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(entry.CurrencyIconId)).GetWrapOrEmpty();
@@ -499,16 +626,37 @@ public class CompactOverlayWindow : Window
 
                 var affordable = plugin.CanAfford(entry);
                 var color = affordable ? AffordableColor : NormalColor;
-                OutlineText(entry.Currency, color);
+                OutlineText(entry.CurrencyAmount.ToString("N0"), color);
+
+                ImGui.EndGroup();
+
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(GetCurrencyLabel(entry.Currency));
+            }
+
+            // Nur sichtbar, wenn "Alle Gegenstände anzeigen" aktiviert ist (siehe Filter weiter oben
+            // in DrawContent) - bei deaktiviertem Schalter tauchen diese Einträge gar nicht erst in
+            // der Liste auf, dieser Hinweis wäre dann redundant.
+            if (Plugin.IsAchievementOrRankGated(entry))
+            {
+                ImGui.SameLine();
+                OutlineText(Loc.T("(Bedingung nicht erfüllt)", "(condition not met)"), UnsupportedColor);
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
             }
         }
 
         ImGui.EndChild();
+
+        if (scrollbarOccluded)
+            ImGui.PopStyleVar();
     }
 
     /// <summary>
-    /// Zeigt, wie viel der Spieler von jeder Währung besitzt, die für die aktuell
-    /// angezeigten (gefilterten) Einträge benötigt wird.
+    /// Zeigt entweder, wie viel der Spieler von jeder Währung besitzt, die für die aktuell
+    /// angezeigten (gefilterten, bereits auf "noch nicht besessen" gefilterten - siehe
+    /// DrawContent/entries) Einträge benötigt wird, oder (per showCurrencyCostMode umgeschaltet)
+    /// wie viel davon INSGESAMT nötig wäre, um alle diese Einträge zu kaufen.
     /// </summary>
     private void DrawCurrencyWallet(List<CollectibleEntry> entries)
     {
@@ -521,7 +669,29 @@ public class CompactOverlayWindow : Window
         if (currencies.Count == 0)
             return;
 
-        OutlineText(Loc.T("Deine Währungen:", "Your currencies:"), MutedColor);
+        var toggleSize = new Vector2(ImGui.GetTextLineHeight(), ImGui.GetTextLineHeight());
+        if (IsOccluded(toggleSize))
+        {
+            ImGui.Dummy(toggleSize);
+        }
+        else
+        {
+            bool toggled;
+            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                toggled = ImGui.Button($"{FontAwesomeIcon.ExchangeAlt.ToIconString()}##CompactCurrencyModeToggle", toggleSize);
+            if (toggled)
+                showCurrencyCostMode = !showCurrencyCostMode;
+        }
+        ImGui.SameLine();
+
+        // X-Position, an der das Label beginnt (direkt nach dem Umschalt-Knopf) - die Währungsliste
+        // darunter wird auf genau diese Spalte eingerückt (siehe SetCursorPosX unten), statt am
+        // linken Fensterrand (unter dem Knopf) zu beginnen.
+        var currencyIndentX = ImGui.GetCursorPosX();
+
+        OutlineText(showCurrencyCostMode
+            ? Loc.T("Benötigte Währung:", "Currency needed:")
+            : Loc.T("Deine Währungen:", "Your currencies:"), MutedColor);
 
         // Mehrere Währungen pro Zeile statt jeweils einer eigenen - bricht (wie die Automations-
         // Knopfreihe weiter oben) selbst in eine weitere Zeile um, sobald das kompakte Fenster
@@ -532,11 +702,14 @@ public class CompactOverlayWindow : Window
         var itemSpacing = ImGui.GetStyle().ItemSpacing.X;
         var isFirst = true;
 
+        ImGui.SetCursorPosX(currencyIndentX);
         foreach (var sample in currencies)
         {
-            var owned = plugin.GetCurrencyAmount(sample.CurrencyItemId);
+            var amount = showCurrencyCostMode
+                ? (uint)entries.Where(e => e.CurrencyItemId == sample.CurrencyItemId).Sum(e => (long)e.CurrencyAmount)
+                : plugin.GetCurrencyAmount(sample.CurrencyItemId);
             var label = GetCurrencyLabel(sample.Currency);
-            var text = $"{owned.ToString("N0", CultureInfo.InvariantCulture)} {label}";
+            var text = $"{amount.ToString("N0", CultureInfo.InvariantCulture)} {label}";
             var hasIcon = sample.CurrencyIconId != 0;
             var itemWidth = ImGui.CalcTextSize(text).X + (hasIcon ? iconSize + itemSpacing : 0f);
 
@@ -544,7 +717,10 @@ public class CompactOverlayWindow : Window
             {
                 ImGui.SameLine();
                 if (ImGui.GetCursorPosX() + itemWidth > contentMaxX)
+                {
                     ImGui.NewLine();
+                    ImGui.SetCursorPosX(currencyIndentX);
+                }
             }
             isFirst = false;
 
@@ -1140,15 +1316,16 @@ public class CompactOverlayWindow : Window
     }
 
     /// <summary>
-    /// Schloss-Icon links neben dem Schließen-Knopf - sperrt/entsperrt dieselbe Einstellung wie
+    /// Schloss-Icon links neben dem Einklapp-Knopf - sperrt/entsperrt dieselbe Einstellung wie
     /// "Fenster sperren" im Optionsfenster (config.CompactLocked), nur direkt im Overlay erreichbar,
-    /// ohne dafür extra die Optionen öffnen zu müssen.
+    /// ohne dafür extra die Optionen öffnen zu müssen. Drittes (linkestes) von drei Knöpfen ganz
+    /// rechts - siehe DrawCollapseButtonTopRight/DrawCloseButtonTopRight.
     /// </summary>
     private bool DrawLockButtonTopRight(bool locked, float buttonSize, float rightMargin)
     {
         var icon = locked ? FontAwesomeIcon.Lock : FontAwesomeIcon.LockOpen;
         var regionMaxX = ImGui.GetWindowContentRegionMax().X - rightMargin;
-        ImGui.SameLine(regionMaxX - buttonSize * 2f - ImGui.GetStyle().ItemSpacing.X);
+        ImGui.SameLine(regionMaxX - buttonSize * 3f - ImGui.GetStyle().ItemSpacing.X * 2f);
 
         var size = new Vector2(buttonSize, buttonSize);
         if (IsOccluded(size))
@@ -1168,6 +1345,37 @@ public class CompactOverlayWindow : Window
             ImGui.SetTooltip(locked
                 ? Loc.T("Fenster entsperren", "Unlock window")
                 : Loc.T("Fenster sperren (Position fixieren)", "Lock window (fix position)"));
+        }
+
+        return clicked;
+    }
+
+    /// <summary>
+    /// Ein-/Ausklapp-Knopf zwischen Schloss und Schließen-Knopf - blendet beim Einklappen alles
+    /// außer der Kopfzeile aus (siehe DrawContent/collapsed), analog zum Optionsfenster.
+    /// </summary>
+    private bool DrawCollapseButtonTopRight(bool isCollapsed, float buttonSize, float rightMargin)
+    {
+        var icon = isCollapsed ? FontAwesomeIcon.ChevronDown : FontAwesomeIcon.ChevronUp;
+        var regionMaxX = ImGui.GetWindowContentRegionMax().X - rightMargin;
+        ImGui.SameLine(regionMaxX - buttonSize * 2f - ImGui.GetStyle().ItemSpacing.X);
+
+        var size = new Vector2(buttonSize, buttonSize);
+        if (IsOccluded(size))
+        {
+            ImGui.Dummy(size);
+            return false;
+        }
+
+        bool clicked;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            clicked = ImGui.Button($"{icon.ToIconString()}##CollapseCompact", size);
+
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(isCollapsed
+                ? Loc.T("Ausklappen", "Expand")
+                : Loc.T("Einklappen", "Collapse"));
         }
 
         return clicked;
