@@ -86,6 +86,13 @@ public class Configuration : IPluginConfiguration
     // Debug
     public bool ShowDebugInfo { get; set; } = false;
 
+    // Lässt die Aetheryten-/Chocobokeep-Automation auch bereits freigeschaltete Ziele erneut
+    // anlaufen (statt nur die tatsächlich fehlenden) - zum Testen von Laufweg/Interaktion, ohne
+    // dafür einen unfertigen Account zu brauchen. Wirkt sich NUR auf die Automation-Zielliste aus,
+    // nicht auf die normale "fehlt noch"-Anzeige im Overlay.
+    public bool SimulateAetheryteAutomation { get; set; } = false;
+    public bool SimulateChocobokeepAutomation { get; set; } = false;
+
     public void Save()
     {
         Plugin.PluginInterface.SavePluginConfig(this);

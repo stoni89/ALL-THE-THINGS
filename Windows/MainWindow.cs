@@ -1006,6 +1006,25 @@ public class MainWindow : Window
         }
         ModernUi.EndCard();
 
+        ModernUi.GroupLabel(Loc.T("Simulation", "Simulation"));
+        ModernUi.BeginCard();
+        TextDisabledWrapped(Loc.T(
+            "Lässt die Automation auch bereits freigeschaltete Ziele erneut anlaufen, zum Testen von Laufweg/Interaktion. Wirkt sich nur auf die Automation aus, nicht auf die normale Anzeige im Overlay.",
+            "Makes the automation revisit already-unlocked targets too, for testing pathing/interaction. Only affects the automation, not the normal overlay display."));
+        var simulateAetheryte = config.SimulateAetheryteAutomation;
+        if (ModernUi.ToggleRow(Loc.T("Auto Aetheryte simulieren", "Simulate Auto Aetheryte"), ref simulateAetheryte))
+        {
+            config.SimulateAetheryteAutomation = simulateAetheryte;
+            config.Save();
+        }
+        var simulateChocobokeep = config.SimulateChocobokeepAutomation;
+        if (ModernUi.ToggleRow(Loc.T("Auto Chocobokeep simulieren", "Simulate Auto Chocobokeep"), ref simulateChocobokeep))
+        {
+            config.SimulateChocobokeepAutomation = simulateChocobokeep;
+            config.Save();
+        }
+        ModernUi.EndCard();
+
         ModernUi.GroupLabel(Loc.T("Debug-Dumps (ins Log schreiben)", "Debug dumps (write to log)"));
         ModernUi.BeginCard();
         DrawWrappedButtonRow(new (string Label, Action OnClick)[]

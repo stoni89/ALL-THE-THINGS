@@ -267,7 +267,7 @@ public class CompactOverlayWindow : Window
         // siehe allForZone) - die Automation reist bei Bedarf selbst mit Lifestream zwischen den
         // Bezirken hin und her (siehe AetheryteAutomation.cs).
         var missingAetherytesCity = allForZone
-            .Where(e => e.Type == CollectibleType.Aetheryte && !plugin.IsOwned(e))
+            .Where(e => e.Type == CollectibleType.Aetheryte && (config.SimulateAetheryteAutomation || !plugin.IsOwned(e)))
             .ToList();
         plugin.AetheryteAutomation.Update(missingAetherytesCity);
 
@@ -295,7 +295,7 @@ public class CompactOverlayWindow : Window
         // Ebenfalls nicht stadtweit - Chocobokeep-Standorte kommen aus GetChocobokeepEntries mit
         // exakter Zonen-Zuordnung, kein Bezirkswechsel nötig.
         var missingChocobokeepsInZone = allForZone
-            .Where(e => e.Type == CollectibleType.Chocobokeep && !plugin.IsOwned(e))
+            .Where(e => e.Type == CollectibleType.Chocobokeep && (config.SimulateChocobokeepAutomation || !plugin.IsOwned(e)))
             .ToList();
         plugin.ChocobokeepAutomation.Update(missingChocobokeepsInZone);
 
