@@ -136,7 +136,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
-            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id),
+            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id),
             CollectibleType.Chocobokeep => IsChocoboTaxiStandUnlocked(entry.Id),
             _ => false,
         };
@@ -1543,6 +1543,82 @@ public sealed class Plugin : IDalamudPlugin
     {
         ["Firebird"] = "Fiery Wings, Fiery Hearts",
     };
+
+    /// <summary>
+    /// Große-Kompanie-gebundene Quests, die durch eine übergeordnete Errungenschaft ersetzt werden -
+    /// z.B. gibt es "My Little Chocobo" für jede der drei Großen Kompanien als eigene Quest, aber
+    /// abschließbar ist immer nur die der aktuellen Kompanie; wechselt man später die Kompanie,
+    /// stünde die (nie abschließbare) Quest der neuen Kompanie sonst dauerhaft als "fehlend" da,
+    /// obwohl der Chocobo längst freigeschaltet ist (siehe Errungenschaft "My Little Chocobo",
+    /// Kategorie "Grand Company - General", die kompanieunabhängig bereits abgeschlossen ist). Wie
+    /// QuestRequiredMounts von Hand gepflegt, da auch hier keine auslesbare Verknüpfung existiert.
+    /// </summary>
+    private static readonly Dictionary<string, string> QuestObsoletedByAchievement = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["My Little Chocobo (Twin Adder)"] = "My Little Chocobo",
+        ["My Little Chocobo (Maelstrom)"] = "My Little Chocobo",
+        ["My Little Chocobo (Immortal Flames)"] = "My Little Chocobo",
+    };
+
+    private static Dictionary<uint, string>? questObsoletedByAchievementIdCache;
+
+    private static Dictionary<string, uint>? achievementIdsByNameCache;
+
+    /// <summary>
+    /// Löst einen Errungenschafts-Anzeigenamen (Englisch, exakt wie im Spiel) auf seine RowId auf -
+    /// für UnlockState.IsAchievementComplete, das eine Achievement-Zeile statt eines Namens braucht.
+    /// Analog zu ResolveQuestIdByName, einmalig aufgebaut und gecacht.
+    /// </summary>
+    private static uint? ResolveAchievementIdByName(string achievementName)
+    {
+        if (achievementIdsByNameCache == null)
+        {
+            achievementIdsByNameCache = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+            var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+            if (achievementSheet != null)
+            {
+                foreach (var row in achievementSheet)
+                {
+                    var rowName = row.Name.ToString();
+                    if (!string.IsNullOrEmpty(rowName))
+                        achievementIdsByNameCache.TryAdd(rowName, row.RowId);
+                }
+            }
+        }
+
+        return achievementIdsByNameCache.TryGetValue(achievementName, out var id) ? id : null;
+    }
+
+    /// <summary>
+    /// Siehe QuestObsoletedByAchievement - true, wenn diese Quest zwar laut QuestManager nicht
+    /// abgeschlossen ist, aber die zugehörige Errungenschaft bereits vorliegt und die Quest damit
+    /// funktional erledigt/nicht mehr annehmbar ist. Für Quests ohne Eintrag immer false. Bewusst
+    /// über die RowId statt den Namen geprüft (QuestObsoletedByAchievement einmalig dorthin
+    /// aufgelöst) - IsOwned wird an manchen Stellen (siehe MainWindow.DrawStatisticsPage) mit einem
+    /// nur-Id CollectibleEntry ohne gesetzten Name aufgerufen, ein namensbasierter Abgleich würde
+    /// dort immer ins Leere laufen.
+    /// </summary>
+    private static unsafe bool IsQuestObsoletedByAchievement(uint questId)
+    {
+        if (questObsoletedByAchievementIdCache == null)
+        {
+            questObsoletedByAchievementIdCache = new Dictionary<uint, string>();
+            foreach (var (questName, achievementName) in QuestObsoletedByAchievement)
+            {
+                var resolvedId = ResolveQuestIdByName(questName);
+                if (resolvedId != null)
+                    questObsoletedByAchievementIdCache[resolvedId.Value] = achievementName;
+            }
+        }
+
+        if (!questObsoletedByAchievementIdCache.TryGetValue(questId, out var requiredAchievement))
+            return false;
+
+        var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+        var achievementId = ResolveAchievementIdByName(requiredAchievement);
+        return achievementId != null && achievementSheet != null
+            && achievementSheet.TryGetRow(achievementId.Value, out var row) && UnlockState.IsAchievementComplete(row);
+    }
 
     private static Dictionary<string, uint>? questIdsByNameCache;
 
