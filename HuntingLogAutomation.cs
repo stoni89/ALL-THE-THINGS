@@ -375,7 +375,7 @@ public sealed class HuntingLogAutomation
         // Genau derselbe Trick wie bei GoToAutomation/AetheryteAutomation: die Karten-Flagge auf
         // die (rohe, per Plugin.OpenEntryMap umgerechnete) Zielposition setzen und vnavmesh nach
         // einem begehbaren Punkt in deren Nähe fragen.
-        Plugin.OpenEntryMap(entry);
+        Plugin.OpenEntryMap(entry, showMapWindow: false);
         var floorPoint = queryFlagToPoint.InvokeFunc();
         if (floorPoint == null)
         {

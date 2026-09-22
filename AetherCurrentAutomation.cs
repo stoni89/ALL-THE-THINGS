@@ -240,7 +240,7 @@ public sealed class AetherCurrentAutomation
         // die (rohe) Zielposition setzen und vnavmesh nach einem begehbaren Punkt in deren Nähe
         // fragen - Ätherströmungen liegen oft in der Luft/an Klippenkanten, eine reine
         // Koordinatensuche (PointOnFloor) fände dort häufig gar keinen begehbaren Punkt.
-        Plugin.OpenEntryMap(entry);
+        Plugin.OpenEntryMap(entry, showMapWindow: false);
         var floorPoint = queryFlagToPoint.InvokeFunc();
         if (floorPoint == null)
         {

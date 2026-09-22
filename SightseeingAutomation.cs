@@ -211,7 +211,7 @@ public sealed class SightseeingAutomation
         // die Zielposition setzen und vnavmesh nach einem begehbaren Punkt in deren Nähe fragen -
         // Aussichtspunkte liegen oft an Klippenkanten/erhöhten Stellen, eine reine Koordinatensuche
         // (PointOnFloor) fände dort häufig gar keinen begehbaren Punkt.
-        Plugin.OpenEntryMap(entry);
+        Plugin.OpenEntryMap(entry, showMapWindow: false);
         var floorPoint = queryFlagToPoint.InvokeFunc();
         if (floorPoint == null)
         {

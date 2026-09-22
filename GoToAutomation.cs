@@ -270,7 +270,7 @@ public sealed class GoToAutomation
         // auf der rohen Position, weil die Karten-Flagge intern großzügiger auf die Navmesh
         // gerastert wird (u.a. wichtig, da Hunting-Log-Weltpositionen mangels bekannter
         // Geländehöhe immer mit Y=0 gerechnet sind, siehe HuntingLogPositions.cs).
-        Plugin.OpenEntryMap(entry);
+        Plugin.OpenEntryMap(entry, showMapWindow: false);
         var floorPoint = queryFlagToPoint.InvokeFunc();
         if (floorPoint == null)
         {

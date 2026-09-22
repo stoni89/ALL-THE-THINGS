@@ -49,6 +49,20 @@ public sealed class ChocobokeepAutomation
     // TryDismissChocobokeepSelectString aufgerufen), bevor überhaupt geprüft wird, ob alles zu ist.
     private static readonly TimeSpan MinInteractionSettleDuration = TimeSpan.FromSeconds(2);
 
+    // Wie lange nach dem Absteigen gewartet wird, bevor überhaupt versucht wird zu interagieren -
+    // Condition[Mounted] wird schon VOR dem Ende der sichtbaren Absteige-/Lande-Animation false
+    // (reines Prüfen darauf reicht also nicht, das wurde bereits versucht) - ein Interact-Versuch
+    // mitten in dieser Animation greift nicht.
+    private static readonly TimeSpan DismountSettleDelay = TimeSpan.FromSeconds(1);
+
+    // Kurze Nachlaufzeit, NACHDEM Talk-/SelectString-Fenster wieder zu sind, bevor zum nächsten
+    // Ziel weitergemacht (und dafür ggf. sofort ein Mount-Ruf gesendet) wird - siehe identisches
+    // Problem/dieselbe Lösung in AetheryteAutomation.SimulationWindowCloseSettleDelay: ein
+    // Chat-Befehl (SendGameChatCommand), der GENAU im selben Moment wie das Zugehen eines nativen
+    // Fensters abgesetzt wird, scheint von dessen Schließ-Animation/UI-Fokuswechsel verschluckt zu
+    // werden (Mount wird laut Log gesendet, aber nie aufgestiegen).
+    private static readonly TimeSpan DialogueCloseSettleDelay = TimeSpan.FromMilliseconds(700);
+
     // Verhindert eine Endlosschleife, falls ein Chocobokeep aus irgendeinem Grund nicht erreicht/
     // gefunden werden kann - nach so vielen Versuchen wird derselbe Eintrag übersprungen.
     private const int MaxAttemptsPerTarget = 2;
@@ -70,6 +84,20 @@ public sealed class ChocobokeepAutomation
     private bool hasSeenPathRunning;
     private DateTime? interactObjectNotFoundSince;
     private DateTime lastRemountAttempt = DateTime.MinValue;
+
+    // Verhindert, dass Plugin.TryRemountAfterForcedDismount (gedacht für unfreiwilliges Absteigen
+    // beim Schwimmen) den Charakter wieder aufsitzen lässt, nachdem WIR ihn absichtlich zum
+    // Interagieren abgestiegen haben (siehe UpdateMoving/UpdateInteracting) - sonst versucht er auf
+    // dem letzten Stück zum Chocobokeep ständig wieder aufzumounten, statt zu Fuß zu interagieren
+    // (identisches Problem/dieselbe Lösung wie in AetheryteAutomation).
+    private bool hasIntentionallyDismounted;
+
+    // Ab wann das Talk-/SelectString-Fenster erstmals wieder zu war (siehe DialogueCloseSettleDelay).
+    private DateTime? dialogueClosedAt;
+
+    // Ab wann Condition[Mounted] erstmals false war, nachdem wir absichtlich abgestiegen sind
+    // (siehe DismountSettleDelay) - null, solange noch beritten.
+    private DateTime? dismountedAt;
     private readonly NavigationStuckDetector stuckDetector = new();
 
     public bool IsActive { get; private set; }
@@ -132,6 +160,8 @@ public sealed class ChocobokeepAutomation
         skippedIds.Clear();
         attemptCounts.Clear();
         interactObjectNotFoundSince = null;
+        dialogueClosedAt = null;
+        dismountedAt = null;
         StatusText = Loc.T("Automation gestartet...", "Automation started...");
     }
 
@@ -235,7 +265,7 @@ public sealed class ChocobokeepAutomation
         // Genau derselbe Trick wie bei HuntingLogAutomation/AetheryteAutomation: die Karten-Flagge
         // auf die (rohe) Zielposition setzen und vnavmesh nach einem begehbaren Punkt in deren Nähe
         // fragen.
-        Plugin.OpenEntryMap(entry);
+        Plugin.OpenEntryMap(entry, showMapWindow: false);
         var floorPoint = queryFlagToPoint.InvokeFunc();
         if (floorPoint == null)
         {
@@ -248,6 +278,9 @@ public sealed class ChocobokeepAutomation
         currentTargetEntry = entry;
         currentTargetPosition = floorPoint.Value;
         didFinalApproach = false;
+        hasIntentionallyDismounted = false;
+        dialogueClosedAt = null;
+        dismountedAt = null;
 
         if (Plugin.TryRequestAetheryteMount())
         {
@@ -316,8 +349,12 @@ public sealed class ChocobokeepAutomation
                 Plugin.TryUseSprint();
 
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
-            // erreicht ist, erneut aufsitzen.
-            Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+            // erreicht ist, erneut aufsitzen. NICHT, nachdem wir selbst absichtlich zum
+            // Interagieren abgestiegen sind (siehe hasIntentionallyDismounted) - sonst versucht der
+            // Charakter auf dem letzten Stück zum Chocobokeep wieder aufzusitzen, obwohl er
+            // absichtlich abgestiegen ist, um interagieren zu können.
+            if (!hasIntentionallyDismounted)
+                Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))
@@ -336,6 +373,12 @@ public sealed class ChocobokeepAutomation
 
         if (hasSeenPathRunning)
         {
+            // Bewusst NICHT hier schon absteigen (anders als der erste Ansatz) - diese Ankunft ist
+            // oft nur die grobe Position der Karten-Flagge, noch nicht der echte NPC-Standort (siehe
+            // UpdateInteracting/FindNearestChocobokeepObject). Würde hier schon abgestiegen, müsste
+            // der Charakter das letzte Stück zu Fuß um Gebäude/Mauern herumlaufen statt einfach dahin
+            // zu fliegen - genau das führte zum gemeldeten "läuft gegen eine Wand". Das eigentliche
+            // Absteigen passiert jetzt erst unmittelbar vor dem Interact-Versuch in UpdateInteracting.
             state = State.Interacting;
             stateEnteredAt = DateTime.UtcNow;
             hasInteractedThisCycle = false;
@@ -380,7 +423,18 @@ public sealed class ChocobokeepAutomation
                 didFinalApproach = true;
                 currentTargetPosition = gameObject.Position;
 
-                var accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, false, FinalApproachDistance);
+                // Noch beritten (die grobe Ankunft von UpdateMoving dismountet bewusst NICHT mehr,
+                // siehe dortigen Kommentar) - wenn möglich weiterhin fliegend näher heran, damit
+                // Gebäude/Mauern zwischen der groben Flaggen-Position und dem echten NPC-Standort
+                // übersprungen statt zu Fuß umlaufen werden müssen.
+                var mounted = Plugin.Condition[ConditionFlag.Mounted];
+                var accepted = false;
+                if (mounted && Plugin.CanFly)
+                    accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, true, FinalApproachDistance);
+
+                if (!accepted)
+                    accepted = pathfindAndMoveCloseTo.InvokeFunc(gameObject.Position, false, FinalApproachDistance);
+
                 if (!accepted)
                 {
                     SkipCurrent(Loc.T("Laufweg zum Objekt abgelehnt", "vnavmesh rejected the approach"));
@@ -393,6 +447,29 @@ public sealed class ChocobokeepAutomation
                 return;
             }
         }
+
+        // Jetzt (spätestens) nah genug dran - erst HIER absteigen, unmittelbar bevor interagiert
+        // wird, statt schon bei der groben Ankunft (siehe UpdateMoving) - ein Chocobokeep lässt sich
+        // beritten/fliegend nicht interagieren, und ein zu frühes Absteigen hätte den Charakter das
+        // letzte Stück zu Fuß um Hindernisse herumlaufen lassen (identisches Problem/Lösung wie in
+        // AetheryteAutomation, hier aber bewusst erst NACH statt VOR dem Final Approach).
+        // Das Absteigen selbst braucht einen Moment (Animation) - Condition[Mounted] abwarten,
+        // bevor überhaupt versucht wird zu interagieren, sonst schlägt der Interact-Versuch fehl,
+        // weil der Charakter mitten in der Absteige-Animation noch als beritten gilt.
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            Plugin.TryDismount();
+            hasIntentionallyDismounted = true;
+            dismountedAt = null;
+            return;
+        }
+
+        // Condition[Mounted] wird schon VOR dem Ende der sichtbaren Absteige-/Lande-Animation
+        // false - ein Interact-Versuch mitten in dieser Animation greift nicht (beobachtet: Klick
+        // erfolgt bereits während der Animation, ohne Wirkung). Deshalb zusätzlich noch kurz warten.
+        dismountedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - dismountedAt.Value < DismountSettleDelay)
+            return;
 
         if (!hasInteractedThisCycle)
         {
@@ -434,10 +511,30 @@ public sealed class ChocobokeepAutomation
                 return;
 
             if (Plugin.IsChocobokeepDialogueOpen() || Plugin.Condition[ConditionFlag.OccupiedInEvent] || Plugin.Condition[ConditionFlag.Occupied])
+            {
+                dialogueClosedAt = null;
+                return;
+            }
+
+            // Kurze Nachlaufzeit NACHDEM Talk-/SelectString-Fenster wieder zu sind (siehe
+            // DialogueCloseSettleDelay), bevor zum nächsten Ziel weitergemacht wird - ein Chat-
+            // Befehl (der Mount-Ruf fürs nächste Ziel), der direkt im selben Moment abgesetzt wird,
+            // scheint sonst von der Schließ-Animation/dem UI-Fokuswechsel verschluckt zu werden.
+            dialogueClosedAt ??= DateTime.UtcNow;
+            if (DateTime.UtcNow - dialogueClosedAt.Value < DialogueCloseSettleDelay)
                 return;
 
             Plugin.Log.Info($"[ChocobokeepAutomation] UpdateInteracting(#{currentTargetEntry.Id}): freigeschaltet.");
+
+            // Sofort als erledigt vermerken (nicht erst auf die vom Aufrufer übergebene
+            // missingChocobokeepsInZone-Liste verlassen) - die kommt aus Plugin.IsOwned, das den
+            // frisch gesetzten Freischalt-Flag u.U. noch einen Frame lang nicht widerspiegelt. Ohne
+            // das würde TryStartNext direkt danach denselben, gerade erst fertigen Chocobokeep erneut
+            // als "nächstgelegenes" (Distanz 0) Ziel wählen - erneutes Mounten/Absteigen/Ansprechen,
+            // bevor es endlich zum nächsten weitergeht (genau das gemeldete Verhalten).
+            skippedIds.Add(currentTargetEntry.Id);
             currentTargetEntry = null;
+            dialogueClosedAt = null;
             state = State.Idle;
             return;
         }

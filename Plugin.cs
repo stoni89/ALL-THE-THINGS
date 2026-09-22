@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
+using System.Text.RegularExpressions;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Command;
 using Dalamud.Game.Text.SeStringHandling.Payloads;
@@ -10,6 +11,7 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using Dalamud.Interface.Windowing;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Utility;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
@@ -98,6 +100,16 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = Loc.T("Öffnet The Explorer's Codex.", "Opens The Explorer's Codex.")
         });
 
+        // Siehe UpdateQuestionableWindowSuppression - Questionables eigener "/qst"-Befehl kann von
+        // hier aus nicht umgebogen werden, daher dieser eigene Befehl als Ersatz, um das (während
+        // der Quest-Automation unterdrückte) Questionable-Fenster trotzdem bei Bedarf zu zeigen.
+        CommandManager.AddHandler("/tecqst", new CommandInfo(OnShowQuestionableCommand)
+        {
+            HelpMessage = Loc.T(
+                "Zeigt/versteckt das Questionable-Fenster (auch während der Quest-Automation, wo es sonst unterdrückt wird).",
+                "Shows/hides the Questionable window (even during Quest Automation, where it's otherwise suppressed).")
+        });
+
         PluginInterface.UiBuilder.Draw += DrawUI;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUI;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUI;
@@ -108,7 +120,82 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.IsOpen = !MainWindow.IsOpen;
     }
 
-    private void DrawUI() => WindowSystem.Draw();
+    private void OnShowQuestionableCommand(string command, string args)
+    {
+        questionableWindowSuppressed = false;
+        CommandManager.ProcessCommand("/qst");
+    }
+
+    private void DrawUI()
+    {
+        UpdateQuestionableWindowSuppression();
+        WindowSystem.Draw();
+    }
+
+    // Ob das Questionable-Fenster gerade aktiv unterdrückt wird (siehe
+    // UpdateQuestionableWindowSuppression) - startet unterdrückt, wird per "/tecqst"-Befehl (siehe
+    // OnShowQuestionableCommand) freigegeben und automatisch wieder scharf gestellt, sobald das
+    // Fenster danach erneut schließt.
+    private bool questionableWindowSuppressed = true;
+
+    // Fenster-Zustand ("Active", siehe unten) vom letzten Frame - nur für die Zu-Flanke
+    // (schließen) relevant, siehe UpdateQuestionableWindowSuppression.
+    private bool questionableWindowWasOpen;
+
+    /// <summary>
+    /// Questionable bietet dafür (Stand jetzt) keine IPC an (Quellcode geprüft: nur Quest-Start/
+    /// -Status/Priority-Funktionen, keine Fenster-Steuerung) - stattdessen wird dessen Fenster
+    /// direkt über den GEMEINSAMEN ImGui-Kontext gefunden. "###Questionable" ist bewusst NUR der
+    /// ID-Teil ohne Anzeigetext (der enthält bei Questionable die Version, z.B.
+    /// "Questionable v1.5###Questionable") - laut Dear-ImGui-Konvention wird für Fenster-IDs
+    /// ausschließlich der Teil AB "###" gehasht, der Teil davor ist rein kosmetisch,
+    /// FindWindowByName("###Questionable") findet das Fenster also unabhängig von der
+    /// installierten Questionable-Version.
+    ///
+    /// Nur unterdrückt, solange UNSERE eigene Quest-Automation läuft (QuestAutomation.IsActive) -
+    /// außerhalb davon wird das Fenster komplett in Ruhe gelassen. Questionables eigenen "/qst"-
+    /// Befehl selbst umzubiegen (per CommandManager.RemoveHandler/AddHandler) scheitert auf dem
+    /// aktuell installierten Dalamud lautlos (beide Aufrufe geben false zurück - vermutlich
+    /// verhindert eine interne Eigentümer-Prüfung, dass ein FREMDES Plugin den Handler eines anderen
+    /// ersetzt). Questionables eigenes QuestWindow.PreOpenCheck() erzwingt außerdem "IsOpen = true"
+    /// die GESAMTE Automation über (nicht nur pro Quest-Schritt), die native "Active"-Flag taugt
+    /// deshalb während der Automation NICHT als Indiz für "der Spieler wollte es gerade öffnen".
+    /// Die einzige zuverlässige Freigabe ist daher der eigene Befehl "/tecqst" (siehe
+    /// OnShowQuestionableCommand), der Questionables echten "/qst"-Handler per ProcessCommand
+    /// aufruft (identisches Verhalten) und zusätzlich die Unterdrückung freigibt. Einzige Flanke,
+    /// die hier noch ausgewertet wird: offen->geschlossen schaltet die Unterdrückung automatisch
+    /// wieder scharf. Rein kosmetisch (Questionables eigener Zustand/IPC bleibt unberührt).
+    /// </summary>
+    private unsafe void UpdateQuestionableWindowSuppression()
+    {
+        if (!QuestAutomation.IsActive)
+        {
+            // Automation nicht aktiv - Fenster nicht anfassen, und für den nächsten Automationslauf
+            // wieder mit "unterdrückt" starten.
+            questionableWindowSuppressed = true;
+            questionableWindowWasOpen = false;
+            return;
+        }
+
+        try
+        {
+            var window = ImGuiP.FindWindowByName("###Questionable");
+            if (window.IsNull)
+                return;
+
+            var isOpenNow = window.Handle->Active != 0;
+            if (!isOpenNow && questionableWindowWasOpen)
+                questionableWindowSuppressed = true;
+            questionableWindowWasOpen = isOpenNow;
+
+            if (questionableWindowSuppressed)
+                window.Handle->HiddenFramesForRenderOnly = 2;
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Unterdrücken des Questionable-Fensters.");
+        }
+    }
 
     private void ToggleMainUI() => MainWindow.IsOpen = !MainWindow.IsOpen;
 
@@ -136,7 +223,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
-            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id),
+            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id) || IsQuestObsoletedByMutualExclusion(entry.Id),
             CollectibleType.Chocobokeep => IsChocoboTaxiStandUnlocked(entry.Id),
             _ => false,
         };
@@ -168,6 +255,25 @@ public sealed class Plugin : IDalamudPlugin
         addon->AtkUnitBase.FireCallbackInt(lastIndex);
         Log.Info($"[ChocobokeepAutomation] TryDismissChocobokeepSelectString: letzter Eintrag '{entryText}' (#{lastIndex}) automatisch gewählt.");
         return true;
+    }
+
+    /// <summary>
+    /// Ob eines der genannten nativen UI-Fenster (per Addon-Namen, z.B. "SelectString"/"Teleport")
+    /// gerade sichtbar ist - für die Aetheryten-Automation im Simulation-Modus (siehe
+    /// AetheryteAutomation.cs), die nach dem Testklick auf einen bereits freigeschalteten
+    /// Aetheryten wartet, bis der Spieler das dabei geöffnete Menü selbst wieder schließt, bevor
+    /// sie automatisch zum nächsten Ziel weiterzieht.
+    /// </summary>
+    public static unsafe bool IsAnyAddonVisible(params string[] addonNames)
+    {
+        foreach (var name in addonNames)
+        {
+            var addon = (AtkUnitBase*)GameGui.GetAddonByName(name).Address;
+            if (addon != null && addon->IsVisible)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1449,10 +1555,14 @@ public sealed class Plugin : IDalamudPlugin
     {
         [130] = new[] { 51u, 504u },   // Ul'dah - Steps of Nald
         [131] = new[] { 51u, 504u },   // Ul'dah - Steps of Thal
+        [178] = new[] { 51u, 504u },   // Flame Barracks (Große Kompanie Ul'dah, "Hinterraum")
         [128] = new[] { 27u, 500u },   // Limsa Lominsa Upper Decks
         [129] = new[] { 27u, 500u },   // Limsa Lominsa Lower Decks
+        [177] = new[] { 27u, 500u },   // Maelstrom Barracks (Große Kompanie Limsa, "Hinterraum")
         [132] = new[] { 39u, 506u },   // New Gridania
         [133] = new[] { 39u, 506u },   // Old Gridania
+        [534] = new[] { 39u, 506u },   // Twin Adder Barracks (Große Kompanie Gridania, "Hinterraum")
+        [598] = new[] { 39u, 506u },   // Serpent Barracks (Große Kompanie Gridania, "Hinterraum")
         [418] = new[] { 62u, 512u },   // Foundation (Ishgard)
         [419] = new[] { 62u, 512u },   // The Pillars (Ishgard)
     };
@@ -1614,6 +1724,402 @@ public sealed class Plugin : IDalamudPlugin
     };
 
     /// <summary>
+    /// Sammelobjekte, die zwar grundsätzlich existieren, aber nur durch eine noch nicht erreichte
+    /// Errungenschaft oder einen noch nicht freigeschalteten Stammes-/Grad-Rang (z.B. bei Beast-
+    /// Tribe-Händlern) tatsächlich erreichbar sind - bei deaktiviertem "Alle Gegenstände anzeigen"
+    /// (Configuration.ShowAllItems, siehe CompactOverlayWindow.DrawContent) werden genau diese
+    /// ausgeblendet, bei aktiviertem Schalter stattdessen mit einem Hinweis markiert (siehe
+    /// GetAchievementOrRankGateReason). Von Hand gepflegt (Typ + Anzeigename), da es dafür keine
+    /// zuverlässig auslesbare Verknüpfung in den Lumina-Spieldaten gibt.
+    ///
+    /// Alle Beast-Tribe-Einträge (Category "Stammes-Quest" in den Datendateien) mit einem "(Rank N)"-
+    /// Hinweis im Currency-Feld - genau diese Angabe wertet GetAchievementOrRankGateReason zur
+    /// Laufzeit aus, hier muss also nur die Liste selbst gepflegt werden, keine Rangzahl je Eintrag.
+    /// </summary>
+    private static readonly HashSet<(CollectibleType Type, string Name)> AchievementOrRankGatedItems = new()
+    {
+        // Amalj'aa
+        (CollectibleType.Minion, "Wind-up Amalj'aa"),
+        (CollectibleType.Minion, "Wind-up Founder"),
+        (CollectibleType.Mount, "Cavalry Drake"),
+        (CollectibleType.Orchestrion, "Smoulder"),
+
+        // Sylph
+        (CollectibleType.Minion, "Wind-up Sylph"),
+        (CollectibleType.Minion, "Wind-up Violet"),
+        (CollectibleType.Mount, "Laurel Goobbue"),
+        (CollectibleType.Orchestrion, "Flibbertigibbet"),
+
+        // Kobold
+        (CollectibleType.Minion, "Wind-up Kobold"),
+        (CollectibleType.Minion, "Wind-up Kobolder"),
+        (CollectibleType.Mount, "Bomb Palanquin"),
+
+        // Sahagin
+        (CollectibleType.Minion, "Wind-up Sahagin"),
+        (CollectibleType.Minion, "Wind-up Sea Devil"),
+        (CollectibleType.Mount, "Cavalry Elbst"),
+
+        // Ixal
+        (CollectibleType.Minion, "Wind-up Ixal"),
+        (CollectibleType.Minion, "Wind-up Dezul Qualan"),
+        (CollectibleType.Mount, "Direwolf"),
+
+        // Vanu Vanu
+        (CollectibleType.Mount, "Sanuwa"),
+        (CollectibleType.Orchestrion, "Coming Home"),
+
+        // Vath
+        (CollectibleType.Minion, "Wind-up Vath"),
+        (CollectibleType.Minion, "Wind-up Gnath"),
+        (CollectibleType.Mount, "Kongamato"),
+        (CollectibleType.Orchestrion, "Piece of Mind"),
+
+        // Moogles
+        (CollectibleType.Minion, "Wind-up Zundu Warrior"),
+        (CollectibleType.Minion, "Wind-up Gundu Warrior"),
+        (CollectibleType.Minion, "Wind-up Ohl Deeh"),
+        (CollectibleType.Mount, "Cloud Mallow"),
+
+        // Kojin
+        (CollectibleType.Minion, "Wind-up Kojin"),
+        (CollectibleType.Minion, "Wind-up Redback"),
+        (CollectibleType.Minion, "Zephyrous Zabuton"),
+        (CollectibleType.Mount, "Striped Ray"),
+        (CollectibleType.Emote, "Ritual Prayer"),
+        (CollectibleType.Orchestrion, "Indomitable"),
+
+        // Ananta
+        (CollectibleType.Minion, "Wind-up Ananta"),
+        (CollectibleType.Minion, "Wind-up Qalyana"),
+        (CollectibleType.Mount, "Marid"),
+        (CollectibleType.Mount, "True Griffin"),
+        (CollectibleType.Emote, "Charmed"),
+        (CollectibleType.Orchestrion, "Keepers of the Lock"),
+
+        // Namazu
+        (CollectibleType.Minion, "Attendee #777"),
+        (CollectibleType.Mount, "Mikoshi"),
+        (CollectibleType.Emote, "Yol Dance"),
+        (CollectibleType.Orchestrion, "Seven Hundred Seventy-Seven Whiskers"),
+
+        // Pixies
+        (CollectibleType.Minion, "Wind-up Pixie"),
+        (CollectibleType.Mount, "Portly Porxie"),
+        (CollectibleType.Orchestrion, "The Garden's Gates"),
+
+        // Qitari
+        (CollectibleType.Minion, "The Behatted Serpent of Ronka"),
+        (CollectibleType.Minion, "The Behelmeted Serpent of Ronka"),
+        (CollectibleType.Mount, "Great Vessel of Ronka"),
+        (CollectibleType.Orchestrion, "Hopl's Dropple"),
+
+        // Dwarves
+        (CollectibleType.Minion, "Wind-up Dragonet"),
+        (CollectibleType.Minion, "Lalinator 5.H0"),
+        (CollectibleType.Mount, "Rolling Tankard"),
+        (CollectibleType.Emote, "Lali Hop"),
+        (CollectibleType.Orchestrion, "Watts's Anvil"),
+
+        // Loporrits
+        (CollectibleType.Minion, "Findingway"),
+        (CollectibleType.Mount, "Moon-hopper"),
+        (CollectibleType.Orchestrion, "Dreamwalker"),
+        (CollectibleType.Orchestrion, "Battle 1 from FINAL FANTASY IV"),
+
+        // Pelupelu
+        (CollectibleType.Minion, "Wind-up Pelupelu"),
+        (CollectibleType.Mount, "Punutiy"),
+        (CollectibleType.FashionAccessory, "Pelupack"),
+        (CollectibleType.Orchestrion, "The Travel Agency (Dawntrail)"),
+
+        // Arkasodara
+        (CollectibleType.Minion, "Wind-up Arkasodara"),
+        (CollectibleType.Mount, "Hippo Cart"),
+        (CollectibleType.Orchestrion, "Hippo Ridin'"),
+        (CollectibleType.TripleTriadCard, "Gajasura"),
+
+        // Omicrons
+        (CollectibleType.Minion, "Lumini"),
+        (CollectibleType.Mount, "Miw Miisv"),
+        (CollectibleType.Orchestrion, "Cradle of Hope"),
+        (CollectibleType.TripleTriadCard, "N-7000"),
+
+        // Yok Huy
+        (CollectibleType.Minion, "Wind-up Yok Huy"),
+        (CollectibleType.Mount, "Vurgar the Loyal"),
+        (CollectibleType.Orchestrion, "Snowline Rollick"),
+        (CollectibleType.TripleTriadCard, "Fahrafahr"),
+
+        // Mamool Ja
+        (CollectibleType.Minion, "Ja Tiika Leafkin"),
+        (CollectibleType.Mount, "Branchbearer"),
+        (CollectibleType.Orchestrion, "Home at Heart"),
+        (CollectibleType.TripleTriadCard, "Blue Leafkin"),
+
+        // Große-Kompanie-Quartiermeister (Flame/Storm/Serpent) - siehe GrandCompanyRequiredItems
+        // unten, dort auch als GC-gebunden markiert statt nur hier gelistet.
+        (CollectibleType.Barding, "Ul'dahn Barding"),
+        (CollectibleType.Barding, "Ul'dahn Crested Barding"),
+        (CollectibleType.Barding, "Ul'dahn Half Barding"),
+        (CollectibleType.Barding, "Lominsan Barding"),
+        (CollectibleType.Barding, "Lominsan Crested Barding"),
+        (CollectibleType.Barding, "Lominsan Half Barding"),
+        (CollectibleType.Barding, "Gridanian Barding"),
+        (CollectibleType.Barding, "Gridanian Crested Barding"),
+        (CollectibleType.Barding, "Gridanian Half Barding"),
+        (CollectibleType.Minion, "Flame Hatchling"),
+        (CollectibleType.Minion, "Storm Hatchling"),
+        (CollectibleType.Minion, "Serpent Hatchling"),
+        (CollectibleType.Orchestrion, "The Hall of Flames"),
+        (CollectibleType.Orchestrion, "The Sands' Secrets"),
+        (CollectibleType.Orchestrion, "Maelstrom Command"),
+        (CollectibleType.Orchestrion, "Ripples in the Sea"),
+        (CollectibleType.Orchestrion, "Into the Adder's Den"),
+        (CollectibleType.Orchestrion, "Dewdrops & Moonbeams"),
+    };
+
+    /// <summary>
+    /// Teilmenge von AchievementOrRankGatedItems, die zusätzlich (bzw. in erster Linie) eine
+    /// Mitgliedschaft in EINER Großen Kompanie voraussetzt - die fünf "elementaren" ARR-Händler
+    /// (Amalj'aa/Sylphic/Kobold/Sahagin/Ixali Vendor, GC-Rang-gebunden) und die Flame-/Storm-/
+    /// Serpent-Quartiermeister. Ist der Charakter gar keiner Kompanie beigetreten, ist das die
+    /// eigentliche Ursache (nicht ein zu niedriger Rang) - siehe GetAchievementOrRankGateReason.
+    /// </summary>
+    private static readonly HashSet<(CollectibleType Type, string Name)> GrandCompanyRequiredItems = new()
+    {
+        (CollectibleType.Minion, "Wind-up Amalj'aa"),
+        (CollectibleType.Minion, "Wind-up Founder"),
+        (CollectibleType.Mount, "Cavalry Drake"),
+        (CollectibleType.Orchestrion, "Smoulder"),
+        (CollectibleType.Minion, "Wind-up Sylph"),
+        (CollectibleType.Minion, "Wind-up Violet"),
+        (CollectibleType.Mount, "Laurel Goobbue"),
+        (CollectibleType.Orchestrion, "Flibbertigibbet"),
+        (CollectibleType.Minion, "Wind-up Kobold"),
+        (CollectibleType.Minion, "Wind-up Kobolder"),
+        (CollectibleType.Mount, "Bomb Palanquin"),
+        (CollectibleType.Minion, "Wind-up Sahagin"),
+        (CollectibleType.Minion, "Wind-up Sea Devil"),
+        (CollectibleType.Mount, "Cavalry Elbst"),
+        (CollectibleType.Minion, "Wind-up Ixal"),
+        (CollectibleType.Minion, "Wind-up Dezul Qualan"),
+        (CollectibleType.Mount, "Direwolf"),
+        (CollectibleType.Barding, "Ul'dahn Barding"),
+        (CollectibleType.Barding, "Ul'dahn Crested Barding"),
+        (CollectibleType.Barding, "Ul'dahn Half Barding"),
+        (CollectibleType.Barding, "Lominsan Barding"),
+        (CollectibleType.Barding, "Lominsan Crested Barding"),
+        (CollectibleType.Barding, "Lominsan Half Barding"),
+        (CollectibleType.Barding, "Gridanian Barding"),
+        (CollectibleType.Barding, "Gridanian Crested Barding"),
+        (CollectibleType.Barding, "Gridanian Half Barding"),
+        (CollectibleType.Minion, "Flame Hatchling"),
+        (CollectibleType.Minion, "Storm Hatchling"),
+        (CollectibleType.Minion, "Serpent Hatchling"),
+        (CollectibleType.Orchestrion, "The Hall of Flames"),
+        (CollectibleType.Orchestrion, "The Sands' Secrets"),
+        (CollectibleType.Orchestrion, "Maelstrom Command"),
+        (CollectibleType.Orchestrion, "Ripples in the Sea"),
+        (CollectibleType.Orchestrion, "Into the Adder's Den"),
+        (CollectibleType.Orchestrion, "Dewdrops & Moonbeams"),
+    };
+
+    /// <summary>
+    /// Aktuelle GC-Rangstufe (0 = kein Rang/nicht beigetreten, 1 = Private Third Class, ...,
+    /// 11 = Captain, siehe SergeantSecondClassRank) - für IsInAnyGrandCompany und den echten
+    /// Rang-Vergleich in ComputeGrandCompanyOrTribeGateReason.
+    /// </summary>
+    private static unsafe byte CurrentGrandCompanyRank => PlayerState.Instance()->GetGrandCompanyRank();
+
+    /// <summary>
+    /// true, solange der Charakter noch KEINER der drei Großen Kompanien beigetreten ist. Über den
+    /// GC-RANG geprüft (0 = kein Rang/nicht beigetreten) - genauso zuverlässig wie über
+    /// PlayerState.GrandCompany direkt (0 dort = ebenfalls "keine", siehe CurrentGrandCompanyId),
+    /// aber semantisch klarer an dieser Stelle.
+    /// </summary>
+    public static bool IsInAnyGrandCompany() => CurrentGrandCompanyRank != 0;
+
+    /// <summary>
+    /// Rohe Kompanie-Kennung aus PlayerState.GrandCompany, 1-BASIERT wie die Lumina-"GrandCompany"-
+    /// Sheet-RowId (0 = keine, 1 = Sturmgarde/Maelstrom, 2 = Zweiter Adler/Twin Adder, 3 =
+    /// Unsterbliche Flammen/Immortal Flames) - siehe die bereits bestehende, identisch kodierte
+    /// Verwendung in IsQuestCurrentlyAcceptable ("row.GrandCompany.RowId != PlayerState.Instance()->
+    /// GrandCompany"), die nur funktioniert, wenn beide Seiten dieselbe 1-basierte Kodierung nutzen.
+    /// (Ein früherer Versuch, das auf 0-basiert "umzustellen", beruhte auf einem missverstandenen
+    /// FFXIVClientStructs-Kommentar, der eigentlich zum NACHBARFELD _GCRanks gehört - nicht zu
+    /// GrandCompany selbst - und wurde wieder zurückgenommen.)
+    /// </summary>
+    private static unsafe byte CurrentGrandCompanyId => PlayerState.Instance()->GrandCompany;
+
+    /// <summary>
+    /// Anders als die fünf "elementaren" ARR-Händler (GC-Rang-gebunden, aber unabhängig davon,
+    /// WELCHER der drei Kompanien man angehört) sind die Flame-/Storm-/Serpent-Quartiermeister-Waren
+    /// (Bardings/Hatchling-Minions/Orchestrion-Rollen) an die jeweils EIGENE Kompanie gebunden - ihre
+    /// Seelen-Währung (Flame/Storm/Serpent Seals) lässt sich nur sammeln/ausgeben, solange man genau
+    /// dieser Kompanie angehört. Von Hand gepflegt (Typ + Anzeigename -> benötigte Kompanie-Kennung,
+    /// siehe CurrentGrandCompanyId), für GetAchievementOrRankGateReason.
+    /// </summary>
+    private static readonly Dictionary<(CollectibleType Type, string Name), byte> GrandCompanySpecificItems = new()
+    {
+        // Sturmgarde / Maelstrom (Storm Quartermaster)
+        [(CollectibleType.Barding, "Lominsan Barding")] = 1,
+        [(CollectibleType.Barding, "Lominsan Crested Barding")] = 1,
+        [(CollectibleType.Barding, "Lominsan Half Barding")] = 1,
+        [(CollectibleType.Minion, "Storm Hatchling")] = 1,
+        [(CollectibleType.Orchestrion, "Maelstrom Command")] = 1,
+        [(CollectibleType.Orchestrion, "Ripples in the Sea")] = 1,
+
+        // Zweiter Adler / Twin Adder (Serpent Quartermaster)
+        [(CollectibleType.Barding, "Gridanian Barding")] = 2,
+        [(CollectibleType.Barding, "Gridanian Crested Barding")] = 2,
+        [(CollectibleType.Barding, "Gridanian Half Barding")] = 2,
+        [(CollectibleType.Minion, "Serpent Hatchling")] = 2,
+        [(CollectibleType.Orchestrion, "Into the Adder's Den")] = 2,
+        [(CollectibleType.Orchestrion, "Dewdrops & Moonbeams")] = 2,
+
+        // Unsterbliche Flammen / Immortal Flames (Flame Quartermaster)
+        [(CollectibleType.Barding, "Ul'dahn Barding")] = 3,
+        [(CollectibleType.Barding, "Ul'dahn Crested Barding")] = 3,
+        [(CollectibleType.Barding, "Ul'dahn Half Barding")] = 3,
+        [(CollectibleType.Minion, "Flame Hatchling")] = 3,
+        [(CollectibleType.Orchestrion, "The Hall of Flames")] = 3,
+        [(CollectibleType.Orchestrion, "The Sands' Secrets")] = 3,
+    };
+
+    private static string GetGrandCompanyDisplayName(byte companyId) => companyId switch
+    {
+        1 => Loc.T("Sturmgarde", "the Maelstrom"),
+        2 => Loc.T("Zweiter Adler", "the Order of the Twin Adder"),
+        3 => Loc.T("Unsterbliche Flammen", "the Immortal Flames"),
+        _ => Loc.T("einer Großen Kompanie", "a Grand Company"),
+    };
+
+    // Erkennt einen in Currency mitgeführten Rang-Hinweis wie "(Rank 4)" (siehe z.B. "25,000 Gil
+    // (Rank 4)" bei Stammes-/GC-Händlern) - für ComputeGrandCompanyOrTribeGateReason unten.
+    private static readonly Regex CurrencyRankPattern = new(@"\(Rank\s*(\d+)\)", RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Numerische GC-Rangstufe von "Sergeant Second Class" (1 = Private Third Class ... 11 =
+    /// Captain, siehe GetGrandCompanyRank) - der für Quartiermeister-Waren (Bardings/Hatchling-
+    /// Minions/Orchestrion-Rollen) nötige Rang, per Wiki verifiziert (Quelle in der Konversation).
+    /// Für alle drei Kompanien dieselbe Stufe, auch wenn der genaue Rangname je Kompanie
+    /// unterschiedlich lautet.
+    /// </summary>
+    private const byte SergeantSecondClassRank = 6;
+
+    /// <summary>
+    /// Live geprüft (nicht nur "steht in der Liste") - liefert null, wenn die Voraussetzung
+    /// inzwischen TATSÄCHLICH erfüllt ist (Kompanie stimmt UND Rang reicht), sonst den Grund als
+    /// lokalisierten Text. Für echte Stammes-Objekte (Vanu Vanu, Vath, ...) gibt es keine bekannte,
+    /// live auslesbare Ruf-Rang-API - die gelten daher weiterhin als "erfüllt unbekannt/wahrscheinlich
+    /// noch nicht" und bleiben statisch markiert, solange sie in AchievementOrRankGatedItems stehen.
+    /// </summary>
+    private static string? ComputeGrandCompanyOrTribeGateReason(CollectibleEntry entry)
+    {
+        // Quartiermeister-Waren (Bardings/Hatchling-Minions/Orchestrion-Rollen) sind an die JEWEILS
+        // EIGENE Kompanie gebunden (siehe GrandCompanySpecificItems-Kommentar).
+        if (GrandCompanySpecificItems.TryGetValue((entry.Type, entry.Name), out var requiredCompanyId))
+        {
+            // WICHTIG: erst auf "überhaupt beigetreten" prüfen (über den Rang, siehe
+            // IsInAnyGrandCompany-Kommentar), bevor CurrentGrandCompanyId verglichen wird - dessen
+            // "0" bedeutet Sturmgarde, nicht "keine Kompanie", ein nicht beigetretener Charakter
+            // würde sonst fälschlich als Sturmgarde-Mitglied durchgehen.
+            if (!IsInAnyGrandCompany())
+            {
+                var requiredCompanyNameForNone = GetGrandCompanyDisplayName(requiredCompanyId);
+                return Loc.T(
+                    $"Du bist noch keiner Großen Kompanie beigetreten (benötigt: {requiredCompanyNameForNone}).",
+                    $"You have not joined a Grand Company yet (requires {requiredCompanyNameForNone}).");
+            }
+
+            if (CurrentGrandCompanyId != requiredCompanyId)
+            {
+                var requiredCompanyName = GetGrandCompanyDisplayName(requiredCompanyId);
+                return Loc.T(
+                    $"Du bist nicht {requiredCompanyName} beigetreten.",
+                    $"You have not joined {requiredCompanyName}.");
+            }
+
+            // Richtige Kompanie - jetzt den TATSÄCHLICHEN Rang gegen die nötige Stufe prüfen, statt
+            // die Meldung blind anzuzeigen, nur weil der Eintrag in der Liste steht (das führte dazu,
+            // dass Spieler mit längst ausreichendem Rang trotzdem "Rang fehlt" zu sehen bekamen).
+            if (CurrentGrandCompanyRank >= SergeantSecondClassRank)
+                return null;
+
+            var companyNameForRank = GetGrandCompanyDisplayName(requiredCompanyId);
+            return Loc.T(
+                $"Benötigt bei {companyNameForRank} den GC-Rang \"Sergeant Second Class\" (bzw. die entsprechende Stufe).",
+                $"Requires the GC rank \"Sergeant Second Class\" (or the equivalent tier) with {companyNameForRank}.");
+        }
+
+        // Die fünf "elementaren" ARR-Händler (Amalj'aa/Sylphic/Kobold/Sahagin/Ixali Vendor) sind
+        // an den GC-RANG gebunden, aber NICHT an eine bestimmte der drei Kompanien.
+        if (GrandCompanyRequiredItems.Contains((entry.Type, entry.Name)))
+        {
+            if (!IsInAnyGrandCompany())
+            {
+                return Loc.T(
+                    "Du bist noch keiner Großen Kompanie beigetreten.",
+                    "You have not joined a Grand Company yet.");
+            }
+
+            var gcRankMatch = CurrencyRankPattern.Match(entry.Currency ?? string.Empty);
+            if (gcRankMatch.Success && byte.TryParse(gcRankMatch.Groups[1].Value, out var requiredGcRank))
+            {
+                if (CurrentGrandCompanyRank >= requiredGcRank)
+                    return null;
+
+                // Zwar tatsächlich ein GC-Rang (siehe Kommentar oben, nicht Stammes-Ruf), aber zur
+                // Wiedererkennung mit dem Namen aus dem Vendor-Feld beschriftet (z.B. "Amalj'aa" aus
+                // "Amalj'aa Vendor") - "GC-Rang X" allein war zu unklar, WELCHER der fünf Händler
+                // gemeint ist.
+                var vendorTribeName = (entry.Vendor ?? string.Empty).Replace("Vendor", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+                return string.IsNullOrEmpty(vendorTribeName)
+                    ? Loc.T($"Benötigt GC-Rang {requiredGcRank}.", $"Requires GC rank {requiredGcRank}.")
+                    : Loc.T($"Benötigt {vendorTribeName}-Rang {requiredGcRank}.", $"Requires {vendorTribeName} rank {requiredGcRank}.");
+            }
+
+            return Loc.T(
+                "Voraussetzung (Errungenschaft/Rang) noch nicht erfüllt.",
+                "Requirement (achievement/rank) not yet met.");
+        }
+
+        // Übrig bleiben die echten Stammes-Objekte (Vanu Vanu, Vath, Moogles, ...) - deren Ruf-Rang
+        // lässt sich hier (noch) nicht live auslesen, daher bleibt nur die Textanzeige, keine
+        // echte Erfüllt/Nicht-erfüllt-Prüfung.
+        if (AchievementOrRankGatedItems.Contains((entry.Type, entry.Name)))
+        {
+            var tribeRankMatch = CurrencyRankPattern.Match(entry.Currency ?? string.Empty);
+            if (tribeRankMatch.Success)
+            {
+                var rank = tribeRankMatch.Groups[1].Value;
+                var tribeName = (entry.Vendor ?? string.Empty).Replace("Vendor", string.Empty, StringComparison.OrdinalIgnoreCase).Trim();
+                return string.IsNullOrEmpty(tribeName)
+                    ? Loc.T($"Benötigt Stammesrang {rank}.", $"Requires tribe rank {rank}.")
+                    : Loc.T($"Benötigt {tribeName}-Stammesrang {rank}.", $"Requires {tribeName} tribe rank {rank}.");
+            }
+
+            return Loc.T(
+                "Voraussetzung (Errungenschaft/Rang) noch nicht erfüllt.",
+                "Requirement (achievement/rank) not yet met.");
+        }
+
+        return null;
+    }
+
+    public static bool IsAchievementOrRankGated(CollectibleEntry entry) =>
+        ComputeGrandCompanyOrTribeGateReason(entry) != null;
+
+    /// <summary>
+    /// Erklärt, WAS genau bei einem als gated erkannten Eintrag fehlt (z.B. "Benötigt Kobold-Rang
+    /// 4") - für den Hover-Tooltip neben dem "Bedingung nicht erfüllt"-Hinweis im Overlay. Sollte
+    /// nur aufgerufen werden, wenn IsAchievementOrRankGated bereits true zurückgegeben hat.
+    /// </summary>
+    public static string GetAchievementOrRankGateReason(CollectibleEntry entry) =>
+        ComputeGrandCompanyOrTribeGateReason(entry) ?? string.Empty;
+
+    /// <summary>
     /// Große-Kompanie-gebundene Quests, die durch eine übergeordnete Errungenschaft ersetzt werden -
     /// z.B. gibt es "My Little Chocobo" für jede der drei Großen Kompanien als eigene Quest, aber
     /// abschließbar ist immer nur die der aktuellen Kompanie; wechselt man später die Kompanie,
@@ -1687,6 +2193,86 @@ public sealed class Plugin : IDalamudPlugin
         var achievementId = ResolveAchievementIdByName(requiredAchievement);
         return achievementId != null && achievementSheet != null
             && achievementSheet.TryGetRow(achievementId.Value, out var row) && UnlockState.IsAchievementComplete(row);
+    }
+
+    /// <summary>
+    /// Quest-Gruppen, von denen ein Charakter aus Spielsystem-Gründen (Startstadt/Große Kompanie)
+    /// nur EINE jemals annehmen/abschließen kann - z.B. "Coming to Limsa Lominsa"/"Coming to
+    /// Ul'dah"/"Coming to Gridania" (an die Startstadt gebunden) oder "An Ill-conceived Venture"
+    /// (an die aktuelle Große Kompanie gebunden, alle drei GC-Varianten tragen dabei sogar denselben
+    /// Anzeigenamen - siehe ResolveAllQuestIdsByName) - die jeweils anderen bleiben für diesen
+    /// Charakter dauerhaft nicht abschließbar und stünden sonst fälschlich als "fehlend" da. Ist
+    /// irgendeine Quest einer Gruppe abgeschlossen, gelten alle anderen Quests derselben Gruppe als
+    /// erledigt (siehe IsQuestObsoletedByMutualExclusion). Von Hand gepflegt wie
+    /// QuestObsoletedByAchievement, wird nur ergänzt, wenn konkrete Quests genannt werden.
+    /// </summary>
+    private static readonly string[][] MutuallyExclusiveQuestGroups =
+    {
+        new[] { "Coming to Limsa Lominsa", "Coming to Ul'dah", "Coming to Gridania" },
+        new[] { "An Ill-conceived Venture" },
+    };
+
+    private static Dictionary<uint, uint[]>? mutuallyExclusiveQuestIdsCache;
+
+    private static Dictionary<string, List<uint>>? questIdsByNameMultiCache;
+
+    /// <summary>
+    /// Wie ResolveQuestIdByName, aber liefert ALLE Zeilen mit diesem Anzeigenamen statt nur der
+    /// ersten - nötig für MutuallyExclusiveQuestGroups: manche Quest-Gruppen (z.B. die drei Große-
+    /// Kompanie-Varianten von "An Ill-conceived Venture") tragen im Gegensatz zu den "Coming to
+    /// X"-Quests exakt denselben Namen für alle Varianten, ein Name -> EINE RowId-Cache (siehe
+    /// questIdsByNameCache) würde hier zwei der drei Zeilen verschlucken.
+    /// </summary>
+    private static IReadOnlyList<uint> ResolveAllQuestIdsByName(string questName)
+    {
+        if (questIdsByNameMultiCache == null)
+        {
+            questIdsByNameMultiCache = new Dictionary<string, List<uint>>(StringComparer.OrdinalIgnoreCase);
+            var questSheet = DataManager.GetExcelSheet<Quest>();
+            if (questSheet != null)
+            {
+                foreach (var row in questSheet)
+                {
+                    var rowName = row.Name.ToString();
+                    if (string.IsNullOrEmpty(rowName))
+                        continue;
+
+                    if (!questIdsByNameMultiCache.TryGetValue(rowName, out var ids))
+                        questIdsByNameMultiCache[rowName] = ids = new List<uint>();
+
+                    ids.Add(row.RowId);
+                }
+            }
+        }
+
+        return questIdsByNameMultiCache.TryGetValue(questName, out var result) ? result : Array.Empty<uint>();
+    }
+
+    /// <summary>
+    /// Siehe MutuallyExclusiveQuestGroups - true, wenn diese Quest zwar laut QuestManager nicht
+    /// abgeschlossen ist, aber eine ANDERE Quest aus derselben (sich gegenseitig ausschließenden)
+    /// Gruppe bereits abgeschlossen wurde (der Charakter also nachweislich in einer anderen
+    /// Startstadt/Großen Kompanie begonnen hat bzw. steckt). Für Quests ohne Gruppenzugehörigkeit
+    /// immer false.
+    /// </summary>
+    private static bool IsQuestObsoletedByMutualExclusion(uint questId)
+    {
+        if (mutuallyExclusiveQuestIdsCache == null)
+        {
+            mutuallyExclusiveQuestIdsCache = new Dictionary<uint, uint[]>();
+            foreach (var group in MutuallyExclusiveQuestGroups)
+            {
+                var resolvedIds = group.SelectMany(ResolveAllQuestIdsByName).Distinct().ToArray();
+
+                foreach (var id in resolvedIds)
+                    mutuallyExclusiveQuestIdsCache[id] = resolvedIds.Where(other => other != id).ToArray();
+            }
+        }
+
+        if (!mutuallyExclusiveQuestIdsCache.TryGetValue(questId, out var siblingQuestIds))
+            return false;
+
+        return siblingQuestIds.Any(id => QuestManager.IsQuestComplete((ushort)id));
     }
 
     private static Dictionary<string, uint>? questIdsByNameCache;
@@ -1770,8 +2356,21 @@ public sealed class Plugin : IDalamudPlugin
     /// (siehe GetAllTrackedQuestIds/MainWindow.DrawStatisticsPage) genutzt werden kann, ohne sie
     /// doppelt zu pflegen.
     /// </summary>
+    /// <summary>
+    /// Quests, die laut Lumina-Sheet zwar noch existieren (und ohne diese Sperre fälschlich als
+    /// "annehmbar" durchgehen würden), im Spiel selbst aber nicht mehr vergeben werden (z.B. durch
+    /// einen späteren Patch entfernter NPC/entfernte Questkette) - von Hand gepflegt, wird nur
+    /// ergänzt, wenn konkrete Quests genannt werden.
+    /// </summary>
+    private static readonly HashSet<string> RemovedQuestNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "He's Got a Ticket to Ride",
+    };
+
     private unsafe bool IsQuestCurrentlyAcceptable(Quest row, byte playerLevel)
     {
+        if (RemovedQuestNames.Contains(row.Name.ToString()))
+            return false;
         if (row.IsRepeatable)
             return false;
         if (row.BeastTribe.RowId != 0)
@@ -2459,9 +3058,29 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Öffnet die Ingame-Karte mit einer Flagge auf der Händler-Position des Eintrags.
+    /// Blendet sofort das native Karten-Fenster ("AreaMap") aus, das GameGui.OpenMapWithMapLink als
+    /// Nebeneffekt immer mit öffnet - für Automationen, die die Karten-Flagge nur intern setzen, um
+    /// über vnavmesh FlagToPoint einen begehbaren Punkt zu bekommen (siehe OpenVendorMap/
+    /// OpenEntryMap mit showMapWindow=false), und die Karte dabei NICHT sichtbar öffnen sollen.
+    /// Setzt nur die Sichtbarkeits-Flag direkt (kein Close/Hide mit Callback), damit die zuvor
+    /// gesetzte Flaggen-Position selbst unangetastet bleibt - dieselbe Technik wie bei
+    /// SuppressQuestionableWindow, nur für ein natives ATK-Addon statt ein ImGui-Fenster.
     /// </summary>
-    public static void OpenVendorMap(CollectibleEntry entry)
+    private static unsafe void SuppressMapWindow()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("AreaMap").Address;
+        if (addon != null)
+            addon->IsVisible = false;
+    }
+
+    /// <summary>
+    /// Öffnet die Ingame-Karte mit einer Flagge auf der Händler-Position des Eintrags. Mit
+    /// showMapWindow=false wird die Flagge zwar gesetzt (z.B. für vnavmesh FlagToPoint), das dabei
+    /// von GameGui.OpenMapWithMapLink automatisch mit geöffnete Karten-Fenster aber sofort wieder
+    /// unterdrückt (siehe SuppressMapWindow) - für Automationen, die die Karte nur intern als
+    /// Positions-Trick brauchen, nicht weil der Spieler wirklich einen Kartenlink angeklickt hat.
+    /// </summary>
+    public static void OpenVendorMap(CollectibleEntry entry, bool showMapWindow = true)
     {
         if (!entry.HasVendorLocation)
             return;
@@ -2469,6 +3088,8 @@ public sealed class Plugin : IDalamudPlugin
         var territoryForFlag = entry.FlagTerritoryTypeId ?? entry.TerritoryTypeId;
         var payload = new MapLinkPayload(territoryForFlag, entry.MapId, entry.VendorMapX, entry.VendorMapY);
         GameGui.OpenMapWithMapLink(payload);
+        if (!showMapWindow)
+            SuppressMapWindow();
 
         // Für den Wegweiser-Pfeil (siehe NavigationTargetPosition) - bevorzugt über dieselbe vnavmesh-
         // IPC aufgelöst, die die Automationen auch fürs tatsächliche Laufen benutzen (steht nur zur
@@ -2507,11 +3128,11 @@ public sealed class Plugin : IDalamudPlugin
     /// vorzuberechnen und zu speichern. Ohne bekannte Position (weder Kartenkoordinate noch
     /// Weltposition) passiert nichts - das Icon dafür wird dann ohnehin nicht angezeigt.
     /// </summary>
-    public static void OpenEntryMap(CollectibleEntry entry)
+    public static void OpenEntryMap(CollectibleEntry entry, bool showMapWindow = true)
     {
         if (entry.HasVendorLocation)
         {
-            OpenVendorMap(entry);
+            OpenVendorMap(entry, showMapWindow);
             return;
         }
 
@@ -2528,6 +3149,8 @@ public sealed class Plugin : IDalamudPlugin
         var territoryForFlag = entry.FlagTerritoryTypeId ?? entry.TerritoryTypeId;
         var payload = new MapLinkPayload(territoryForFlag, entry.MapId, mapCoords.X, mapCoords.Y);
         GameGui.OpenMapWithMapLink(payload);
+        if (!showMapWindow)
+            SuppressMapWindow();
 
         SetNavigationTarget(worldPosition, entry.Name, territoryForFlag);
     }
@@ -2965,7 +3588,8 @@ public sealed class Plugin : IDalamudPlugin
         // Zusätzlich: alle 10 Teil-Ränge der aktuellen Zehner-Stufe (siehe GetHuntingLogEntries-
         // Kommentar) mit ihren bis zu 4 Zielen, Fortschritt und PlaceNameZone-RowIds, plus der
         // PlaceName-RowId der aktuellen Zone zum Abgleich.
-        var classId = player?.ClassJob.RowId ?? 0;
+        var classId = ResolveHuntingLogClassId(player?.ClassJob.RowId ?? 0);
+        Log.Info($"[HuntingLogDebug] Für Hunting Log verwendete Basisklasse-RowId={classId} (Job-RowId={player?.ClassJob.RowId}).");
         var tier = manager->RankData[0].Rank;
         var noteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.MonsterNote>();
         if (noteSheet == null)
@@ -3194,6 +3818,25 @@ public sealed class Plugin : IDalamudPlugin
     private static readonly Dictionary<uint, Vector3> ManualHuntingLogPositions = HuntingLogPositions.Positions;
 
     /// <summary>
+    /// Löst eine ClassJob-RowId auf die BASISKLASSE auf, unter der das Hunting Log tatsächlich
+    /// geführt wird (z.B. Paladin #19 -> Gladiator #1) - per Debug-Dump bestätigt: Sobald ein
+    /// Charakter zum Job aufgestiegen ist, liefert player.ClassJob.RowId die JOB-RowId (z.B. 19 für
+    /// Paladin), die Hunting-Log-Zeilen im Lumina-Sheet "MonsterNote" sind aber weiterhin unter der
+    /// BASISKLASSEN-RowId (1) einsortiert - mit der Job-RowId direkt in der ClassId*10000-Formel
+    /// gerechnet, wurden dadurch nie existierende Zeilen (z.B. 190011) gesucht, alle Einträge des
+    /// Jobs blieben unsichtbar. Lumina.ClassJob.ClassJobParent zeigt für Jobs auf ihre Basisklasse
+    /// (0 = keine, d.h. selbst schon eine Basisklasse/ein Handwerks-/Sammelberuf).
+    /// </summary>
+    private static uint ResolveHuntingLogClassId(uint classJobRowId)
+    {
+        var classJobSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.ClassJob>();
+        if (classJobSheet != null && classJobSheet.TryGetRow(classJobRowId, out var row) && row.ClassJobParent.RowId != 0)
+            return row.ClassJobParent.RowId;
+
+        return classJobRowId;
+    }
+
+    /// <summary>
     /// Berechnet die Hunting-Log-Einträge des AKTUELL AKTIVEN Rangs der AKTUELLEN Klasse, die zur
     /// übergebenen Zone gehören - live pro Frame berechnet (nicht gecacht wie GetLiveZoneEntries,
     /// da sich der Kill-Fortschritt laufend ändert). Quelle ist Slot 0 von FFXIVClientStructs'
@@ -3207,10 +3850,11 @@ public sealed class Plugin : IDalamudPlugin
     /// Fortschritt JEDES der 10 Teil-Ränge parallel (Index 3 z.B. "Klasse 04"). Jede Lumina-
     /// "MonsterNote"-Zeile ist EIN Teil-Rang (mit bis zu 4 Zielen + paralleler Count-Anforderung);
     /// die RowId dafür kommt über dieselbe Formel wie AgentMonsterNote.GetMonsterNoteIdForIndex
-    /// (ClassId * 10000 + Stufe*10 + Teil-Rang-Index + 1) - ClassId wird dabei mit der Lumina-
-    /// ClassJob-RowId gleichgesetzt (beim Gladiator sind beide 1, für andere Klassen noch nicht
-    /// querverifiziert). Bereits abgeschlossene Teil-Ränge (alle Ziele erreicht) werden nicht mehr
-    /// angezeigt - das Spiel selbst hakt sie dann ab, statt sie weiter als "zu tun" zu listen.
+    /// (ClassId * 10000 + Stufe*10 + Teil-Rang-Index + 1) - ClassId ist dabei bewusst die BASISKLASSE,
+    /// nicht der aktuelle Job (siehe ResolveHuntingLogClassId, per Debug-Dump bestätigt: als Paladin
+    /// wird trotzdem unter Gladiator #1 gesucht). Bereits abgeschlossene Teil-Ränge (alle Ziele
+    /// erreicht) werden nicht mehr angezeigt - das Spiel selbst hakt sie dann ab, statt sie weiter
+    /// als "zu tun" zu listen.
     /// </summary>
     public unsafe List<CollectibleEntry> GetHuntingLogEntries(uint territoryId)
     {
@@ -3220,7 +3864,7 @@ public sealed class Plugin : IDalamudPlugin
         if (player == null)
             return result;
 
-        var classId = player.ClassJob.RowId;
+        var classId = ResolveHuntingLogClassId(player.ClassJob.RowId);
         var className = player.ClassJob.ValueNullable?.Name.ToString();
         if (classId == 0 || string.IsNullOrEmpty(className))
             return result;
@@ -3355,6 +3999,7 @@ public sealed class Plugin : IDalamudPlugin
         QuestAutomation.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
+        CommandManager.RemoveHandler("/tecqst");
 
         PluginInterface.UiBuilder.Draw -= DrawUI;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUI;

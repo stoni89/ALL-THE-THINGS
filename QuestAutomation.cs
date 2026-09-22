@@ -346,7 +346,10 @@ public sealed class QuestAutomation
                     if (isHome)
                         TryStartNext(missingQuestsInZone);
                     else
+                    {
+                        Plugin.Log.Info($"[QuestAutomation] Idle: nicht daheim (homeTerritoryId={homeTerritoryId}, currentEffectiveTerritoryId={currentEffectiveTerritoryId}) - starte TryTravelHome.");
                         TryTravelHome(currentEffectiveTerritoryId);
+                    }
                     break;
 
                 case State.WaitingForPickup:
@@ -387,6 +390,7 @@ public sealed class QuestAutomation
                             // Die Zonen-Prüfung (siehe oben) passiert erst im NÄCHSTEN Update-Aufruf im
                             // Idle-Zweig - nicht hier mitten in der Quest, sonst würde eine gerade von
                             // Questionable selbst durchgeführte Reise unterbrochen.
+                            Plugin.Log.Info($"[QuestAutomation] Running->Idle: Quest '{currentQuestName}' ({currentQuestId}) fertig, currentEffectiveTerritoryId={currentEffectiveTerritoryId}.");
                             runningWentFalseAt = null;
                             state = State.Idle;
                             currentQuestId = null;
@@ -426,6 +430,7 @@ public sealed class QuestAutomation
 
         if (!IsLifestreamAvailable())
         {
+            Plugin.Log.Info("[QuestAutomation] TryTravelHome: Lifestream nicht verfügbar - Automation wird gestoppt.");
             StatusText = Loc.T(
                 "Kann nicht zur Startzone zurückreisen (Lifestream nicht gefunden) - Automation gestoppt.",
                 "Can't travel back to the starting zone (Lifestream not found) - automation stopped.");
@@ -434,6 +439,7 @@ public sealed class QuestAutomation
         }
 
         var homeDistrictIds = Plugin.GetSplitCityTerritories(homeTerritoryId.Value);
+        Plugin.Log.Info($"[QuestAutomation] TryTravelHome: homeTerritoryId={homeTerritoryId}, homeDistrictIds=[{string.Join(",", homeDistrictIds)}], currentEffectiveTerritoryId={currentEffectiveTerritoryId}.");
 
         // Erst kostenlos per Aethernetz versuchen - klappt nur, wenn man noch in Reichweite
         // desselben Stadtnetzwerks ist (z.B. die Quest hat nur in einen Nachbarbezirk geführt),
@@ -441,10 +447,13 @@ public sealed class QuestAutomation
         foreach (var territory in homeDistrictIds)
         {
             var anyUnlockedId = Plugin.FindAnyUnlockedAetheryteInTerritory(territory);
+            Plugin.Log.Info($"[QuestAutomation] TryTravelHome: Aethernetz-Suche in Territory {territory} -> anyUnlockedId={anyUnlockedId}.");
             if (anyUnlockedId == null)
                 continue;
 
-            if (lifestreamAethernetTeleportById.InvokeFunc(anyUnlockedId.Value))
+            var aethernetAccepted = lifestreamAethernetTeleportById.InvokeFunc(anyUnlockedId.Value);
+            Plugin.Log.Info($"[QuestAutomation] TryTravelHome: Aethernetz-Sprung zu {anyUnlockedId} -> accepted={aethernetAccepted}.");
+            if (aethernetAccepted)
             {
                 state = State.TravelingHome;
                 stateEnteredAt = DateTime.UtcNow;
@@ -464,6 +473,7 @@ public sealed class QuestAutomation
             if (mainAetheryteId != null)
                 break;
         }
+        Plugin.Log.Info($"[QuestAutomation] TryTravelHome: mainAetheryteId={mainAetheryteId}.");
 
         // Weder Aethernetz noch bezahlter Teleport möglich (kein Aetheryte dort freigeschaltet, oder
         // der Teleport wurde abgelehnt, z.B. "Insufficient gil") - statt endlos zu warten oder ganz
@@ -471,6 +481,7 @@ public sealed class QuestAutomation
         // direkt hier mit den dortigen fehlenden Quests weiter (gibt es dort keine mehr, beendet sie
         // sich gleich danach ganz regulär über "Keine Quests mehr übrig").
         var accepted = mainAetheryteId.HasValue && lifestreamTeleport.InvokeFunc(mainAetheryteId.Value, (byte)0);
+        Plugin.Log.Info($"[QuestAutomation] TryTravelHome: bezahlter Teleport zu {mainAetheryteId} -> accepted={accepted}.");
         if (!accepted)
         {
             homeTerritoryId = currentEffectiveTerritoryId;
@@ -508,6 +519,7 @@ public sealed class QuestAutomation
             // Zone weiter als "nicht daheim" erkennen und denselben, deterministisch wieder
             // scheiternden Reiseversuch endlos wiederholen, statt jemals weiterzumachen.
             var arrivedHome = Plugin.GetSplitCityTerritories(homeTerritoryId!.Value).Contains(currentEffectiveTerritoryId);
+            Plugin.Log.Info($"[QuestAutomation] UpdateTravelingHome: Lifestream fertig, homeTerritoryId={homeTerritoryId}, currentEffectiveTerritoryId={currentEffectiveTerritoryId}, arrivedHome={arrivedHome}, travelHomeFailureCount={travelHomeFailureCount}.");
             if (!arrivedHome && ++travelHomeFailureCount <= MaxTravelHomeAttempts)
             {
                 // Noch Versuche übrig - im nächsten Idle-Durchlauf erneut versuchen.

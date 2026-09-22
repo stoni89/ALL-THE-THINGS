@@ -49,6 +49,12 @@ public class Configuration : IPluginConfiguration
     // läuft per vnavmesh/Lifestream automatisch zum Fundort, siehe GoToAutomation.
     public bool ShowGoToIcon { get; set; } = true;
 
+    // Standardmäßig AN: zeigt auch Sammelobjekte, die aktuell nur durch eine noch nicht erreichte
+    // Errungenschaft oder einen noch nicht erreichten Stammes-/Grad-Rang erreichbar sind (siehe
+    // Plugin.AchievementOrRankGatedItems, von Hand gepflegte Liste). Deaktiviert blendet genau diese
+    // Einträge aus, statt sie als vermeintlich "gleich erreichbar" mit allen anderen zu vermischen.
+    public bool ShowAllItems { get; set; } = true;
+
     // Reihe der Automation-Start/Stopp-Knöpfe (Quest/Aetheryte/Hunting Log/Ätherströmung/Sightseeing/
     // Chocobokeep) im Overlay - die Automationen selbst laufen unabhängig davon weiter, nur die
     // Knöpfe zum Starten/Stoppen werden ein-/ausgeblendet.
