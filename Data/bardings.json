@@ -525,7 +525,7 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  1200,
-        "Source":  "Enie - The Firmament - 1,200 Skybuilders\u0027 Scrips / FÃªte Present"
+        "Source":  "Enie - The Firmament - 1,200 Skybuilders\u0027 Scrips / Fête Present"
     },
     {
         "Id":  75,
@@ -909,7 +909,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Armorer - Containment Bay Z1T9 (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Armorer - Containment Bay Z1T9 (Extreme) / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  51,
@@ -957,7 +957,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Goldsmith - Containment Bay P1T6 (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Goldsmith - Containment Bay P1T6 (Extreme) / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  49,
@@ -966,9 +966,9 @@
         "Category":  "Goldene Sammelstelle",
         "TerritoryTypeId":  144,
         "MapId":  196,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "Vendor":  "Gold Saucer Attendant",
+        "VendorMapX":  5.1,
+        "VendorMapY":  6.6,
         "Currency":  "150,000 MGP",
         "CurrencyIconId":  65025,
         "CurrencyItemId":  29,
@@ -1005,7 +1005,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Leatherworker - The Minstrel\u0027s Ballad: Nidhogg\u0027s Rage / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Leatherworker - The Minstrel\u0027s Ballad: Nidhogg\u0027s Rage / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  44,
@@ -1037,7 +1037,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Leatherworker - Containment Bay S1T7 (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Leatherworker - Containment Bay S1T7 (Extreme) / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  42,
@@ -1101,7 +1101,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Armorer - Thok ast Thok (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Armorer - Thok ast Thok (Extreme) / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  34,
@@ -1117,7 +1117,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Armorer - Limitless Blue (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present / Zadnor Lockbox"
+        "Source":  "Crafted by Armorer - Limitless Blue (Extreme) / Heaven-on-High - Silver Sack / Fête Present / Zadnor Lockbox"
     },
     {
         "Id":  38,
@@ -1222,9 +1222,9 @@
         "Category":  "Goldene Sammelstelle",
         "TerritoryTypeId":  144,
         "MapId":  196,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "Vendor":  "Gold Saucer Attendant",
+        "VendorMapX":  5.1,
+        "VendorMapY":  6.6,
         "Currency":  "20,000 MGP",
         "CurrencyIconId":  65025,
         "CurrencyItemId":  29,
@@ -1261,7 +1261,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Leatherworker - The Akh Afah Amphitheatre (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present"
+        "Source":  "Crafted by Leatherworker - The Akh Afah Amphitheatre (Extreme) / Heaven-on-High - Silver Sack / Fête Present"
     },
     {
         "Id":  27,
@@ -1293,7 +1293,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Leatherworker - The Striking Tree (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present"
+        "Source":  "Crafted by Leatherworker - The Striking Tree (Extreme) / Heaven-on-High - Silver Sack / Fête Present"
     },
     {
         "Id":  26,
@@ -1325,7 +1325,7 @@
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Crafted by Armorer - The Whorleater (Extreme) / Heaven-on-High - Silver Sack / FÃªte Present"
+        "Source":  "Crafted by Armorer - The Whorleater (Extreme) / Heaven-on-High - Silver Sack / Fête Present"
     },
     {
         "Id":  24,

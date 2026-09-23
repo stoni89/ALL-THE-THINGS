@@ -57,6 +57,13 @@ public sealed class Plugin : IDalamudPlugin
 
     public Configuration Configuration { get; init; }
 
+    /// <summary>
+    /// Für SightseeingAutomation (hält sonst bewusst keine Plugin-Instanz, siehe "instance"-Feld
+    /// oben) - ob gerade Configuration.SimulateSightseeingAutomation aktiv ist, damit die Automation
+    /// im Simulation-Modus NIE einen Emote sendet (nur zum Testen von Laufweg/Position gedacht).
+    /// </summary>
+    public static bool SimulateSightseeingAutomation => instance.Configuration.SimulateSightseeingAutomation;
+
     public readonly WindowSystem WindowSystem = new("TheExplorersCodex");
     private MainWindow MainWindow { get; init; }
     public CompactOverlayWindow CompactOverlayWindow { get; init; }
@@ -100,16 +107,6 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = Loc.T("Öffnet The Explorer's Codex.", "Opens The Explorer's Codex.")
         });
 
-        // Siehe UpdateQuestionableWindowSuppression - Questionables eigener "/qst"-Befehl kann von
-        // hier aus nicht umgebogen werden, daher dieser eigene Befehl als Ersatz, um das (während
-        // der Quest-Automation unterdrückte) Questionable-Fenster trotzdem bei Bedarf zu zeigen.
-        CommandManager.AddHandler("/tecqst", new CommandInfo(OnShowQuestionableCommand)
-        {
-            HelpMessage = Loc.T(
-                "Zeigt/versteckt das Questionable-Fenster (auch während der Quest-Automation, wo es sonst unterdrückt wird).",
-                "Shows/hides the Questionable window (even during Quest Automation, where it's otherwise suppressed).")
-        });
-
         PluginInterface.UiBuilder.Draw += DrawUI;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUI;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMainUI;
@@ -120,82 +117,7 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.IsOpen = !MainWindow.IsOpen;
     }
 
-    private void OnShowQuestionableCommand(string command, string args)
-    {
-        questionableWindowSuppressed = false;
-        CommandManager.ProcessCommand("/qst");
-    }
-
-    private void DrawUI()
-    {
-        UpdateQuestionableWindowSuppression();
-        WindowSystem.Draw();
-    }
-
-    // Ob das Questionable-Fenster gerade aktiv unterdrückt wird (siehe
-    // UpdateQuestionableWindowSuppression) - startet unterdrückt, wird per "/tecqst"-Befehl (siehe
-    // OnShowQuestionableCommand) freigegeben und automatisch wieder scharf gestellt, sobald das
-    // Fenster danach erneut schließt.
-    private bool questionableWindowSuppressed = true;
-
-    // Fenster-Zustand ("Active", siehe unten) vom letzten Frame - nur für die Zu-Flanke
-    // (schließen) relevant, siehe UpdateQuestionableWindowSuppression.
-    private bool questionableWindowWasOpen;
-
-    /// <summary>
-    /// Questionable bietet dafür (Stand jetzt) keine IPC an (Quellcode geprüft: nur Quest-Start/
-    /// -Status/Priority-Funktionen, keine Fenster-Steuerung) - stattdessen wird dessen Fenster
-    /// direkt über den GEMEINSAMEN ImGui-Kontext gefunden. "###Questionable" ist bewusst NUR der
-    /// ID-Teil ohne Anzeigetext (der enthält bei Questionable die Version, z.B.
-    /// "Questionable v1.5###Questionable") - laut Dear-ImGui-Konvention wird für Fenster-IDs
-    /// ausschließlich der Teil AB "###" gehasht, der Teil davor ist rein kosmetisch,
-    /// FindWindowByName("###Questionable") findet das Fenster also unabhängig von der
-    /// installierten Questionable-Version.
-    ///
-    /// Nur unterdrückt, solange UNSERE eigene Quest-Automation läuft (QuestAutomation.IsActive) -
-    /// außerhalb davon wird das Fenster komplett in Ruhe gelassen. Questionables eigenen "/qst"-
-    /// Befehl selbst umzubiegen (per CommandManager.RemoveHandler/AddHandler) scheitert auf dem
-    /// aktuell installierten Dalamud lautlos (beide Aufrufe geben false zurück - vermutlich
-    /// verhindert eine interne Eigentümer-Prüfung, dass ein FREMDES Plugin den Handler eines anderen
-    /// ersetzt). Questionables eigenes QuestWindow.PreOpenCheck() erzwingt außerdem "IsOpen = true"
-    /// die GESAMTE Automation über (nicht nur pro Quest-Schritt), die native "Active"-Flag taugt
-    /// deshalb während der Automation NICHT als Indiz für "der Spieler wollte es gerade öffnen".
-    /// Die einzige zuverlässige Freigabe ist daher der eigene Befehl "/tecqst" (siehe
-    /// OnShowQuestionableCommand), der Questionables echten "/qst"-Handler per ProcessCommand
-    /// aufruft (identisches Verhalten) und zusätzlich die Unterdrückung freigibt. Einzige Flanke,
-    /// die hier noch ausgewertet wird: offen->geschlossen schaltet die Unterdrückung automatisch
-    /// wieder scharf. Rein kosmetisch (Questionables eigener Zustand/IPC bleibt unberührt).
-    /// </summary>
-    private unsafe void UpdateQuestionableWindowSuppression()
-    {
-        if (!QuestAutomation.IsActive)
-        {
-            // Automation nicht aktiv - Fenster nicht anfassen, und für den nächsten Automationslauf
-            // wieder mit "unterdrückt" starten.
-            questionableWindowSuppressed = true;
-            questionableWindowWasOpen = false;
-            return;
-        }
-
-        try
-        {
-            var window = ImGuiP.FindWindowByName("###Questionable");
-            if (window.IsNull)
-                return;
-
-            var isOpenNow = window.Handle->Active != 0;
-            if (!isOpenNow && questionableWindowWasOpen)
-                questionableWindowSuppressed = true;
-            questionableWindowWasOpen = isOpenNow;
-
-            if (questionableWindowSuppressed)
-                window.Handle->HiddenFramesForRenderOnly = 2;
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Fehler beim Unterdrücken des Questionable-Fensters.");
-        }
-    }
+    private void DrawUI() => WindowSystem.Draw();
 
     private void ToggleMainUI() => MainWindow.IsOpen = !MainWindow.IsOpen;
 
@@ -220,6 +142,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.FashionAccessory => PlayerState.Instance()->IsOrnamentUnlocked(entry.Id),
             CollectibleType.TripleTriadCard => UIState.Instance()->IsTripleTriadCardUnlocked((ushort)entry.Id),
             CollectibleType.FrameKit => IsFrameKitUnlocked(entry),
+            CollectibleType.Hairstyle => IsHairstyleUnlocked(entry.Id),
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
@@ -343,46 +266,43 @@ public sealed class Plugin : IDalamudPlugin
     public static unsafe bool IsSightseeingLogUnlocked() => PlayerState.Instance()->SightseeingLogUnlockState != 0;
 
     /// <summary>
-    /// Ob ein Sammel-Typ in der aktuellen Zone gerade überhaupt machbar ist - für Sightseeing
-    /// braucht man dafür Fliegen (viele Punkte sind sonst gar nicht erreichbar) und das
-    /// freigeschaltete Log selbst (siehe IsSightseeingLogUnlocked). Bewusst NICHT für AetherCurrent -
-    /// genau umgekehrtes Henne-Ei-Problem: Ätherströmungen muss man erst einsammeln, UM Fliegen in
-    /// der Zone überhaupt erst freizuschalten (siehe AetherCurrentAutomation.BeginPathfind) - sie
-    /// hinter CanFly zu verstecken würde das Feature genau dann unbrauchbar machen, wenn man es am
-    /// meisten braucht. Auch NICHT für HuntingLog (auf expliziten Wunsch wieder entfernt). Wird
-    /// nicht zum Ausfiltern benutzt (Einträge bleiben sichtbar), sondern nur zum Ausgrauen in
-    /// Liste/Filter/Reihenfolge.
+    /// Ob ein Sammel-Typ in der aktuellen Zone gerade überhaupt machbar ist - aktuell von keinem Typ
+    /// mehr genutzt (Sightseeing hing hier früher am Fliegen, das aber das Log selbst gar nicht
+    /// freischaltet - siehe ComputeGrandCompanyOrTribeGateReason, das die Log-Freischaltung jetzt
+    /// stattdessen über die normale "Bedingung nicht erfüllt"-Markierung abbildet). Bleibt als
+    /// generischer Erweiterungspunkt bestehen, falls ein künftiger Typ wieder eine reine
+    /// Zonen-Machbarkeits-Ausgrauung braucht.
     /// </summary>
-    public static bool IsTypeCurrentlyPossible(CollectibleType type) => type switch
-    {
-        CollectibleType.Sightseeing => IsSightseeingLogUnlocked() && CanFly,
-        _ => true,
-    };
+    public static bool IsTypeCurrentlyPossible(CollectibleType type) => true;
 
     /// <summary>
-    /// Erklärtext fürs Ausgrauen (siehe IsTypeCurrentlyPossible). Für Sightseeing bewusst immer
-    /// derselbe Text (nicht mehr zwischen "Log nicht freigeschaltet" und "Fliegen nicht
-    /// freigeschaltet" unterschieden) - CanFly kann in Zonen ohne jede Flug-Freischaltung leicht
-    /// fälschlich als Grund erscheinen, obwohl eigentlich das Log selbst fehlt.
+    /// Erklärtext fürs Ausgrauen (siehe IsTypeCurrentlyPossible) - aktuell ungenutzt, siehe dort.
     /// </summary>
-    public static string GetTypeNotPossibleReason(CollectibleType type)
-    {
-        if (type == CollectibleType.Sightseeing)
-            return Loc.T("Sightseeing Log noch nicht freigeschaltet", "Sightseeing Log not unlocked yet");
-
-        return Loc.T("Noch nicht möglich", "Not possible yet");
-    }
+    public static string GetTypeNotPossibleReason(CollectibleType type) => Loc.T("Noch nicht möglich", "Not possible yet");
 
     private static Dictionary<string, (uint TerritoryId, uint MapId)>? zoneByPlaceNameCache;
+
+    // Zweite Nachschlage-Quelle NEBEN TerritoryType.PlaceName - Raids/Trials/Alliance-Raids heißen
+    // im Source-Text meist wie ihr "ContentFinderCondition"-Duty-Name (z.B. "Asphodelos: The Fourth
+    // Circle"), der oft NICHT mit der PlaceName-Spalte ihrer Zone übereinstimmt (die ist dort meist
+    // generischer/intern benannt) - siehe EnrichEntriesWithZoneFromSource.
+    private static Dictionary<string, (uint TerritoryId, uint MapId)>? zoneByContentNameCache;
 
     /// <summary>
     /// Trägt TerritoryTypeId/MapId für Einträge nach, deren JSON-Datei nur den Fundort als
     /// Klartext in Source kennt (z.B. "The Clyteum" bei einem Dungeon-Truhen-Drop), aber keine
-    /// Zone - betrifft vor allem Notenrollen/Minions/Triple-Triad-Karten mit Category "Dungeon"
-    /// (siehe CollectionData.GetAllEntries). Gleicht Source gegen die PlaceName-Spalte des Lumina-
-    /// Sheets "TerritoryType" ab (case-insensitive, führende/nachgestellte "*" wie bei "*The
-    /// Merchant's Tale*" entfernt) - Einträge, für die keine Übereinstimmung gefunden wird, bleiben
-    /// unverändert (TerritoryTypeId weiterhin 0, kein Rückschritt gegenüber vorher).
+    /// Zone - betrifft vor allem Notenrollen/Minions/Triple-Triad-Karten mit Category "Dungeon"/
+    /// "Raid" (siehe CollectionData.GetAllEntries). Gleicht Source gegen zwei Lumina-Quellen ab:
+    /// TerritoryType.PlaceName (funktioniert meist für Dungeons) und ContentFinderCondition.Name
+    /// (funktioniert meist für Raids/Trials/Alliance-Raids, deren PlaceName oft nicht mit dem
+    /// bekannten Duty-Namen übereinstimmt) - jeweils zusätzlich mit/ohne führendem "The " versucht,
+    /// da Source und die jeweilige Lumina-Spalte den Artikel nicht immer konsistent führen (z.B.
+    /// Source "The Aurum Vale" vs. tatsächlichem PlaceName "Aurum Vale"). Manche Source-Texte
+    /// listen mehrere mögliche Fundorte zusammen (z.B. "Asphodelos: The Fourth Circle / Asphodelos:
+    /// The Fourth Circle (Savage)", oder ganz unterschiedliche Dungeons für dasselbe Minion) - wird
+    /// an "/" aufgeteilt, der erste auflösbare Teil gewinnt. Einträge, für die trotzdem keine
+    /// Übereinstimmung gefunden wird, bleiben unverändert (TerritoryTypeId weiterhin 0, kein
+    /// Rückschritt gegenüber vorher).
     /// </summary>
     public static void EnrichEntriesWithZoneFromSource(List<CollectibleEntry> entries)
     {
@@ -403,17 +323,51 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
+        if (zoneByContentNameCache == null)
+        {
+            zoneByContentNameCache = new Dictionary<string, (uint TerritoryId, uint MapId)>(StringComparer.OrdinalIgnoreCase);
+            var cfcSheet = DataManager.GetExcelSheet<ContentFinderCondition>();
+            if (cfcSheet != null)
+            {
+                foreach (var cfc in cfcSheet)
+                {
+                    var name = cfc.Name.ToString();
+                    var territory = cfc.TerritoryType.ValueNullable;
+                    if (string.IsNullOrEmpty(name) || territory == null || territory.Value.RowId == 0 || zoneByContentNameCache.ContainsKey(name))
+                        continue;
+
+                    zoneByContentNameCache[name] = (territory.Value.RowId, territory.Value.Map.RowId);
+                }
+            }
+        }
+
+        var placeNameCache = zoneByPlaceNameCache;
+        var contentNameCache = zoneByContentNameCache;
+
+        bool TryResolveZoneName(string name, out (uint TerritoryId, uint MapId) zone)
+        {
+            if (placeNameCache.TryGetValue(name, out zone) || contentNameCache.TryGetValue(name, out zone))
+                return true;
+
+            var altName = name.StartsWith("The ", StringComparison.OrdinalIgnoreCase) ? name[4..] : "The " + name;
+            return placeNameCache.TryGetValue(altName, out zone) || contentNameCache.TryGetValue(altName, out zone);
+        }
+
         foreach (var entry in entries)
         {
             if (entry.TerritoryTypeId != 0 || string.IsNullOrEmpty(entry.Source))
                 continue;
 
-            var source = entry.Source.Trim().Trim('*');
-            if (!zoneByPlaceNameCache.TryGetValue(source, out var zone))
-                continue;
+            foreach (var candidate in entry.Source.Split('/'))
+            {
+                var source = candidate.Trim().Trim('*');
+                if (source.Length == 0 || !TryResolveZoneName(source, out var zone))
+                    continue;
 
-            entry.TerritoryTypeId = zone.TerritoryId;
-            entry.MapId = zone.MapId;
+                entry.TerritoryTypeId = zone.TerritoryId;
+                entry.MapId = zone.MapId;
+                break;
+            }
         }
     }
 
@@ -450,10 +404,12 @@ public sealed class Plugin : IDalamudPlugin
     public static void DumpZoneEnrichmentDebugInfo()
     {
         var entries = CollectionData.GetAllEntries();
-        var dungeonEntries = entries.Where(e => e.Category.Contains("Dungeon", StringComparison.OrdinalIgnoreCase)).ToList();
+        var dungeonEntries = entries
+            .Where(e => e.Category is "Dungeon" or "Raid" or "Chaos-Raid" or "Variant/Criterion-Dungeon")
+            .ToList();
         var stillMissing = dungeonEntries.Where(e => e.TerritoryTypeId == 0).ToList();
 
-        Log.Info($"[ZoneEnrichmentDebug] {dungeonEntries.Count} Dungeon-Einträge insgesamt, {stillMissing.Count} davon noch ohne Zone:");
+        Log.Info($"[ZoneEnrichmentDebug] {dungeonEntries.Count} Dungeon/Raid-Einträge insgesamt, {stillMissing.Count} davon noch ohne Zone:");
         foreach (var entry in stillMissing)
             Log.Info($"[ZoneEnrichmentDebug]   {entry.Type} \"{entry.Name}\": Source=\"{entry.Source}\"");
     }
@@ -1209,6 +1165,564 @@ public sealed class Plugin : IDalamudPlugin
         Log.Info($"[FrameKitDebug] Davon {unknownCount} mit unbekanntem Freischalt-Weg (FrameKitUnlockKind.Unknown).");
     }
 
+    private static List<CollectibleEntry>? hairstyleEntriesCache;
+
+    /// <summary>
+    /// Baut die vollständige Liste aller "Modern Aesthetics"-Frisuren live aus Lumina auf
+    /// ("CharaMakeCustomize"-Sheet, dessen HintItem-Feld auf das jeweilige "Modern Aesthetics"-Buch
+    /// verweist) - dafür gibt es keine handelsübliche Community-Datenbasis wie bei Mounts/Minions,
+    /// und die Freischaltung läuft über eine eigene PlayerState-Bitmaske (siehe IsHairstyleUnlocked),
+    /// nicht über ein normales Item/eine Errungenschaft. Gefiltert auf Zeilen, deren HintItem-Name
+    /// mit "Modern Aesthetics" beginnt - die übrigen CharaMakeCustomize-Zeilen sind Basis-
+    /// Charaktererstellungs-Optionen ohne eigenes Freischalt-Item, die hier nichts verloren haben.
+    /// Händler/Preis wird für die per Gil kaufbaren darunter zusätzlich aufgelöst, siehe
+    /// EnrichHairstyleVendors - Frisuren ohne auflösbaren Händler (z.B. Raid-/Errungenschafts-
+    /// Freischaltungen) bleiben mit TerritoryTypeId=0 (kein Fundort/GoTo-Link), sind aber weiterhin
+    /// über IsHairstyleUnlocked live als besessen/nicht besessen erkennbar.
+    /// </summary>
+    public static List<CollectibleEntry> GetHairstyleEntries()
+    {
+        if (hairstyleEntriesCache != null)
+            return hairstyleEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        var customizeSheet = DataManager.GetExcelSheet<CharaMakeCustomize>();
+        if (customizeSheet == null)
+        {
+            hairstyleEntriesCache = result;
+            return result;
+        }
+
+        foreach (var row in customizeSheet)
+        {
+            if (row.RowId == 0)
+                continue;
+
+            var hintItem = row.HintItem.ValueNullable;
+            if (hintItem == null)
+                continue;
+
+            var itemName = hintItem.Value.Name.ToString();
+            if (!itemName.StartsWith("Modern Aesthetics", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            result.Add(new CollectibleEntry
+            {
+                Id = row.RowId,
+                Name = itemName,
+                Type = CollectibleType.Hairstyle,
+                Category = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
+                Source = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
+            });
+        }
+
+        EnrichHairstyleVendors(result);
+
+        hairstyleEntriesCache = result;
+        return result;
+    }
+
+    /// <summary>
+    /// Trägt Händler/Preis für "Modern Aesthetics"-Bücher nach, die für Gil bei einem NPC gekauft
+    /// werden können (siehe GetHairstyleEntries) - Item → Shop kommt aus dem rohen Lumina-Sheet
+    /// "GilShopItem" (einfache Gil-Händler, anders als die Sonderwährungs-Händler bei
+    /// EnrichFrameKitVendors), Shop → NPC direkt aus "ENpcBase.ENpcData" (dieselbe direkte
+    /// ID-Raum-Auflösung wie dort, siehe Kommentar). NPC → Weltposition ebenfalls nach demselben
+    /// Vorbild (Lumina-Sheet "Level", ENpcPlace-CSV nur als Fallback). Bewusst KEINE TopicSelect-/
+    /// FateShop-/InclusionShop-Menü-Auflösung wie bei EnrichFrameKitVendors - einfache Gil-Händler
+    /// hängen ihre Shops direkt in ENpcData, ohne verschachteltes Menü.
+    /// </summary>
+    private static void EnrichHairstyleVendors(List<CollectibleEntry> entries)
+    {
+        var candidates = entries.Where(e => e.Type == CollectibleType.Hairstyle).ToList();
+        if (candidates.Count == 0)
+            return;
+
+        try
+        {
+            var customizeSheet = DataManager.GetExcelSheet<CharaMakeCustomize>();
+            var gilShopItemSheet = DataManager.GetSubrowExcelSheet<GilShopItem>();
+            var npcResidentSheet = DataManager.GetExcelSheet<ENpcResident>();
+            var npcBaseSheet = DataManager.GetExcelSheet<ENpcBase>();
+            var itemSheet = DataManager.GetExcelSheet<Item>();
+            if (customizeSheet == null || gilShopItemSheet == null || npcResidentSheet == null || npcBaseSheet == null || itemSheet == null)
+                return;
+
+            // entry.Id ist die CharaMakeCustomize-RowId - HintItem daraus die Ziel-Item-RowId auflösen.
+            var itemRowIdToEntry = new Dictionary<uint, CollectibleEntry>();
+            foreach (var entry in candidates)
+            {
+                if (!customizeSheet.TryGetRow(entry.Id, out var row))
+                    continue;
+
+                var itemRowId = row.HintItem.RowId;
+                if (itemRowId != 0)
+                    itemRowIdToEntry.TryAdd(itemRowId, entry);
+            }
+
+            Log.Info($"[HairstyleDebug] itemRowIdToEntry.Count={itemRowIdToEntry.Count} (candidates={candidates.Count})");
+            if (itemRowIdToEntry.Count == 0)
+                return;
+
+            var targetItemRowIds = itemRowIdToEntry.Keys.ToHashSet();
+            var itemRowIdToShopId = new Dictionary<uint, uint>();
+            try
+            {
+                foreach (var shopItem in gilShopItemSheet.Flatten())
+                {
+                    var itemRowId = shopItem.Item.RowId;
+                    if (itemRowId == 0 || !targetItemRowIds.Contains(itemRowId) || itemRowIdToShopId.ContainsKey(itemRowId))
+                        continue;
+
+                    itemRowIdToShopId[itemRowId] = shopItem.RowId; // RowId == GilShop-RowId bei GilShopItem
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Fehler beim Lesen von GilShopItem.");
+            }
+
+            Log.Info($"[HairstyleDebug] itemRowIdToShopId.Count={itemRowIdToShopId.Count}");
+            if (itemRowIdToShopId.Count == 0)
+                return;
+
+            var targetShopIds = itemRowIdToShopId.Values.ToHashSet();
+            var shopIdToNpcId = new Dictionary<uint, uint>();
+            foreach (var npc in npcBaseSheet)
+            {
+                foreach (var data in npc.ENpcData)
+                {
+                    if (data.RowId != 0 && targetShopIds.Contains(data.RowId))
+                        shopIdToNpcId.TryAdd(data.RowId, npc.RowId);
+                }
+            }
+
+            Log.Info($"[HairstyleDebug] shopIdToNpcId.Count={shopIdToNpcId.Count} (targetShopIds={targetShopIds.Count})");
+
+            var levelSheet = DataManager.GetExcelSheet<Level>();
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            var targetNpcIds = shopIdToNpcId.Values.ToHashSet();
+            var npcIdToPlace = new Dictionary<uint, (uint TerritoryTypeId, uint MapId, float X, float Y)>();
+            if (levelSheet != null && mapSheet != null)
+            {
+                foreach (var level in levelSheet)
+                {
+                    if (level.Type != 8)
+                        continue;
+                    var npcRowId = level.Object.RowId;
+                    if (npcRowId == 0 || !targetNpcIds.Contains(npcRowId) || npcIdToPlace.ContainsKey(npcRowId))
+                        continue;
+                    var mapId = level.Map.RowId;
+                    if (mapId == 0 || !mapSheet.TryGetRow(mapId, out var map))
+                        continue;
+
+                    var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+                        new Vector2(level.X, level.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+                    npcIdToPlace[npcRowId] = (level.Territory.RowId, mapId, mapCoords.X, mapCoords.Y);
+                }
+            }
+
+            var npcPlaces = CsvLoader.LoadResource<ENpcPlace>(CsvLoader.ENpcPlaceResourceName, true, out _, out _);
+            foreach (var place in npcPlaces)
+            {
+                if (!targetNpcIds.Contains(place.ENpcResidentId))
+                    continue;
+                npcIdToPlace.TryAdd(place.ENpcResidentId, (place.TerritoryTypeId, place.MapId, place.Position.X, place.Position.Y));
+            }
+
+            Log.Info($"[HairstyleDebug] npcIdToPlace.Count={npcIdToPlace.Count} (targetNpcIds={targetNpcIds.Count})");
+
+            var enrichedCount = 0;
+            foreach (var (itemRowId, entry) in itemRowIdToEntry)
+            {
+                try
+                {
+                    if (!itemRowIdToShopId.TryGetValue(itemRowId, out var shopId))
+                    {
+                        Log.Info($"[HairstyleDebug] {entry.Name}: Item #{itemRowId} in keinem GilShop als Ware gefunden.");
+                        continue;
+                    }
+                    if (!shopIdToNpcId.TryGetValue(shopId, out var npcId))
+                    {
+                        Log.Info($"[HairstyleDebug] {entry.Name}: GilShop #{shopId} wird von keinem NPC in ENpcBase.ENpcData referenziert.");
+                        continue;
+                    }
+                    if (!npcIdToPlace.TryGetValue(npcId, out var place))
+                    {
+                        Log.Info($"[HairstyleDebug] {entry.Name}: NPC #{npcId} hat weder einen Platz im Level-Sheet noch in der ENpcPlace-CSV.");
+                        continue;
+                    }
+                    if (!npcResidentSheet.TryGetRow(npcId, out var npc))
+                        continue;
+                    if (!itemSheet.TryGetRow(itemRowId, out var item))
+                        continue;
+
+                    var vendorName = npc.Singular.ToString();
+                    var price = item.PriceMid;
+                    entry.Vendor = vendorName;
+                    entry.VendorMapX = place.X;
+                    entry.VendorMapY = place.Y;
+                    entry.TerritoryTypeId = place.TerritoryTypeId;
+                    entry.MapId = place.MapId;
+                    entry.Currency = $"{price:N0} Gil";
+                    entry.CurrencyIconId = 65002;
+                    entry.CurrencyItemId = 1;
+                    entry.CurrencyAmount = price;
+                    entry.Source = $"{vendorName} - {price:N0} Gil";
+                    enrichedCount++;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, $"Fehler beim Anreichern von Modern-Aesthetics-Eintrag {entry.Name} - übersprungen.");
+                }
+            }
+
+            Log.Info($"[HairstyleDebug] EnrichHairstyleVendors fertig: {enrichedCount}/{candidates.Count} Einträge angereichert.");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Auflösen von Modern-Aesthetics-Händlern - Anreicherung übersprungen.");
+        }
+    }
+
+    /// <summary>
+    /// Ob eine "Modern Aesthetics"-Frisur (CharaMakeCustomize-RowId) bereits freigeschaltet ist -
+    /// über Dalamuds IUnlockState (dieselbe generische Bitmasken-Abfrage wie bei Sightseeing/
+    /// IsAdventureComplete), da PlayerState/UIState dafür keine eigene Methode anbieten.
+    /// </summary>
+    public static bool IsHairstyleUnlocked(uint customizeRowId)
+    {
+        var sheet = DataManager.GetExcelSheet<CharaMakeCustomize>();
+        return sheet != null && sheet.TryGetRow(customizeRowId, out var row) && UnlockState.IsCharaMakeCustomizeUnlocked(row);
+    }
+
+    /// <summary>
+    /// Einmaliger Debug-Dump aller "Modern Aesthetics"-Frisuren mit aufgelöstem Händler/Freischalt-
+    /// Status - zur Kalibrierung von GetHairstyleEntries/EnrichHairstyleVendors, v.a. um Einträge
+    /// ohne aufgelösten Händler zu finden.
+    /// </summary>
+    public static void DumpHairstyleDebugInfo()
+    {
+        hairstyleEntriesCache = null;
+        var entries = GetHairstyleEntries();
+        Log.Info($"[HairstyleDebug] {entries.Count} Modern-Aesthetics-Frisuren gefunden:");
+        foreach (var entry in entries)
+        {
+            var unlocked = IsHairstyleUnlocked(entry.Id);
+            Log.Info($"[HairstyleDebug]   {entry.Name}(#{entry.Id}): Vendor=\"{entry.Vendor}\", Territory={entry.TerritoryTypeId}, " +
+                     $"Currency=\"{entry.Currency}\", unlocked={unlocked}");
+        }
+
+        var missingVendorCount = entries.Count(e => string.IsNullOrEmpty(e.Vendor));
+        Log.Info($"[HairstyleDebug] Davon {missingVendorCount} ohne aufgelösten Händler.");
+    }
+
+    // Bits sind Weather-Sheet-RowIds (1u << RowId) - für SightseeingWeatherMask.
+    private const uint WeatherClear = 1u << 1;
+    private const uint WeatherFair = 1u << 2;
+    private const uint WeatherClouds = 1u << 3;
+    private const uint WeatherFog = 1u << 4;
+    private const uint WeatherGales = 1u << 6;
+    private const uint WeatherRain = 1u << 7;
+    private const uint WeatherShowers = 1u << 8;
+    private const uint WeatherThunder = 1u << 9;
+    private const uint WeatherThunderstorms = 1u << 10;
+    private const uint WeatherDustStorms = 1u << 11;
+    private const uint WeatherHeatWaves = 1u << 14;
+    private const uint WeatherSnow = 1u << 15;
+    private const uint WeatherBlizzards = 1u << 16;
+    private const uint WeatherGloom = 1u << 17;
+    private const uint WeatherClearOrFair = WeatherClear | WeatherFair;
+    private const uint WeatherRainOrShowers = WeatherRain | WeatherShowers;
+
+    /// <summary>
+    /// Wetter-Voraussetzung je A-Realm-Reborn-Sichtungspunkt (Index = laufende Nummer im "Adventure"-
+    /// Sheet minus 1, siehe GetSightseeingEntries) - JEDER der 80 A-Realm-Reborn-Punkte verlangt ein
+    /// bestimmtes Wetter, KEIN späterer Punkt (Heavensward+) tut das. Nicht aus Lumina auslesbar (das
+    /// Adventure-Sheet selbst kennt keine Wetter-Spalte) - übernommen aus dem quelloffenen Dalamud-
+    /// Plugin "AutoSightseeingLog" (github.com/XeldarAlz/FFXIV-AutoSightseeingLog,
+    /// Core/Vistas/VistaData.cs), das diese Werte selbst wiederum manuell recherchiert/verifiziert hat.
+    /// </summary>
+    private static readonly uint[] RealmRebornVistaWeathers =
+    {
+        WeatherClearOrFair, WeatherClearOrFair, WeatherRainOrShowers, WeatherClearOrFair, WeatherClouds, WeatherClearOrFair, WeatherFog, WeatherClearOrFair, WeatherClouds, WeatherClearOrFair,
+        WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherClouds, WeatherClearOrFair, WeatherFog, WeatherRainOrShowers, WeatherClouds, WeatherClearOrFair,
+        WeatherClearOrFair, WeatherClearOrFair, WeatherRainOrShowers, WeatherClearOrFair, WeatherRainOrShowers, WeatherClearOrFair, WeatherGales, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair,
+        WeatherClearOrFair, WeatherThunderstorms, WeatherClearOrFair, WeatherClouds, WeatherClearOrFair, WeatherRainOrShowers, WeatherClearOrFair, WeatherRainOrShowers, WeatherRainOrShowers, WeatherClearOrFair,
+        WeatherClearOrFair, WeatherClearOrFair, WeatherThunder, WeatherThunderstorms, WeatherClearOrFair, WeatherFog, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherClouds,
+        WeatherClearOrFair, WeatherClearOrFair, WeatherDustStorms, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherShowers, WeatherFog, WeatherClearOrFair, WeatherHeatWaves,
+        WeatherClearOrFair, WeatherHeatWaves, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherClouds, WeatherFog, WeatherClearOrFair, WeatherFog, WeatherBlizzards,
+        WeatherClearOrFair, WeatherClearOrFair, WeatherBlizzards | WeatherSnow, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair, WeatherGloom, WeatherClearOrFair, WeatherClearOrFair, WeatherClearOrFair,
+    };
+
+    // "A Sight to Behold" (Naoh Gamduhla, New Gridania) - übergibt das Sightseeing Log selbst, siehe
+    // auch IsSightseeingLogUnlocked/ComputeGrandCompanyOrTribeGateReason. Erst danach zeichnen sich
+    // überhaupt Punkte auf.
+    private const uint SightseeingUnlockQuestId = 65698;
+
+    // Die ersten 20 A-Realm-Reborn-Punkte (Nummer 1-20 im Adventure-Sheet) sind sofort verfügbar,
+    // sobald das Log freigeschaltet ist - erst wenn ALLE 20 aufgezeichnet sind, schaltet Millith
+    // Ironheart (Old Gridania) die restlichen 60 A-Realm-Reborn-Punkte (21-80) frei. KEIN "man muss
+    // erst alle A-Realm-Reborn-Punkte machen" wie oft angenommen - nur diese ersten 20.
+    private const int SightseeingFirstBookCount = 20;
+
+    // "Sights of the North" - schaltet alle Heavensward-Sichtungspunkte frei. Ab Stormblood übernimmt
+    // stattdessen das Lumina-Sheet "AdventureExPhase" (siehe ResolveSightseeingGateQuests) - für
+    // Heavensward selbst fehlt dort ein Eintrag, daher hier fest hinterlegt (Quelle: "AutoSightseeingLog").
+    private const uint SightseeingHeavenswardQuestId = 67643;
+
+    // Von Hand nachgetragene Ersatz-Zielposition (statt der rohen Adventure.Level-Position) für
+    // Punkte, bei denen die Automation gegen eine Wand/ein Geländer läuft, statt anzukommen (Key =
+    // Adventure-RowId, siehe DumpPlayerPositionDebugInfo zum Ermitteln passender Werte) - genau der
+    // gleiche Ansatz wie "AutoSightseeingLog"s approachPoints-Tabelle, nur ohne dessen aufwendige
+    // Navmesh-Raycasting-Suche: hier einfach von Hand ein paar Yards vor die eigentliche Position
+    // gesetzt, sobald ein konkreter Punkt als problematisch gemeldet wird.
+    private static readonly Dictionary<uint, Vector3> SightseeingApproachOverrides = new()
+    {
+        [2162688] = new Vector3(-83.241394f, 42.393375f, -170.998f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+    };
+
+    // Von Hand nachgetragener ZWISCHENSTOPP vor der eigentlichen Zielposition (Key = Adventure-
+    // RowId) - für Punkte, bei denen selbst der über die Karten-Flagge/FlagToPoint gefundene grobe
+    // Laufweg (siehe SightseeingAutomation.BeginNavigateToEntry) gegen eine Wand/ein Geländer läuft,
+    // statt zunächst einen sicheren nahegelegenen Punkt anzulaufen. Ist einer hinterlegt, läuft die
+    // Automation ZUERST dorthin (mit der normalen, großzügigen Toleranz) und erst von dort den
+    // letzten, engen Schritt zur echten Position (siehe SightseeingApproachOverrides/
+    // BeginFinalApproach) - der Umweg über die Karten-Flagge entfällt dann komplett.
+    private static readonly Dictionary<uint, Vector3> SightseeingApproachWaypoints = new()
+    {
+        [2162688] = new Vector3(-82.96662f, 41.993416f, -170.93227f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+    };
+
+    /// <summary>Siehe SightseeingApproachWaypoints-Kommentar.</summary>
+    public static bool TryGetSightseeingApproachWaypoint(uint adventureId, out Vector3 waypoint) =>
+        SightseeingApproachWaypoints.TryGetValue(adventureId, out waypoint);
+
+    private static List<CollectibleEntry>? sightseeingEntriesCache;
+    private static List<(uint FirstAdventureId, uint LastAdventureId, uint QuestId)>? sightseeingGateQuestsCache;
+
+    /// <summary>
+    /// Löst je Buch AB Stormblood die zum Freischalten nötige Quest auf (Lumina-Sheet
+    /// "AdventureExPhase": AdventureBegin/AdventureEnd markieren den RowId-Bereich der zu diesem Buch
+    /// gehörenden Sichtungspunkte, Quest die dafür nötige Haupt-/Nebenquest) - anders als bei A Realm
+    /// Reborn/Heavensward (siehe SightseeingFirstBookCount/SightseeingHeavenswardQuestId) ist das hier
+    /// vollständig aus Lumina auslesbar, keine von Hand gepflegten Werte nötig.
+    /// </summary>
+    private static List<(uint FirstAdventureId, uint LastAdventureId, uint QuestId)> ResolveSightseeingGateQuests()
+    {
+        if (sightseeingGateQuestsCache != null)
+            return sightseeingGateQuestsCache;
+
+        var result = new List<(uint, uint, uint)>();
+        var phaseSheet = DataManager.GetExcelSheet<AdventureExPhase>();
+        if (phaseSheet != null)
+        {
+            foreach (var phase in phaseSheet)
+            {
+                var firstId = phase.AdventureBegin.RowId;
+                var lastId = phase.AdventureEnd.RowId;
+                var questId = phase.Quest.RowId;
+                if (firstId != 0 && lastId != 0 && questId != 0)
+                    result.Add((firstId, lastId, questId));
+            }
+        }
+
+        sightseeingGateQuestsCache = result;
+        return result;
+    }
+
+    /// <summary>
+    /// Baut die vollständige Liste aller Sightseeing-Log-Punkte live aus Lumina auf ("Adventure"-
+    /// Sheet) - EINMAL global (nicht pro Zone, anders als früher), weil die Zusatz-Bedingungen
+    /// (v.a. SightseeingNeedsFirstTwenty) die laufende Nummer INNERHALB DES GESAMTEN Sheets brauchen.
+    /// Positions-Umrechnung: Lumina "Level" speichert X/Y/Z bereits in der normalen FFXIV-Weltkoordinaten-
+    /// Konvention (Y = Höhe, siehe Level.cs Feld-Offsets 0/4/8) - FRÜHER wurde hier fälschlich Y und Z
+    /// vertauscht (vom Dalamud-Plugin "Tourist" übernommen, das denselben Fehler macht, dort aber nur
+    /// eine kosmetische VFX-Markierung betrifft statt echter Lauf-Ziele) - das war vermutlich die
+    /// Ursache für "Positionen stimmen nicht". +0.5f auf die Höhe, damit der Zielpunkt nicht im Boden
+    /// einsackt (ebenfalls von Tourist übernommen). Wetter-/Zeit-/Buch-Freischalt-Bedingungen siehe
+    /// RealmRebornVistaWeathers/SightseeingFirstBookCount/SightseeingHeavenswardQuestId/
+    /// ResolveSightseeingGateQuests - alle vier Aspekte (Position, Wetter, Zeit, Buch-Freischaltung)
+    /// nach Vorbild des quelloffenen Dalamud-Plugins "AutoSightseeingLog".
+    /// </summary>
+    public static List<CollectibleEntry> GetSightseeingEntries()
+    {
+        if (sightseeingEntriesCache != null)
+            return sightseeingEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        var adventureSheet = DataManager.GetExcelSheet<Adventure>();
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (adventureSheet == null || territorySheet == null)
+        {
+            sightseeingEntriesCache = result;
+            return result;
+        }
+
+        var gateQuests = ResolveSightseeingGateQuests();
+        var number = 0;
+
+        foreach (var row in adventureSheet)
+        {
+            number++;
+
+            try
+            {
+                var level = row.Level.ValueNullable;
+                if (level == null)
+                    continue;
+
+                var territoryId = level.Value.Territory.RowId;
+                if (territoryId == 0)
+                    continue;
+
+                var name = row.Name.ToString();
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                var emoteCommand = row.Emote.ValueNullable?.TextCommand.ValueNullable?.Command.ToString();
+
+                // 0 = A Realm Reborn (siehe TerritoryType.ExVersion), 1 = Heavensward, 2+ = Stormblood
+                // und später - dieselbe Reihenfolge wie in "AutoSightseeingLog"s ExpansionKind-Enum.
+                var expansion = territorySheet.TryGetRow(territoryId, out var territory) ? territory.ExVersion.RowId : 0;
+
+                uint gateQuestId = 0;
+                var needsFirstTwenty = false;
+                if (expansion == 0)
+                {
+                    needsFirstTwenty = number > SightseeingFirstBookCount;
+                }
+                else if (expansion == 1)
+                {
+                    gateQuestId = SightseeingHeavenswardQuestId;
+                }
+                else
+                {
+                    foreach (var (firstId, lastId, questId) in gateQuests)
+                    {
+                        if (row.RowId >= firstId && row.RowId <= lastId)
+                        {
+                            gateQuestId = questId;
+                            break;
+                        }
+                    }
+                }
+
+                var weatherMask = expansion == 0 && number <= RealmRebornVistaWeathers.Length
+                    ? RealmRebornVistaWeathers[number - 1]
+                    : 0u;
+
+                result.Add(new CollectibleEntry
+                {
+                    Id = row.RowId,
+                    Name = name,
+                    Type = CollectibleType.Sightseeing,
+                    Category = Loc.T("Sightseeing", "Sightseeing"),
+                    TerritoryTypeId = territoryId,
+                    MapId = level.Value.Map.RowId,
+                    WorldPosition = SightseeingApproachOverrides.TryGetValue(row.RowId, out var overridePos)
+                        ? overridePos
+                        : new Vector3(level.Value.X, level.Value.Y + 0.5f, level.Value.Z),
+                    RequiredEmoteCommand = string.IsNullOrEmpty(emoteCommand) ? null : emoteCommand,
+                    SightseeingWeatherMask = weatherMask,
+                    SightseeingHasTimeWindow = row.MinTime != 0 || row.MaxTime != 0,
+                    SightseeingFirstBell = (byte)(row.MinTime / 100),
+                    SightseeingLastBell = (byte)(row.MaxTime / 100),
+                    SightseeingGateQuestId = gateQuestId,
+                    SightseeingNeedsFirstTwenty = needsFirstTwenty,
+                    Source = Loc.T("Sightseeing", "Sightseeing"),
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Fehler bei Adventure-Zeile {row.RowId}");
+            }
+        }
+
+        sightseeingEntriesCache = result;
+        return result;
+    }
+
+    /// <summary>
+    /// Aktuelle Eorzea-Stunde (0-23) - eine "Glocke" dauert 175 Erdsekunden, ein Eorzea-Tag also
+    /// 24*175=4200 Erdsekunden. Server-Zeit (Framework.GetServerTime, Unix-Sekunden) statt lokaler
+    /// Client-Uhr, damit eine falsch eingestellte PC-Uhrzeit die Prüfung nicht verfälscht - dieselbe
+    /// Formel wie im Dalamud-Plugin "AutoSightseeingLog" (Core/Time/EorzeaTime.cs).
+    /// </summary>
+    private static unsafe int GetCurrentEorzeaBell()
+    {
+        var serverTime = Framework.GetServerTime();
+        if (serverTime <= 0)
+            serverTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        return (int)(serverTime / 175 % 24);
+    }
+
+    /// <summary>
+    /// Ob die aktuelle Eorzea-Zeit im (ggf. über Mitternacht laufenden) Zeitfenster des Punkts liegt.
+    /// Nur für Einträge mit SightseeingHasTimeWindow relevant.
+    /// </summary>
+    private static bool IsSightseeingTimeOk(CollectibleEntry entry)
+    {
+        var bell = GetCurrentEorzeaBell();
+        return entry.SightseeingFirstBell <= entry.SightseeingLastBell
+            ? bell >= entry.SightseeingFirstBell && bell <= entry.SightseeingLastBell
+            : bell >= entry.SightseeingFirstBell || bell <= entry.SightseeingLastBell;
+    }
+
+    /// <summary>
+    /// Ob das aktuelle Wetter der Zone des Punkts zu seiner SightseeingWeatherMask passt - live über
+    /// FFXIVClientStructs' WeatherManager (funktioniert für JEDE Zone, nicht nur die aktuell
+    /// geladene, da FFXIV-Wetter deterministisch aus der Zone selbst berechnet wird). Nur für
+    /// Einträge mit SightseeingWeatherMask != 0 relevant (ausschließlich A-Realm-Reborn-Punkte).
+    /// </summary>
+    private static unsafe bool IsSightseeingWeatherOk(CollectibleEntry entry)
+    {
+        var weatherId = WeatherManager.Instance()->GetWeatherForHour((ushort)entry.TerritoryTypeId, 0);
+        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << weatherId)) != 0;
+    }
+
+    /// <summary>
+    /// Ob alle ersten SightseeingFirstBookCount A-Realm-Reborn-Sichtungspunkte bereits aufgezeichnet
+    /// sind - live über PlayerState.IsAdventureComplete, für SightseeingNeedsFirstTwenty. Es gibt
+    /// kein eigenes "ist A Realm Reborn"-Feld auf CollectibleEntry - SightseeingWeatherMask != 0
+    /// identifiziert dieselbe Menge zuverlässig (siehe RealmRebornVistaWeathers-Kommentar: JEDER
+    /// A-Realm-Reborn-Punkt hat eine Wetter-Bedingung, KEIN späterer), kombiniert mit
+    /// "!SightseeingNeedsFirstTwenty" (nur bei A-Realm-Reborn-Nummer 1-20 gesetzt) ergibt das genau
+    /// die ersten 20.
+    /// </summary>
+    private static unsafe bool AreFirstSightseeingBookEntriesComplete()
+    {
+        var firstBook = GetSightseeingEntries().Where(e => !e.SightseeingNeedsFirstTwenty && e.SightseeingWeatherMask != 0);
+        return firstBook.All(e => PlayerState.Instance()->IsAdventureComplete(e.Id));
+    }
+
+    private static Dictionary<uint, string>? questNameByIdCache;
+
+    /// <summary>
+    /// Umgekehrte Richtung zu ResolveQuestIdByName - für Hinweistexte, die nur eine Quest-RowId
+    /// kennen (siehe SightseeingGateQuestId), aber den Anzeigenamen brauchen.
+    /// </summary>
+    private static string? ResolveQuestNameById(uint questId)
+    {
+        if (questNameByIdCache == null)
+        {
+            questNameByIdCache = new Dictionary<uint, string>();
+            var questSheet = DataManager.GetExcelSheet<Quest>();
+            if (questSheet != null)
+            {
+                foreach (var row in questSheet)
+                {
+                    var name = row.Name.ToString();
+                    if (!string.IsNullOrEmpty(name))
+                        questNameByIdCache[row.RowId] = name;
+                }
+            }
+        }
+
+        return questNameByIdCache.TryGetValue(questId, out var questName) ? questName : null;
+    }
+
     private readonly record struct ChocobokeepLocation(uint ChocoboTaxiStandId, uint TerritoryId, Vector3 Position);
 
     /// <summary>
@@ -1497,6 +2011,18 @@ public sealed class Plugin : IDalamudPlugin
         if (entry.Category != "Saisonevent")
             return true;
 
+        // Cross-Game-Kollaborationen (Yo-kai Watch, Final Fantasy XV/XI/XVI, Dragon Quest X,
+        // Fall Guys/MGF, ...) laufen NICHT über das normale Festival-System
+        // (GameMain->ActiveFestivals) - das deckt nur echte wiederkehrende saisonale Events
+        // (Starlight, Hatching-tide, ...) ab. GetActiveFestivalNames() liefert für Kollaborationen
+        // deshalb IMMER eine leere Liste, auch während die Kollaboration tatsächlich live ist
+        // (per Debug-Dump bestätigt: beim laufenden Yo-kai-Watch-Event war die Liste leer, der
+        // Eintrag wurde fälschlich dauerhaft als "Bedingung nicht erfüllt" markiert). Es gibt
+        // dafür keine bekannte, live auslesbare Quelle - Kollaborationen gelten daher generell als
+        // erfüllt (nicht gated), statt permanent falsch negativ zu sein.
+        if (entry.Source.Contains("Collaboration", StringComparison.OrdinalIgnoreCase))
+            return true;
+
         var activeNames = GetActiveFestivalNames();
         if (activeNames.Count == 0)
             return false;
@@ -1703,7 +2229,7 @@ public sealed class Plugin : IDalamudPlugin
     /// Besitz-Voraussetzungen gibt es KEINE auslesbare Verknüpfung in den Lumina-Spieldaten, weder
     /// im Quest- noch im Achievement-Sheet) - daher von Hand gepflegt, Quest-Anzeigename (Englisch,
     /// exakt wie im Spiel) -> benötigte Mount-Namen. Wird nur ergänzt, wenn der Nutzer eine konkrete
-    /// Quest + Voraussetzung nennt, siehe GetRequirementInfo.
+    /// Quest + Voraussetzung nennt, siehe ComputeGrandCompanyOrTribeGateReason.
     /// </summary>
     private static readonly Dictionary<string, string[]> QuestRequiredMounts = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -1721,7 +2247,44 @@ public sealed class Plugin : IDalamudPlugin
     private static readonly Dictionary<string, string> MountRequiredQuest = new(StringComparer.OrdinalIgnoreCase)
     {
         ["Firebird"] = "Fiery Wings, Fiery Hearts",
+        ["Magicked Card"] = "The Adventurer with All the Cards",
     };
+
+    // "Simply to Dye For" (schaltet Färben frei) braucht die abgeschlossene Artefakt-Rüstungsquest
+    // EINES der ursprünglichen A-Realm-Reborn-Jobs (egal welcher) - in Lumina nur indirekt über
+    // "Color Your World" verknüpft, das selbst KEINE auslesbare PreviousQuest-Voraussetzung trägt
+    // (dieselbe Lücke wie bei QuestRequiredMounts) - daher von Hand gepflegt. Key = ClassJob-RowId
+    // (für die job-abhängige Anzeige im Gate-Text, siehe ComputeGrandCompanyOrTribeGateReason),
+    // Wert = Name DIESER Job-Quest. Für die eigentliche Freischalt-Prüfung zählt jede der Werte hier
+    // (OR, nicht nur die des aktuellen Jobs) - siehe DyeUnlockQuestName.
+    private static readonly Dictionary<uint, string> DyeUnlockJobQuestByClassJobId = new()
+    {
+        [19] = "Keeping the Oath",        // Paladin
+        [20] = "How to Quit You",         // Monk
+        [21] = "The Beast Within",        // Warrior
+        [22] = "Into the Dragon's Maw",   // Dragoon
+        [23] = "Five Easy Pieces",        // Bard
+        [24] = "Requiem for the Fallen",  // White Mage
+        [25] = "Always Bet on Black",     // Black Mage
+        [27] = "Primal Burdens",          // Summoner
+        [28] = "Heart of the Forest",     // Scholar
+        [30] = "Master and Student",      // Ninja
+    };
+
+    private const string DyeUnlockQuestName = "Simply to Dye For";
+
+    /// <summary>
+    /// Ob ein Mount (per Anzeigename, siehe QuestRequiredMounts) bereits freigeschaltet ist - löst
+    /// den Namen einmalig über die gecachte CollectionData.GetAllEntries() in seine Id auf, dann
+    /// live über PlayerState geprüft (wie IsOwned), damit die Markierung sofort verschwindet,
+    /// sobald das Mount freigeschaltet wird.
+    /// </summary>
+    private static unsafe bool IsMountUnlockedByName(string mountName)
+    {
+        var mount = CollectionData.GetAllEntries()
+            .FirstOrDefault(e => e.Type == CollectibleType.Mount && string.Equals(e.Name, mountName, StringComparison.OrdinalIgnoreCase));
+        return mount != null && PlayerState.Instance()->IsMountUnlocked(mount.Id);
+    }
 
     /// <summary>
     /// Sammelobjekte, die zwar grundsätzlich existieren, aber nur durch eine noch nicht erreichte
@@ -2017,6 +2580,123 @@ public sealed class Plugin : IDalamudPlugin
     /// </summary>
     private static string? ComputeGrandCompanyOrTribeGateReason(CollectibleEntry entry)
     {
+        // Das Sightseeing Log selbst wird über die Quest "A Sight to Behold" freigeschaltet, NICHT
+        // durchs Fliegen (das war vorher fälschlich über IsTypeCurrentlyPossible/CanFly verknüpft) -
+        // ohne freigeschaltetes Log lässt sich kein einziger Sightseeing-Eintrag abschließen. Live
+        // geprüft, damit die Markierung sofort verschwindet, sobald die Quest erledigt ist.
+        if (entry.Type == CollectibleType.Sightseeing)
+        {
+            if (SightseeingUnsupportedByAutomation.TryGetValue(entry.Id, out var unsupportedReason))
+                return Loc.T(unsupportedReason.De, unsupportedReason.En);
+
+            if (!IsSightseeingLogUnlocked())
+            {
+                return Loc.T(
+                    "Sightseeing Log noch nicht freigeschaltet (Quest \"A Sight to Behold\").",
+                    "Sightseeing Log not unlocked yet (quest \"A Sight to Behold\").");
+            }
+
+            // Die ersten 20 A-Realm-Reborn-Punkte sind mit dem Log selbst verfügbar - die restlichen
+            // 60 (SightseeingNeedsFirstTwenty) erst, wenn ALLE ersten 20 aufgezeichnet sind (danach
+            // schaltet Millith Ironheart in Old Gridania das Buch frei) - siehe SightseeingFirstBookCount.
+            if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
+            {
+                return Loc.T(
+                    $"Benötigt zuerst alle ersten {SightseeingFirstBookCount} A-Realm-Reborn-Sichtungspunkte (schaltet die restlichen bei Millith Ironheart, Old Gridania, frei).",
+                    $"Requires the first {SightseeingFirstBookCount} A Realm Reborn sightseeing points first (unlocks the rest with Millith Ironheart in Old Gridania).");
+            }
+
+            // Heavensward (feste Quest) bzw. Stormblood und später (siehe ResolveSightseeingGateQuests,
+            // aus Lumina "AdventureExPhase" aufgelöst) - jedes spätere Buch braucht seine eigene Quest.
+            if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
+            {
+                var gateQuestName = ResolveQuestNameById(entry.SightseeingGateQuestId);
+                return string.IsNullOrEmpty(gateQuestName)
+                    ? Loc.T("Dieses Sightseeing-Log-Buch ist noch nicht freigeschaltet.", "This sightseeing log book isn't unlocked yet.")
+                    : Loc.T(
+                        $"Benötigt die abgeschlossene Quest \"{gateQuestName}\", um dieses Sightseeing-Log-Buch freizuschalten.",
+                        $"Requires the completed quest \"{gateQuestName}\" to unlock this sightseeing log book.");
+            }
+
+            // Nur A-Realm-Reborn-Punkte verlangen ein bestimmtes Wetter (SightseeingWeatherMask != 0),
+            // siehe RealmRebornVistaWeathers.
+            if (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
+            {
+                return Loc.T(
+                    "Das Wetter in dieser Zone passt gerade nicht (nur bei bestimmtem Wetter sichtbar/abschließbar).",
+                    "The weather in this zone isn't right currently (only visible/completable with specific weather).");
+            }
+
+            if (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry))
+            {
+                return Loc.T(
+                    $"Nur zwischen {entry.SightseeingFirstBell:00}:00 und {entry.SightseeingLastBell:00}:59 Eorzeazeit sichtbar/abschließbar.",
+                    $"Only visible/completable between {entry.SightseeingFirstBell:00}:00 and {entry.SightseeingLastBell:00}:59 Eorzea time.");
+            }
+        }
+
+        // Mounts mit einer manuell erfassten Zusatz-Voraussetzung (siehe MountRequiredQuest-
+        // Kommentar) - live gegen den tatsächlichen Quest-Abschluss geprüft.
+        if (entry.Type == CollectibleType.Mount && MountRequiredQuest.TryGetValue(entry.Name, out var requiredQuestForMount))
+        {
+            var requiredQuestId = ResolveQuestIdByName(requiredQuestForMount);
+            if (requiredQuestId == null || !QuestManager.IsQuestComplete((ushort)requiredQuestId.Value))
+            {
+                return Loc.T(
+                    $"Benötigt die abgeschlossene Quest \"{requiredQuestForMount}\".",
+                    $"Requires the completed quest \"{requiredQuestForMount}\".");
+            }
+        }
+
+        // Quests mit einer manuell erfassten Zusatz-Voraussetzung (siehe QuestRequiredMounts-
+        // Kommentar) - live gegen den tatsächlichen Mount-Besitz geprüft.
+        if (entry.Type == CollectibleType.Quest && QuestRequiredMounts.TryGetValue(entry.Name, out var requiredMounts))
+        {
+            var missingMount = requiredMounts.FirstOrDefault(mountName => !IsMountUnlockedByName(mountName));
+            if (missingMount != null)
+            {
+                return Loc.T(
+                    $"Benötigt das freigeschaltete Mount \"{missingMount}\".",
+                    $"Requires the unlocked mount \"{missingMount}\".");
+            }
+        }
+
+        // "Simply to Dye For" (Färben-Freischaltung) braucht die abgeschlossene Artefakt-Rüstungs-
+        // quest EINES beliebigen ursprünglichen A-Realm-Reborn-Jobs (siehe
+        // DyeUnlockJobQuestByClassJobId-Kommentar) - JEDE davon zählt (OR), nicht nur die des
+        // aktuell gespielten Jobs. Zeigt bevorzugt den Namen DER Job-Quest, die zum aktuell
+        // gespielten Job passt (am ehesten relevant), sonst den generischen Platzhalter.
+        if (entry.Type == CollectibleType.Quest && string.Equals(entry.Name, DyeUnlockQuestName, StringComparison.OrdinalIgnoreCase))
+        {
+            var anyDyeUnlockQuestComplete = DyeUnlockJobQuestByClassJobId.Values
+                .SelectMany(ResolveAllQuestIdsByName)
+                .Any(id => QuestManager.IsQuestComplete((ushort)id));
+
+            if (!anyDyeUnlockQuestComplete)
+            {
+                var currentClassJobId = ObjectTable.LocalPlayer?.ClassJob.RowId ?? 0;
+                var jobQuestName = DyeUnlockJobQuestByClassJobId.TryGetValue(currentClassJobId, out var name)
+                    ? name
+                    : "Artefact Armor Quest";
+
+                return Loc.T(
+                    $"Benötigt die abgeschlossene Quest \"{jobQuestName}\" (oder die eines anderen A-Realm-Reborn-Jobs).",
+                    $"Requires the completed quest \"{jobQuestName}\" (or that of another A Realm Reborn job).");
+            }
+        }
+
+        // Nur während eines saisonalen Events kaufbare Einträge (Category "Saisonevent", siehe
+        // IsSeasonalEventEntryCurrentlyActive) - früher komplett aus der Liste gefiltert, statt
+        // dessen (wie jede andere Bedingung) live geprüft und als "Bedingung nicht erfüllt"
+        // markiert, solange das zugehörige Event gerade NICHT läuft. Der Eventname steht bei diesen
+        // Einträgen bereits als Klartext im Source-Feld (z.B. "The Rising (2026)").
+        if (entry.Category == "Saisonevent" && !IsSeasonalEventEntryCurrentlyActive(entry))
+        {
+            return Loc.T(
+                $"Nur während eines Events erhältlich ({entry.Source}), das gerade nicht läuft.",
+                $"Only available during an event ({entry.Source}), which isn't currently running.");
+        }
+
         // Quartiermeister-Waren (Bardings/Hatchling-Minions/Orchestrion-Rollen) sind an die JEWEILS
         // EIGENE Kompanie gebunden (siehe GrandCompanySpecificItems-Kommentar).
         if (GrandCompanySpecificItems.TryGetValue((entry.Type, entry.Name), out var requiredCompanyId))
@@ -2301,53 +2981,6 @@ public sealed class Plugin : IDalamudPlugin
 
         return questIdsByNameCache.TryGetValue(questName, out var id) ? id : null;
     }
-
-    /// <summary>
-    /// Hinweistext + Wiki-Link für Einträge mit manuell erfasster Zusatz-Voraussetzung (siehe
-    /// QuestRequiredMounts/MountRequiredQuest) - bewusst NICHT im CollectibleEntry selbst gespeichert
-    /// (die Mount-Liste kommt aus der einmal geladenen/für die ganze Sitzung gecachten
-    /// CollectionData.GetAllEntries() und würde sonst nach Erfüllen der Voraussetzung nicht mehr
-    /// aktualisiert), sondern jeden Frame frisch geprüft, genau wie IsOwned/CanAfford. Gibt (null,
-    /// null) zurück, wenn keine Voraussetzung bekannt ist oder sie bereits erfüllt ist.
-    /// </summary>
-    public unsafe (string? Note, string? WikiUrl) GetRequirementInfo(CollectibleEntry entry)
-    {
-        if (entry.Type == CollectibleType.Quest && QuestRequiredMounts.TryGetValue(entry.Name, out var requiredMounts))
-        {
-            var mountIdsByName = CollectionData.GetAllEntries()
-                .Where(e => e.Type == CollectibleType.Mount)
-                .GroupBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
-
-            foreach (var mountName in requiredMounts)
-            {
-                if (!mountIdsByName.TryGetValue(mountName, out var mountId) || !PlayerState.Instance()->IsMountUnlocked(mountId))
-                    return (Loc.T("(Voraussetzung nicht erfüllt)", "(requirement not met)"), GetWikiUrl(entry.Name));
-            }
-
-            return (null, null);
-        }
-
-        if (entry.Type == CollectibleType.Mount && MountRequiredQuest.TryGetValue(entry.Name, out var requiredQuest))
-        {
-            var questId = ResolveQuestIdByName(requiredQuest);
-            if (questId == null || !QuestManager.IsQuestComplete((ushort)questId.Value))
-                return ($"(Quest: {requiredQuest})", GetWikiUrl(requiredQuest));
-
-            return (null, null);
-        }
-
-        return (null, null);
-    }
-
-    /// <summary>
-    /// Wiki-Seite für eine Quest mit Zusatz-Voraussetzung (siehe QuestRequiredMounts/
-    /// MountRequiredQuest) - das Consolegameswiki verwendet als URL einfach den Quest-Anzeigenamen
-    /// mit Leerzeichen durch Unterstriche ersetzt (Satzzeichen wie Kommas bleiben unverändert
-    /// stehen), siehe z.B. https://ffxiv.consolegameswiki.com/wiki/Fiery_Wings,_Fiery_Hearts.
-    /// </summary>
-    private static string GetWikiUrl(string questName) =>
-        "https://ffxiv.consolegameswiki.com/wiki/" + questName.Replace(' ', '_');
 
     /// <summary>
     /// Prüft alle Freischalt-/Annehmbarkeits-Bedingungen einer Quest AUSSER dem Vergabeort (den
@@ -2661,47 +3294,17 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        // Sightseeing-Log-Einträge ("Adventure" im Lumina-Sheet) - anders als Ätherströmungen haben
-        // diese eine echte Weltposition direkt im Sheet (über die verlinkte "Level"-Zeile), kein
-        // Community-Export nötig. Achsen-Umrechnung (Level.X/Z/Y -> Welt X/Y/Z) und der +0.5f
-        // Höhenversatz sind vom Dalamud-Plugin "Tourist" übernommen (dessen MarkerService setzt
-        // exakt dieselbe VFX-Markierung an dieser Position).
-        var adventureSheet = DataManager.GetExcelSheet<Adventure>();
-        if (adventureSheet != null)
-        {
-            foreach (var row in adventureSheet)
-            {
-                try
-                {
-                    var level = row.Level.ValueNullable;
-                    if (level == null || level.Value.Territory.RowId != territoryId)
-                        continue;
-
-                    var name = row.Name.ToString();
-                    if (string.IsNullOrEmpty(name))
-                        continue;
-
-                    var emoteCommand = row.Emote.ValueNullable?.TextCommand.ValueNullable?.Command.ToString();
-
-                    result.Add(new CollectibleEntry
-                    {
-                        Id = row.RowId,
-                        Name = name,
-                        Type = CollectibleType.Sightseeing,
-                        Category = Loc.T("Sightseeing", "Sightseeing"),
-                        TerritoryTypeId = territoryId,
-                        MapId = level.Value.Map.RowId,
-                        WorldPosition = new Vector3(level.Value.X, level.Value.Z, level.Value.Y),
-                        RequiredEmoteCommand = string.IsNullOrEmpty(emoteCommand) ? null : emoteCommand,
-                        Source = Loc.T("Sightseeing", "Sightseeing"),
-                    });
-                }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, $"Fehler bei Adventure-Zeile {row.RowId}");
-                }
-            }
-        }
+        // Sightseeing-Log-Einträge - global EINMAL aus dem ganzen "Adventure"-Sheet aufgebaut (siehe
+        // GetSightseeingEntries), da die Zusatz-Bedingungen (v.a. "erste 20 A-Realm-Reborn-Punkte
+        // nötig") die Position INNERHALB des GESAMTEN Sheets brauchen, nicht nur der aktuellen Zone -
+        // hier nur nach Zone gefiltert. Genau wie bei Aetheryten oben sollen in geteilten Hauptstädten
+        // (z.B. Limsa: "Barracuda Piers" liegt in den Upper, andere Punkte evtl. in den Lower Decks)
+        // Punkte aus JEDEM Bezirk auftauchen, egal in welchem man gerade steht - sonst fehlt beim
+        // Betreten des "falschen" Bezirks ein Teil der eigentlich schon erreichbaren Punkte.
+        var acceptableSightseeingTerritoryIds = SplitCityTerritories.TryGetValue(territoryId, out var sightseeingSiblingIds)
+            ? sightseeingSiblingIds
+            : new[] { territoryId };
+        result.AddRange(GetSightseeingEntries().Where(e => acceptableSightseeingTerritoryIds.Contains(e.TerritoryTypeId)));
 
         return result;
     }
@@ -2968,6 +3571,41 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
+    /// Nächstgelegener bereits freigeschalteter Aetheryte/Aethernetz-Kristall EINER Zone (nicht der
+    /// ganzen geteilten Hauptstadt, siehe FlagTerritoryTypeId) zu einer rohen Weltposition IN
+    /// DERSELBEN Zone - über Kartenkoordinaten-Distanz als Näherung (funktioniert daher auch für
+    /// eine Zone, in der man sich gerade gar nicht befindet, anders als eine vnavmesh-Abfrage, die
+    /// nur die aktuell geladene Zone kennt). Für SightseeingAutomation: vor einem Lifestream-
+    /// Aethernetz-Sprung zum nächsten Kristall im AKTUELLEN Bezirk laufen (Lifestream springt nur
+    /// aus der Reichweite eines Aethernetz-Punkts heraus, nicht von einer beliebigen Position) UND
+    /// im ZIEL-Bezirk den zum eigentlichen Sightseeing-Punkt nächstgelegenen Kristall als
+    /// Sprungziel wählen (statt "irgendeinen", der unnötig weit weg liegen kann).
+    /// </summary>
+    public static CollectibleEntry? FindNearestUnlockedAetheryteInZone(uint territoryId, Vector3 referenceWorldPosition)
+    {
+        var candidates = instance.GetLiveZoneEntries(ResolveEffectiveTerritoryId(territoryId))
+            .Where(e => e.Type == CollectibleType.Aetheryte
+                        && (e.FlagTerritoryTypeId ?? e.TerritoryTypeId) == territoryId
+                        && IsAetheryteUnlocked(e.Id))
+            .ToList();
+        if (candidates.Count == 0)
+            return null;
+
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        var mapId = territorySheet != null && territorySheet.TryGetRow(territoryId, out var territory) ? territory.Map.RowId : 0u;
+        var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+        if (mapId == 0 || mapSheet == null || !mapSheet.TryGetRow(mapId, out var map))
+            return candidates[0];
+
+        var referenceMapCoords = Dalamud.Utility.MapUtil.WorldToMap(
+            new Vector2(referenceWorldPosition.X, referenceWorldPosition.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+
+        return candidates
+            .OrderBy(e => Vector2.DistanceSquared(new Vector2(e.VendorMapX, e.VendorMapY), new Vector2(referenceMapCoords.X, referenceMapCoords.Y)))
+            .First();
+    }
+
+    /// <summary>
     /// Öffentlicher Zugriff auf die geteilten-Hauptstadt-Bezirksgruppe einer Zone (siehe
     /// SplitCityTerritories) - für die Aetheryten-Automation.
     /// </summary>
@@ -3005,7 +3643,7 @@ public sealed class Plugin : IDalamudPlugin
     /// <summary>
     /// Liest den menschenlesbaren Zonennamen aus dem Lumina "TerritoryType"-Sheet.
     /// </summary>
-    public string GetZoneName(uint territoryTypeId)
+    public static string GetZoneName(uint territoryTypeId)
     {
         var sheet = DataManager.GetExcelSheet<TerritoryType>();
         if (sheet != null && sheet.TryGetRow(territoryTypeId, out var row))
@@ -3074,6 +3712,23 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
+    /// Rechnet eine Kartenkoordinate (wie bei CollectibleEntry.VendorMapX/Y) in eine grobe rohe
+    /// Weltposition um (Umkehrung von MapUtil.WorldToMap, Y unbekannt/immer 0) - für Fälle ohne
+    /// vnavmesh-Abfrage verfügbar (andere Zone als aktuell geladen, o.ä.), z.B. um die Entfernung
+    /// eines Eintrags zum Spieler grob abzuschätzen (siehe QuestAutomation.TryStartNext).
+    /// </summary>
+    public static Vector3? ResolveWorldPositionFromMapCoords(uint mapId, float mapX, float mapY)
+    {
+        var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+        if (mapSheet == null || !mapSheet.TryGetRow(mapId, out var map) || map.SizeFactor == 0)
+            return null;
+
+        var worldX = (mapX - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetX;
+        var worldZ = (mapY - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetY;
+        return new Vector3(worldX, 0, worldZ);
+    }
+
+    /// <summary>
     /// Öffnet die Ingame-Karte mit einer Flagge auf der Händler-Position des Eintrags. Mit
     /// showMapWindow=false wird die Flagge zwar gesetzt (z.B. für vnavmesh FlagToPoint), das dabei
     /// von GameGui.OpenMapWithMapLink automatisch mit geöffnete Karten-Fenster aber sofort wieder
@@ -3095,9 +3750,7 @@ public sealed class Plugin : IDalamudPlugin
         // IPC aufgelöst, die die Automationen auch fürs tatsächliche Laufen benutzen (steht nur zur
         // Verfügung, wenn man gerade in genau dieser Zone steht, da vnavmesh die Flagge gegen das
         // aktuell geladene Navmesh auflöst) - das zeigt garantiert exakt denselben Punkt, den die
-        // Automation ansteuern würde. Sonst Fallback auf die eigene Umrechnung der Kartenkoordinate
-        // zurück in eine rohe Weltposition (Umkehrung von MapUtil.WorldToMap, dieselbe Formel wie in
-        // HuntingLogPositions.cs dokumentiert/ResolveAetheryteWorldPosition benutzt).
+        // Automation ansteuern würde. Sonst Fallback auf ResolveWorldPositionFromMapCoords.
         Vector3? navigationWorldPosition = null;
         if (ClientState.TerritoryType == territoryForFlag && navigationFlagToPointQuery is { HasFunction: true } query)
         {
@@ -3105,16 +3758,7 @@ public sealed class Plugin : IDalamudPlugin
             catch { /* vnavmesh nicht bereit - siehe Fallback unten */ }
         }
 
-        if (navigationWorldPosition == null)
-        {
-            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
-            if (mapSheet != null && mapSheet.TryGetRow(entry.MapId, out var map) && map.SizeFactor != 0)
-            {
-                var worldX = (entry.VendorMapX - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetX;
-                var worldZ = (entry.VendorMapY - 1f) * 50f - 102400f / map.SizeFactor - map.OffsetY;
-                navigationWorldPosition = new Vector3(worldX, 0, worldZ);
-            }
-        }
+        navigationWorldPosition ??= ResolveWorldPositionFromMapCoords(entry.MapId, entry.VendorMapX, entry.VendorMapY);
 
         if (navigationWorldPosition.HasValue)
             SetNavigationTarget(navigationWorldPosition.Value, entry.Name, territoryForFlag);
@@ -3290,6 +3934,39 @@ public sealed class Plugin : IDalamudPlugin
 
         actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
     }
+
+    // Von Hand als "nicht von der Automation unterstützt" markierte Sightseeing-Punkte (Key =
+    // Adventure-RowId, Wert = Anzeigetext) - erscheinen dadurch weiterhin in der Liste, aber mit
+    // "Bedingung nicht erfüllt" statt von der Automation (erfolglos) angelaufen zu werden. Alles
+    // echte Jumping Puzzles - ein Versuch, das per simuliertem Tastendruck (IKeyState) zu
+    // automatisieren, ist an einer bewussten Dalamud-Einschränkung gescheitert ("Dalamud does not
+    // support pressing keys, only preventing them"); vnavmesh selbst kann so eine echte Sprung-Lücke
+    // ohnehin nicht queren (kein Navmesh dort). Bleibt daher dauerhaft manuell.
+    private static readonly Dictionary<uint, (string De, string En)> SightseeingUnsupportedByAutomation = new()
+    {
+        [2162724] = ( // The Carline Canopy
+            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
+            "Not supported by the automation (jumping puzzle) - please visit it manually."),
+        [2162696] = ( // The Leatherworkers' Guild
+            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
+            "Not supported by the automation (jumping puzzle) - please visit it manually."),
+        [2162697] = ( // Apkallu Falls
+            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
+            "Not supported by the automation (jumping puzzle) - please visit it manually."),
+        [2162725] = ( // The Lancers' Guild
+            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
+            "Not supported by the automation (jumping puzzle) - please visit it manually."),
+    };
+
+    /// <summary>
+    /// Für SightseeingAutomations Zielliste (siehe CompactOverlayWindow) - bewusst ZUSÄTZLICH zu
+    /// IsAchievementOrRankGated/ComputeGrandCompanyOrTribeGateReason geprüft, statt sich allein
+    /// darauf zu verlassen: Configuration.SimulateSightseeingAutomation umgeht genau diese
+    /// Gate-Prüfung absichtlich (siehe dessen Kommentar), würde einen als "nicht unterstützt"
+    /// markierten Punkt im Simulation-Modus sonst trotzdem als Automations-Ziel durchlassen.
+    /// </summary>
+    public static bool IsSightseeingUnsupportedByAutomation(uint adventureId) =>
+        SightseeingUnsupportedByAutomation.ContainsKey(adventureId);
 
     /// <summary>
     /// Liefert die aktuell freigeschalteten Mounts (Id + Name) - für die Mount-Auswahl der
@@ -3654,9 +4331,31 @@ public sealed class Plugin : IDalamudPlugin
         foreach (var entry in sightseeing)
         {
             var emote = string.IsNullOrEmpty(entry.RequiredEmoteCommand) ? "keiner" : entry.RequiredEmoteCommand;
+            var gateReason = GetAchievementOrRankGateReason(entry);
+            var conditionText = string.IsNullOrEmpty(gateReason) ? "erfüllt" : gateReason;
             Log.Info($"[SightseeingDebug]   {entry.Name}(#{entry.Id}): Position={entry.WorldPosition}, benötigter Emote={emote}, " +
-                     $"unlocked={IsAdventureComplete(entry.Id)}");
+                     $"unlocked={IsAdventureComplete(entry.Id)}, WeatherMask={entry.SightseeingWeatherMask}, " +
+                     $"Zeitfenster={(entry.SightseeingHasTimeWindow ? $"{entry.SightseeingFirstBell:00}-{entry.SightseeingLastBell:00}" : "keins")}, " +
+                     $"GateQuestId={entry.SightseeingGateQuestId}, NeedsFirstTwenty={entry.SightseeingNeedsFirstTwenty}, Bedingung={conditionText}");
         }
+    }
+
+    /// <summary>
+    /// Loggt die eigene aktuelle Weltposition + Zone - zum Ermitteln von Ersatz-Koordinaten für
+    /// SightseeingApproachOverrides (oder ManualAetheryteWorldPositions): einfach an die gewünschte
+    /// Stelle (z.B. 1-2 Yards vor einem Sightseeing-Punkt, der gegen eine Wand läuft) laufen und
+    /// diesen Dump auslösen, statt die Koordinaten mit einem Fremd-Tool suchen zu müssen.
+    /// </summary>
+    public void DumpPlayerPositionDebugInfo()
+    {
+        var player = ObjectTable.LocalPlayer;
+        if (player == null)
+        {
+            Log.Info("[PositionDebug] Kein lokaler Spieler gefunden.");
+            return;
+        }
+
+        Log.Info($"[PositionDebug] Zone {ClientState.TerritoryType}: Position=({player.Position.X}, {player.Position.Y}, {player.Position.Z})");
     }
 
     /// <summary>
@@ -3965,14 +4664,31 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Prüft, ob der Spieler aktuell genug von der benötigten Währung besitzt, um den Eintrag zu kaufen.
+    /// Prüft, ob der Spieler aktuell genug von JEDER benötigten Währung besitzt, um den Eintrag zu
+    /// kaufen - bei mehreren gleichzeitig benötigten Währungen (siehe
+    /// CollectibleEntry.AdditionalCurrencies, z.B. Triple-Triad-Karte "G-Warrior") müssen ALLE
+    /// davon erfüllt sein, nicht nur die erste.
     /// </summary>
     public bool CanAfford(CollectibleEntry entry)
     {
         if (entry.CurrencyItemId == 0 || entry.CurrencyAmount == 0)
             return false;
 
-        return GetCurrencyAmount(entry.CurrencyItemId) >= entry.CurrencyAmount;
+        if (GetCurrencyAmount(entry.CurrencyItemId) < entry.CurrencyAmount)
+            return false;
+
+        if (entry.AdditionalCurrencies != null)
+        {
+            foreach (var additional in entry.AdditionalCurrencies)
+            {
+                if (additional.CurrencyItemId == 0 || additional.CurrencyAmount == 0)
+                    return false;
+                if (GetCurrencyAmount(additional.CurrencyItemId) < additional.CurrencyAmount)
+                    return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -3999,7 +4715,6 @@ public sealed class Plugin : IDalamudPlugin
         QuestAutomation.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
-        CommandManager.RemoveHandler("/tecqst");
 
         PluginInterface.UiBuilder.Draw -= DrawUI;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUI;

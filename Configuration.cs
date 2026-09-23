@@ -29,13 +29,20 @@ public class Configuration : IPluginConfiguration
         [CollectibleType.Facewear] = true,
         [CollectibleType.FashionAccessory] = true,
         [CollectibleType.TripleTriadCard] = true,
+        [CollectibleType.Hairstyle] = true,
     };
+
+    // Welche Währungen (per GetCurrencyLabel-Kurzname, z.B. "MGP", "Allied Seals") komplett
+    // ausgeblendet werden sollen - und mit ihnen alle Einträge, die genau diese Währung verlangen
+    // (siehe CompactOverlayWindow "Currencys filtern"). Leer = nichts ausgeblendet.
+    public HashSet<string> HiddenCurrencies { get; set; } = new();
 
     // Reihenfolge, in der die Typen im kompakten Overlay aufgelistet werden
     public List<CollectibleType> TypeOrder { get; set; } = new()
     {
         CollectibleType.Mount, CollectibleType.Minion, CollectibleType.Orchestrion, CollectibleType.Barding,
         CollectibleType.Emote, CollectibleType.Facewear, CollectibleType.FashionAccessory, CollectibleType.TripleTriadCard,
+        CollectibleType.Hairstyle,
     };
 
     // 0 = undurchsichtig, 1 = vollständig transparent
@@ -98,6 +105,14 @@ public class Configuration : IPluginConfiguration
     // nicht auf die normale "fehlt noch"-Anzeige im Overlay.
     public bool SimulateAetheryteAutomation { get; set; } = false;
     public bool SimulateChocobokeepAutomation { get; set; } = false;
+
+    // Wie oben, aber zusätzlich zu bereits aufgezeichneten Punkten auch solche, die gerade durch
+    // falsches Wetter/falsche Uhrzeit oder eine noch nicht erfüllte Buch-Freischaltung als "Bedingung
+    // nicht erfüllt" markiert sind (siehe Plugin.ComputeGrandCompanyOrTribeGateReason) - zum Testen
+    // von Laufweg/Ankunftsposition, ohne auf das passende Wetter/die passende Uhrzeit warten zu
+    // müssen. Wirkt sich NUR auf die Automation-Zielliste aus, nicht auf die normale Anzeige im
+    // Overlay.
+    public bool SimulateSightseeingAutomation { get; set; } = false;
 
     public void Save()
     {
