@@ -767,6 +767,42 @@ public class MainWindow : Window
             config.UseSprintOnCooldown = useSprint;
             config.Save();
         }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // Automatisch abschalten, falls Allagan Tools nachträglich deinstalliert/deaktiviert wurde -
+        // sonst bliebe die Option "an", obwohl der Klick-Handler (siehe Plugin.OpenAllaganToolsItemInfo)
+        // mangels Plugin ohnehin nichts mehr täte.
+        var allaganToolsAvailable = Plugin.IsAllaganToolsAvailable();
+        if (config.EnableAllaganToolsIntegration && !allaganToolsAvailable)
+        {
+            config.EnableAllaganToolsIntegration = false;
+            config.Save();
+        }
+
+        if (!allaganToolsAvailable)
+            ImGui.BeginDisabled();
+
+        var enableAllaganTools = config.EnableAllaganToolsIntegration;
+        if (ModernUi.ToggleRow(Loc.T("Allagan-Tools-Integration aktivieren", "Enable Allagan Tools integration"), ref enableAllaganTools))
+        {
+            config.EnableAllaganToolsIntegration = enableAllaganTools;
+            config.Save();
+        }
+
+        if (!allaganToolsAvailable)
+            ImGui.EndDisabled();
+
+        if (!allaganToolsAvailable && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(Loc.T("Allagan Tools ist nicht installiert.", "Allagan Tools is not installed."));
+
+        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 5f);
+        TextDisabledWrapped(Loc.T(
+            "Aktiviert die Möglichkeit, mit SHIFT + Linksklick mehr Informationen zu den Items oder Currencys zu bekommen.",
+            "Enables the ability to get more information about items or currencies via SHIFT + left-click."));
+
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
@@ -1167,6 +1203,10 @@ public class MainWindow : Window
             "Klickt automatisch durch Dialoge/Cutscenes während der Quest-Automation.",
             "Automatically clicks through dialogue/cutscenes during the quest automation.",
             true),
+        ("InventoryTools", "Allagan Tools",
+            "Optional - für \"SHIFT + Linksklick\" auf Items/Währungen im Overlay, siehe die Einstellung \"Allagan-Tools-Integration aktivieren\" unter Allgemein > QoL.",
+            "Optional - for \"SHIFT + left-click\" on items/currencies in the overlay, see the \"Enable Allagan Tools integration\" setting under General > QoL.",
+            false),
     };
 
     /// <summary>

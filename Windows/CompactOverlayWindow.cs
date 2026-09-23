@@ -411,13 +411,15 @@ public class CompactOverlayWindow : Window
         // während man selbst in den Lower Decks steht) - SightseeingAutomation reist bei Bedarf selbst
         // per Lifestream über den nächsten freigeschalteten Aetheryten in den Zielbezirk, genau wie
         // AetheryteAutomation/GoToAutomation (siehe SightseeingAutomation.TryTravelToDistrict).
-        // IsSightseeingUnsupportedByAutomation IMMER ausgeschlossen (auch im Simulation-Modus, der
-        // die Gate-Prüfung darunter sonst bewusst umgeht) - echte Jumping Puzzles ("The Carline
-        // Canopy", "The Leatherworkers' Guild"), die dauerhaft nur manuell aufsuchbar sind (siehe
-        // Plugin.SightseeingUnsupportedByAutomation-Kommentar).
+        // IsSightseeingUnsupportedByAutomation und "kein Fliegen freigeschaltet" IMMER ausgeschlossen
+        // (auch im Simulation-Modus, der die Gate-Prüfung darunter sonst bewusst umgeht) - echte
+        // Jumping Puzzles ("The Carline Canopy", "The Leatherworkers' Guild"), die dauerhaft nur
+        // manuell aufsuchbar sind (siehe Plugin.SightseeingUnsupportedByAutomation-Kommentar), bzw.
+        // Fliegen als harte Voraussetzung fürs gesamte Feature (explizite Nutzeranforderung) - ohne
+        // Fliegen kann vnavmesh die Punkte ohnehin nicht zuverlässig erreichen.
         var missingSightseeingInZone = plugin.GetLiveZoneEntries(effectiveTerritoryId)
             .Where(e => e.Type == CollectibleType.Sightseeing && siblingTerritories.Contains(e.TerritoryTypeId))
-            .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id))
+            .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id) && !Plugin.IsSightseeingBlockedByFlying(e))
             .Where(e => config.SimulateSightseeingAutomation || (!plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e)))
             .ToList();
         plugin.SightseeingAutomation.Update(missingSightseeingInZone);
@@ -661,7 +663,8 @@ public class CompactOverlayWindow : Window
                 ImGui.SameLine();
                 OutlineText("-", MutedColor);
 
-                DrawCurrencyRequirement(entry.Currency, entry.CurrencyIconId, entry.CurrencyItemId, entry.CurrencyAmount);
+                var currencyAllaganToolsEligible = AllaganToolsEligibleTypes.Contains(entry.Type);
+                DrawCurrencyRequirement(entry.Currency, entry.CurrencyIconId, entry.CurrencyItemId, entry.CurrencyAmount, currencyAllaganToolsEligible);
 
                 // Für die wenigen Einträge, die MEHRERE Währungen gleichzeitig verlangen (z.B.
                 // Triple-Triad-Karte "G-Warrior": 1x Ruby Totem + 1x Emerald Totem + 1x Diamond
@@ -670,7 +673,7 @@ public class CompactOverlayWindow : Window
                 if (entry.AdditionalCurrencies != null)
                 {
                     foreach (var additional in entry.AdditionalCurrencies)
-                        DrawCurrencyRequirement(additional.Currency, additional.CurrencyIconId, additional.CurrencyItemId, additional.CurrencyAmount);
+                        DrawCurrencyRequirement(additional.Currency, additional.CurrencyIconId, additional.CurrencyItemId, additional.CurrencyAmount, currencyAllaganToolsEligible);
                 }
             }
 
@@ -680,9 +683,56 @@ public class CompactOverlayWindow : Window
             if (Plugin.IsAchievementOrRankGated(entry))
             {
                 ImGui.SameLine();
-                OutlineText(Loc.T("(Bedingung nicht erfüllt)", "(condition not met)"), UnsupportedColor);
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
+
+                if (Plugin.IsSightseeingBlockedByFlying(entry))
+                {
+                    // Explizite Nutzeranforderung: das Sightseeing-Feature soll nur mit
+                    // freigeschaltetem Fliegen funktionieren - eigener, spezifischer Hinweistext
+                    // statt des generischen Labels, hat Vorrang vor der Jumping-Puzzle-Sonderbehandlung
+                    // unten (siehe Plugin.ComputeGrandCompanyOrTribeGateReason-Reihenfolge).
+                    OutlineText(Loc.T("(Bedingung nicht erfüllt (Fliegen nicht freigeschaltet))", "(condition not met (flying not unlocked))"), UnsupportedColor);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
+                }
+                else if (entry.Type == CollectibleType.Sightseeing && Plugin.IsSightseeingUnsupportedByAutomation(entry.Id) && Plugin.IsSightseeingBookAccessible(entry))
+                {
+                    // Trotz "von der Automation nicht unterstützt" (echtes Jumping Puzzle) weiterhin
+                    // den tatsächlichen Wetter-/Zeit-Status zeigen - grün mit Restdauer, solange
+                    // gerade aktiv (man kann so einen Punkt ja manuell erreichen), sonst wie gewohnt
+                    // mit Countdown bis zur Verfügbarkeit. Der Text selbst bleibt IMMER
+                    // "(Bedingung nicht erfüllt)", unabhängig vom Wetter/Zeit-Status (der Hinweis auf
+                    // das Jumping Puzzle steht bereits im Hover-Tooltip, siehe unten).
+                    var activeLabel = Plugin.GetSightseeingActiveUntilLabel(entry);
+                    var isActive = !string.IsNullOrEmpty(activeLabel);
+                    var timerSuffix = isActive ? activeLabel : Plugin.GetSightseeingAvailabilityLabel(entry);
+                    var color = isActive ? AffordableColor : UnsupportedColor;
+
+                    OutlineText(
+                        Loc.T($"(Bedingung nicht erfüllt{timerSuffix})", $"(condition not met{timerSuffix})"),
+                        color);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
+                }
+                else
+                {
+                    // Für Sightseeing-Punkte, die gerade durch Wetter/Uhrzeit gesperrt sind, direkt im
+                    // Label sichtbar (nicht erst im Hover-Tooltip) - siehe GetSightseeingAvailabilityLabel.
+                    var availabilityLabel = Plugin.GetSightseeingAvailabilityLabel(entry);
+                    OutlineText(Loc.T($"(Bedingung nicht erfüllt{availabilityLabel})", $"(condition not met{availabilityLabel})"), UnsupportedColor);
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
+                }
+            }
+            else
+            {
+                // Sightseeing-Punkte mit Wetter-/Zeitfenster-Bedingung, die GERADE aktiv sind - grün
+                // mit Restdauer, bis diese Bedingung wieder kippt (siehe GetSightseeingActiveUntilLabel).
+                var activeUntilLabel = Plugin.GetSightseeingActiveUntilLabel(entry);
+                if (!string.IsNullOrEmpty(activeUntilLabel))
+                {
+                    ImGui.SameLine();
+                    OutlineText($"({Loc.T("aktiv", "active")}{activeUntilLabel})", AffordableColor);
+                }
             }
         }
 
@@ -698,7 +748,7 @@ public class CompactOverlayWindow : Window
     /// CollectibleEntry.AdditionalCurrencies) mehrfach hintereinander aufgerufen, für den
     /// Normalfall (nur eine Währung) genau einmal.
     /// </summary>
-    private void DrawCurrencyRequirement(string currencyText, uint currencyIconId, uint currencyItemId, uint currencyAmount)
+    private void DrawCurrencyRequirement(string currencyText, uint currencyIconId, uint currencyItemId, uint currencyAmount, bool allaganToolsEligible)
     {
         ImGui.SameLine();
 
@@ -729,8 +779,24 @@ public class CompactOverlayWindow : Window
 
         ImGui.EndGroup();
 
+        // SHIFT + Linksklick: Allagan Tools' "Mehr Informationen"-Fenster für DIESE Währung öffnen
+        // (siehe Plugin.OpenAllaganToolsItemInfo), falls aktiviert, eine Item-ID bekannt ist und der
+        // BESITZENDE Eintrag zu den Item-Typen gehört (siehe AllaganToolsEligibleTypes) - Quest/
+        // Sightseeing/etc. zeigen aktuell zwar ohnehin nie eine Währung, aus Konsistenzgründen aber
+        // trotzdem mitgeprüft.
+        var allaganToolsEnabled = allaganToolsEligible && currencyItemId != 0
+                                   && plugin.Configuration.EnableAllaganToolsIntegration && Plugin.IsAllaganToolsAvailable();
+
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip(GetCurrencyLabel(currencyText));
+        {
+            var label = GetCurrencyLabel(currencyText);
+            ImGui.SetTooltip(allaganToolsEnabled
+                ? $"{label}\n{Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)")}"
+                : label);
+        }
+
+        if (allaganToolsEnabled && ImGui.IsItemClicked() && ImGui.GetIO().KeyShift)
+            Plugin.OpenAllaganToolsItemInfo(currencyItemId);
     }
 
     /// <summary>
@@ -1347,6 +1413,9 @@ public class CompactOverlayWindow : Window
     private void DrawClickableName(CollectibleEntry entry, bool isNotYetPossible = false)
     {
         var affordable = plugin.CanAfford(entry);
+        var allaganToolsEnabled = plugin.Configuration.EnableAllaganToolsIntegration
+                                   && Plugin.IsAllaganToolsAvailable()
+                                   && AllaganToolsEligibleTypes.Contains(entry.Type);
 
         // Sowohl Kartenkoordinaten-Einträge (Händler/Aetheryten/Quest-NPCs) als auch Hunting-Log-
         // Monster mit bekannter Weltposition (siehe WorldPosition) bekommen denselben klickbaren
@@ -1356,6 +1425,21 @@ public class CompactOverlayWindow : Window
         if (!entry.HasGoToTarget)
         {
             OutlineText(entry.Name, isNotYetPossible ? NotYetPossibleColor : affordable ? AffordableColor : NormalColor);
+
+            // Ohne Kartenziel normalerweise gar nicht interaktiv - außer für SHIFT + Linksklick
+            // (Allagan Tools, siehe Plugin.OpenAllaganToolsItemInfo), falls aktiviert.
+            if (allaganToolsEnabled)
+            {
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                    ImGui.SetTooltip(Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)"));
+                }
+
+                if (ImGui.IsItemClicked() && ImGui.GetIO().KeyShift)
+                    Plugin.OpenAllaganToolsItemInfo(entry.Name);
+            }
+
             return;
         }
 
@@ -1363,13 +1447,21 @@ public class CompactOverlayWindow : Window
         if (ImGui.IsItemHovered())
         {
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-            ImGui.SetTooltip(string.IsNullOrEmpty(entry.Vendor)
+            var mapTooltip = string.IsNullOrEmpty(entry.Vendor)
                 ? Loc.T("Auf Karte anzeigen", "Show on map")
-                : Loc.T($"Bei {entry.Vendor} - Auf Karte anzeigen", $"From {entry.Vendor} - show on map"));
+                : Loc.T($"Bei {entry.Vendor} - Auf Karte anzeigen", $"From {entry.Vendor} - show on map");
+            ImGui.SetTooltip(allaganToolsEnabled
+                ? $"{mapTooltip}\n{Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)")}"
+                : mapTooltip);
         }
 
         if (ImGui.IsItemClicked())
-            Plugin.OpenEntryMap(entry);
+        {
+            if (allaganToolsEnabled && ImGui.GetIO().KeyShift)
+                Plugin.OpenAllaganToolsItemInfo(entry.Name);
+            else
+                Plugin.OpenEntryMap(entry);
+        }
     }
 
     /// <summary>
@@ -1588,6 +1680,25 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
         [CollectibleType.Chocobokeep] = new(0.95f, 0.85f, 0.2f, 1f),
     };
+
+    // Typen, deren Name tatsächlich einem echten Item-Sheet-Eintrag entspricht, den Allagan Tools'
+    // "/moreinfo"-Befehl (siehe Plugin.OpenAllaganToolsItemInfo) per Namenssuche finden kann - für
+    // SHIFT + Linksklick (siehe DrawClickableName/DrawCurrencyRequirement). Quest/Sightseeing/
+    // Aetheryte/HuntingLog/AetherCurrent/Chocobokeep sind keine Items, und FrameKit/Hairstyle tragen
+    // nur den Namen des Rahmens/der Frisur, nicht des freischaltenden Items - für all diese würde
+    // die Namenssuche ohnehin nur "nicht gefunden" liefern.
+    private static readonly HashSet<CollectibleType> AllaganToolsEligibleTypes = new()
+    {
+        CollectibleType.Mount,
+        CollectibleType.Minion,
+        CollectibleType.Orchestrion,
+        CollectibleType.Barding,
+        CollectibleType.Emote,
+        CollectibleType.Facewear,
+        CollectibleType.FashionAccessory,
+        CollectibleType.TripleTriadCard,
+    };
+
     private static readonly Vector2[] ShadowOffsets =
     {
         new(-1, -1), new(1, -1), new(-1, 1), new(1, 1),
