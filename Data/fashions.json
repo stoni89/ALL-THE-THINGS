@@ -38,9 +38,9 @@
         "Category":  "Goldene Sammelstelle",
         "TerritoryTypeId":  144,
         "MapId":  196,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "Vendor":  "MGC Trader",
+        "VendorMapX":  6.3,
+        "VendorMapY":  6.1,
         "Currency":  "430 MGC",
         "CurrencyIconId":  65140,
         "CurrencyItemId":  52322,
@@ -68,11 +68,11 @@
         "Name":  "Senor Otter Pack",
         "Type":  "FashionAccessory",
         "Category":  "Saisonevent",
-        "TerritoryTypeId":  0,
-        "MapId":  0,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "TerritoryTypeId":  144,
+        "MapId":  196,
+        "Vendor":  "Campaign Attendant",
+        "VendorMapX":  5.3,
+        "VendorMapY":  6.3,
         "Currency":  "",
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
@@ -612,11 +612,11 @@
         "Name":  "Fat Cat Parasol",
         "Type":  "FashionAccessory",
         "Category":  "Saisonevent",
-        "TerritoryTypeId":  0,
-        "MapId":  0,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "TerritoryTypeId":  129,
+        "MapId":  12,
+        "Vendor":  "Itinerant Moogle",
+        "VendorMapX":  9,
+        "VendorMapY":  12,
         "Currency":  "",
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
@@ -653,7 +653,7 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  1800,
-        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / FÃªte Present / Bronze Ancient Record - Oizys or Auxesia"
+        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / Fête Present / Bronze Ancient Record - Oizys or Auxesia"
     },
     {
         "Id":  12,
@@ -694,9 +694,9 @@
         "Category":  "Goldene Sammelstelle",
         "TerritoryTypeId":  144,
         "MapId":  196,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "Vendor":  "Gold Saucer Attendant",
+        "VendorMapX":  5.1,
+        "VendorMapY":  6.6,
         "Currency":  "500,000 MGP",
         "CurrencyIconId":  65025,
         "CurrencyItemId":  29,
@@ -733,7 +733,7 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  1800,
-        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / FÃªte Present / Bronze/Silver Ancient Record - Oizys"
+        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / Fête Present / Bronze/Silver Ancient Record - Oizys"
     },
     {
         "Id":  6,
@@ -749,7 +749,7 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  900,
-        "Source":  "Enie - The Firmament - 900 Skybuilders\u0027 Scrips / FÃªte Present / Bronze Ancient Record - Oizys or Auxesia"
+        "Source":  "Enie - The Firmament - 900 Skybuilders\u0027 Scrips / Fête Present / Bronze Ancient Record - Oizys or Auxesia"
     },
     {
         "Id":  5,
@@ -758,9 +758,9 @@
         "Category":  "Goldene Sammelstelle",
         "TerritoryTypeId":  144,
         "MapId":  196,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "Vendor":  "Gold Saucer Attendant",
+        "VendorMapX":  5.1,
+        "VendorMapY":  6.6,
         "Currency":  "200,000 MGP",
         "CurrencyIconId":  65025,
         "CurrencyItemId":  29,
@@ -813,7 +813,7 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  900,
-        "Source":  "Enie - The Firmament - 900 Skybuilders\u0027 Scrips / FÃªte Present / Bronze/Silver Ancient Record - Oizys"
+        "Source":  "Enie - The Firmament - 900 Skybuilders\u0027 Scrips / Fête Present / Bronze/Silver Ancient Record - Oizys"
     },
     {
         "Id":  1,
@@ -829,6 +829,6 @@
         "CurrencyIconId":  65073,
         "CurrencyItemId":  28063,
         "CurrencyAmount":  1800,
-        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / FÃªte Present / Bronze/Silver Ancient Record - Oizys"
+        "Source":  "Enie - The Firmament - 1,800 Skybuilders\u0027 Scrips / Fête Present / Bronze/Silver Ancient Record - Oizys"
     }
 ]

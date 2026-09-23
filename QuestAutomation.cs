@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Numerics;
 using Dalamud.Game.Chat;
 using Dalamud.Game.Text;
 using Dalamud.Plugin.Ipc;
@@ -49,6 +50,14 @@ public sealed class QuestAutomation
     // Rückreise an (siehe auch AetheryteAutomation.DistrictTravelSettleDelay).
     private static readonly TimeSpan TravelHomeSettleDelay = TimeSpan.FromSeconds(2);
 
+    // Lifestream.IsBusy() wird bei der bezahlten Teleport-Aktion beobachtet schon lange VOR dem
+    // tatsächlichen Abschluss wieder false (die echte Zauberzeit von ~5s plus Ladebildschirm laufen
+    // noch, siehe UpdateTravelingHome) - ohne diese Mindestdauer (Zauberzeit + typischer
+    // Ladebildschirm + kleiner Puffer) würde die Ankunftsprüfung viel zu früh laufen, fälschlich
+    // "nicht angekommen" melden und sofort einen neuen Versuch starten, der dann an der
+    // Teleport-Abklingzeit scheitert (accepted=False).
+    private static readonly TimeSpan TeleportMinimumTravelDuration = TimeSpan.FromSeconds(10);
+
     // Verhindert eine Endlosschleife, falls Lifestream eine Rückreise wiederholt asynchron ablehnt
     // (siehe UpdateTravelingHome) - nach so vielen gescheiterten Versuchen wird die aktuelle Zone
     // stattdessen zur neuen Startzone, statt es immer wieder mit demselben Ergebnis zu versuchen.
@@ -70,16 +79,15 @@ public sealed class QuestAutomation
     private readonly ICallGateSubscriber<string, bool> isQuestLocked;
 
     // aetheryteId, subIndex(0 = großer Aetheryte) -> angenommen? Volle (kostenpflichtige) Teleport-
-    // Aktion für die Rückreise zur Startzone (siehe TryTravelHome) - nötig, wenn eine Quest quer
-    // über die Karte (oder in eine andere Stadt) führt, wo ein Aethernetz-Sprung nicht ausreicht.
+    // Aktion für die Rückreise zur Startzone (siehe TryTravelHome). Der kostenlose Aethernetz-Sprung
+    // (Lifestream.AethernetTeleportById) wird bewusst NICHT mehr versucht: TryTravelHome läuft laut
+    // Update/State.Idle NUR, wenn die aktuelle Zone NICHT zur Startstadt gehört (isHome bereits
+    // false) - ein Aethernetz-Sprung setzt aber voraus, dass man sich BEREITS in Reichweite des
+    // Ziel-Netzwerks befindet, was dadurch nie zutrifft. Er wurde früher trotzdem versucht, meldete
+    // "accepted=true" (Lifestream validiert das selbst nicht vorher) und scheiterte danach immer
+    // asynchron mit "[Lifestream] Destination could not be found" im Chat, bevor endlich auf diesen
+    // zuverlässigen bezahlten Teleport zurückgefallen wurde.
     private readonly ICallGateSubscriber<uint, byte, bool> lifestreamTeleport;
-
-    // Aetheryte-RowId -> angenommen? Kostenloser Aethernetz-Sprung (kein Ladebildschirm, kein Gil) -
-    // wird bei der Rückreise IMMER zuerst versucht (siehe TryTravelHome), bevor auf die
-    // kostenpflichtige Teleport-Aktion zurückgegriffen wird. Funktioniert nur, wenn man sich noch
-    // in Aethernetz-Reichweite dergleichen Stadt befindet (z.B. Quest hat nur in einen Nachbarbezirk
-    // geführt), nicht von komplett anderswo auf der Karte.
-    private readonly ICallGateSubscriber<uint, bool> lifestreamAethernetTeleportById;
 
     private readonly ICallGateSubscriber<bool> lifestreamIsBusy;
     private readonly ICallGateSubscriber<object> lifestreamAbort;
@@ -91,6 +99,7 @@ public sealed class QuestAutomation
     private DateTime stateEnteredAt;
     private DateTime? travelHomeFinishedAt;
     private DateTime? runningWentFalseAt;
+
     private readonly HashSet<uint> skippedQuestIds = new();
     private readonly Dictionary<uint, int> attemptCounts = new();
 
@@ -135,7 +144,6 @@ public sealed class QuestAutomation
         rsrAutorotationActive = Plugin.PluginInterface.GetIpcSubscriber<bool>("RotationSolverReborn.AutorotationActive");
 
         lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
-        lifestreamAethernetTeleportById = Plugin.PluginInterface.GetIpcSubscriber<uint, bool>("Lifestream.AethernetTeleportById");
         lifestreamIsBusy = Plugin.PluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
         lifestreamAbort = Plugin.PluginInterface.GetIpcSubscriber<object>("Lifestream.Abort");
 
@@ -279,7 +287,17 @@ public sealed class QuestAutomation
         currentQuestId = null;
         homeTerritoryId = null;
         StopLifestream();
+        StopQuestionable();
+    }
 
+    /// <summary>
+    /// Nur Questionable selbst hart stoppen (siehe Stop-Klassenkommentar zu "/qst stop"), OHNE
+    /// unseren eigenen Automation-Zustand anzufassen - für den Moment vor einer selbst gesteuerten
+    /// Lifestream-Rückreise (siehe Update/State.Idle), damit Questionable währenddessen nicht von
+    /// sich aus weiterläuft und mit unserer Teleport-Aktion kollidiert.
+    /// </summary>
+    private void StopQuestionable()
+    {
         try
         {
             Plugin.CommandManager.ProcessCommand("/qst stop");
@@ -348,6 +366,11 @@ public sealed class QuestAutomation
                     else
                     {
                         Plugin.Log.Info($"[QuestAutomation] Idle: nicht daheim (homeTerritoryId={homeTerritoryId}, currentEffectiveTerritoryId={currentEffectiveTerritoryId}) - starte TryTravelHome.");
+                        // Questionable erst hart stoppen, bevor wir selbst per Lifestream reisen -
+                        // sonst kann es (z.B. weil es schon von sich aus zur nächsten erkannten
+                        // Quest weiterlaufen will) mit unserer eigenen Teleport-Aktion kollidieren,
+                        // was den Teleport-Erfolg/die Ankunftsprüfung verfälscht.
+                        StopQuestionable();
                         TryTravelHome(currentEffectiveTerritoryId);
                     }
                     break;
@@ -412,13 +435,16 @@ public sealed class QuestAutomation
     }
 
     /// <summary>
-    /// Reist zurück zur Zone, in der die Automation gestartet wurde - zuerst per kostenlosem
-    /// Aethernetz-Sprung (funktioniert nur in Reichweite derselben Stadt), sonst per kostenpflichtiger
-    /// Lifestream-Teleport-Aktion. Schlägt auch die ab (z.B. "Insufficient gil"), wird NICHT gewartet
-    /// und die Rückreise nicht wiederholt: die aktuelle Zone wird stattdessen einfach zur neuen
-    /// "Startzone", und es geht direkt mit den dortigen fehlenden Quests weiter (falls keine mehr da
-    /// sind, endet die Automation dann ganz regulär über "Keine Quests mehr übrig"). Nur ohne
-    /// Lifestream selbst wird sofort gestoppt, da dann auch kein Aethernetz-Sprung möglich wäre.
+    /// Reist zurück zur Zone, in der die Automation gestartet wurde - per kostenpflichtiger
+    /// Lifestream-Teleport-Aktion. Bewusst KEIN vorheriger Versuch über den kostenlosen Aethernetz-
+    /// Sprung (siehe lifestreamTeleport-Feldkommentar) - der wäre an dieser Stelle immer aussichtslos,
+    /// da TryTravelHome laut Update/State.Idle nur läuft, wenn die aktuelle Zone NICHT zur Startstadt
+    /// gehört, ein Aethernetz-Sprung aber voraussetzt, bereits in deren Netzwerk-Reichweite zu sein.
+    /// Schlägt auch der bezahlte Teleport ab (z.B. "Insufficient gil"), wird NICHT gewartet und die
+    /// Rückreise nicht wiederholt: die aktuelle Zone wird stattdessen einfach zur neuen "Startzone",
+    /// und es geht direkt mit den dortigen fehlenden Quests weiter (falls keine mehr da sind, endet
+    /// die Automation dann ganz regulär über "Keine Quests mehr übrig"). Nur ohne Lifestream selbst
+    /// wird sofort gestoppt, da dann gar kein Teleport möglich wäre.
     /// </summary>
     private void TryTravelHome(uint currentEffectiveTerritoryId)
     {
@@ -441,28 +467,6 @@ public sealed class QuestAutomation
         var homeDistrictIds = Plugin.GetSplitCityTerritories(homeTerritoryId.Value);
         Plugin.Log.Info($"[QuestAutomation] TryTravelHome: homeTerritoryId={homeTerritoryId}, homeDistrictIds=[{string.Join(",", homeDistrictIds)}], currentEffectiveTerritoryId={currentEffectiveTerritoryId}.");
 
-        // Erst kostenlos per Aethernetz versuchen - klappt nur, wenn man noch in Reichweite
-        // desselben Stadtnetzwerks ist (z.B. die Quest hat nur in einen Nachbarbezirk geführt),
-        // kostet aber im Erfolgsfall kein Gil und keinen Ladebildschirm.
-        foreach (var territory in homeDistrictIds)
-        {
-            var anyUnlockedId = Plugin.FindAnyUnlockedAetheryteInTerritory(territory);
-            Plugin.Log.Info($"[QuestAutomation] TryTravelHome: Aethernetz-Suche in Territory {territory} -> anyUnlockedId={anyUnlockedId}.");
-            if (anyUnlockedId == null)
-                continue;
-
-            var aethernetAccepted = lifestreamAethernetTeleportById.InvokeFunc(anyUnlockedId.Value);
-            Plugin.Log.Info($"[QuestAutomation] TryTravelHome: Aethernetz-Sprung zu {anyUnlockedId} -> accepted={aethernetAccepted}.");
-            if (aethernetAccepted)
-            {
-                state = State.TravelingHome;
-                stateEnteredAt = DateTime.UtcNow;
-                travelHomeFinishedAt = null;
-                StatusText = Loc.T("Reise zurück zur Startzone (Aethernetz)...", "Traveling back to the starting zone (aethernet)...");
-                return;
-            }
-        }
-
         // Manche geteilte Hauptstädte (z.B. Ul'dah) haben nur EINEN großen Aetheryten für die ganze
         // Stadt, physisch in nur einem Bezirk - daher über alle Bezirke der Startzone suchen, nicht
         // nur exakt den, in dem gestartet wurde.
@@ -475,11 +479,11 @@ public sealed class QuestAutomation
         }
         Plugin.Log.Info($"[QuestAutomation] TryTravelHome: mainAetheryteId={mainAetheryteId}.");
 
-        // Weder Aethernetz noch bezahlter Teleport möglich (kein Aetheryte dort freigeschaltet, oder
-        // der Teleport wurde abgelehnt, z.B. "Insufficient gil") - statt endlos zu warten oder ganz
-        // zu stoppen, wird die aktuelle Zone einfach zur neuen "Startzone": die Automation macht
-        // direkt hier mit den dortigen fehlenden Quests weiter (gibt es dort keine mehr, beendet sie
-        // sich gleich danach ganz regulär über "Keine Quests mehr übrig").
+        // Kein Teleport möglich (kein Aetheryte dort freigeschaltet, oder der Teleport wurde
+        // abgelehnt, z.B. "Insufficient gil") - statt endlos zu warten oder ganz zu stoppen, wird die
+        // aktuelle Zone einfach zur neuen "Startzone": die Automation macht direkt hier mit den
+        // dortigen fehlenden Quests weiter (gibt es dort keine mehr, beendet sie sich gleich danach
+        // ganz regulär über "Keine Quests mehr übrig").
         var accepted = mainAetheryteId.HasValue && lifestreamTeleport.InvokeFunc(mainAetheryteId.Value, (byte)0);
         Plugin.Log.Info($"[QuestAutomation] TryTravelHome: bezahlter Teleport zu {mainAetheryteId} -> accepted={accepted}.");
         if (!accepted)
@@ -495,12 +499,19 @@ public sealed class QuestAutomation
         state = State.TravelingHome;
         stateEnteredAt = DateTime.UtcNow;
         travelHomeFinishedAt = null;
-        StatusText = Loc.T("Reise zurück zur Startzone...", "Traveling back to the starting zone...");
+        var teleportHomeZoneName = Plugin.GetZoneName(homeTerritoryId.Value);
+        StatusText = Loc.T($"Teleportiere nach {teleportHomeZoneName}...", $"Teleporting to {teleportHomeZoneName}...");
     }
 
     private void UpdateTravelingHome(uint currentEffectiveTerritoryId)
     {
-        if (!lifestreamIsBusy.InvokeFunc())
+        // Siehe TeleportMinimumTravelDuration-Kommentar - Lifestream.IsBusy() allein wird der
+        // tatsächlichen Reisedauer (echte Zauberzeit + Ladebildschirm) nicht zuverlässig gerecht,
+        // daher zusätzlich eine Mindestdauer abwarten, bevor "nicht mehr beschäftigt" überhaupt als
+        // "fertig" gewertet wird.
+        var stillTraveling = lifestreamIsBusy.InvokeFunc() || DateTime.UtcNow - stateEnteredAt < TeleportMinimumTravelDuration;
+
+        if (!stillTraveling)
         {
             // Kurz warten, bis sich Plugin.ClientState.TerritoryType tatsächlich auf die neue Zone
             // aktualisiert hat (siehe TravelHomeSettleDelay) - sonst hält der nächste Update-Aufruf
@@ -512,12 +523,12 @@ public sealed class QuestAutomation
             travelHomeFinishedAt = null;
 
             // Lifestream kann eine Reise auch NACH dem angenommenen Auftrag noch asynchron
-            // ablehnen (z.B. "Destination could not be found" bei einem Aethernetz-Ziel, das laut
-            // IsAetheryteUnlocked zwar freigeschaltet ist, aber von Lifestream selbst nicht gefunden
-            // wird) - dabei wird IsBusy() genauso false wie bei einer echten, erfolgreichen Ankunft.
-            // Ohne diese Prüfung würde TryStartNext im nächsten Idle-Durchlauf die (unveränderte)
-            // Zone weiter als "nicht daheim" erkennen und denselben, deterministisch wieder
-            // scheiternden Reiseversuch endlos wiederholen, statt jemals weiterzumachen.
+            // ablehnen (z.B. ein Ziel, das laut IsAetheryteUnlocked zwar freigeschaltet ist, aber von
+            // Lifestream selbst nicht gefunden wird) - dabei wird IsBusy() genauso false wie bei
+            // einer echten, erfolgreichen Ankunft. Ohne diese Prüfung würde TryStartNext im nächsten
+            // Idle-Durchlauf die (unveränderte) Zone weiter als "nicht daheim" erkennen und denselben,
+            // deterministisch wieder scheiternden Reiseversuch endlos wiederholen, statt jemals
+            // weiterzumachen.
             var arrivedHome = Plugin.GetSplitCityTerritories(homeTerritoryId!.Value).Contains(currentEffectiveTerritoryId);
             Plugin.Log.Info($"[QuestAutomation] UpdateTravelingHome: Lifestream fertig, homeTerritoryId={homeTerritoryId}, currentEffectiveTerritoryId={currentEffectiveTerritoryId}, arrivedHome={arrivedHome}, travelHomeFailureCount={travelHomeFailureCount}.");
             if (!arrivedHome && ++travelHomeFailureCount <= MaxTravelHomeAttempts)
@@ -551,13 +562,27 @@ public sealed class QuestAutomation
 
     private void TryStartNext(IReadOnlyList<CollectibleEntry> missingQuestsInZone)
     {
-        var next = missingQuestsInZone.FirstOrDefault(q => !skippedQuestIds.Contains(q.Id));
-        if (next == null)
+        var candidates = missingQuestsInZone.Where(q => !skippedQuestIds.Contains(q.Id)).ToList();
+        if (candidates.Count == 0)
         {
             StatusText = Loc.T("Keine Quests mehr übrig.", "No quests left.");
             Stop();
             return;
         }
+
+        // Die räumlich nächstgelegene annehmbare Quest zuerst, statt stur der Zonen-Listenreihenfolge
+        // zu folgen - sonst läuft der Charakter quer durch die Zone, obwohl die nächste Quest direkt
+        // neben der gerade abgeschlossenen liegt (die Vergabe-Position wird aus der Kartenkoordinate
+        // zurückgerechnet, siehe Plugin.ResolveWorldPositionFromMapCoords). Quests ohne auflösbare
+        // Position fallen ans Ende, statt die Sortierung ganz abzubrechen.
+        var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
+        var next = candidates
+            .OrderBy(q => q.HasVendorLocation
+                ? Plugin.ResolveWorldPositionFromMapCoords(q.MapId, q.VendorMapX, q.VendorMapY) is { } questPos
+                    ? Vector3.Distance(playerPos, questPos)
+                    : float.MaxValue
+                : float.MaxValue)
+            .First();
 
         var attempts = attemptCounts.GetValueOrDefault(next.Id, 0) + 1;
         attemptCounts[next.Id] = attempts;

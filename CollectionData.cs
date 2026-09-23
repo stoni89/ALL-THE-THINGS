@@ -41,6 +41,14 @@ public class CollectibleEntry
     public uint CurrencyIconId { get; set; } // Icon-ID der Währung (0 = unbekannt)
     public uint CurrencyItemId { get; set; } // Item-ID der Währung, für Inventar-Abfrage (0 = unbekannt)
     public uint CurrencyAmount { get; set; } // benötigte Menge der Währung
+
+    // Für die wenigen Einträge, die MEHR als eine Währung gleichzeitig verlangen (z.B. Triple-
+    // Triad-Karte "G-Warrior": 1x Ruby Totem + 1x Emerald Totem + 1x Diamond Totem) - Currency/
+    // CurrencyIconId/CurrencyItemId/CurrencyAmount oben bleiben die ERSTE Währung (rückwärts-
+    // kompatibel mit allen bestehenden Einträgen, die nur eine kennen), hier stehen alle WEITEREN.
+    // null/leer für den ganz normalen Fall (nur eine Währung).
+    public List<CollectibleCurrency>? AdditionalCurrencies { get; set; }
+
     public string Source { get; set; } = string.Empty; // z.B. "Dungeon Drop", "Vendor", "Quest"
 
     // Nur für Hunting-Log-Einträge (siehe Plugin.GetHuntingLogEntries/ManualHuntingLogPositions) -
@@ -59,6 +67,17 @@ public class CollectibleEntry
     // Chat-Befehl (z.B. "/sit") kommt direkt aus dem verlinkten Emote/TextCommand-Sheet.
     public string? RequiredEmoteCommand { get; init; }
 
+    // Nur für Sightseeing-Log-Einträge (siehe Plugin.GetSightseeingEntries) - zusätzliche
+    // Bedingungen, die NUR zu bestimmten Zeiten/bei bestimmtem Wetter/nach bestimmtem Fortschritt
+    // erfüllt sind, live geprüft (siehe Plugin.ComputeGrandCompanyOrTribeGateReason). 0/false/leer
+    // bedeutet jeweils "keine solche Zusatzbedingung".
+    public uint SightseeingWeatherMask { get; init; } // Bitmaske über Weather-Sheet-RowIds (1<<RowId), nur A-Realm-Reborn-Punkte
+    public bool SightseeingHasTimeWindow { get; init; }
+    public byte SightseeingFirstBell { get; init; } // Eorzea-Stunde (0-23), inklusive
+    public byte SightseeingLastBell { get; init; } // Eorzea-Stunde (0-23), inklusive
+    public uint SightseeingGateQuestId { get; init; } // benötigte abgeschlossene Quest, um dieses Log-Buch freizuschalten
+    public bool SightseeingNeedsFirstTwenty { get; init; } // A-Realm-Reborn Punkte 21-80: erst nach den ersten 20 freigeschaltet
+
     // Nur für Portrait-Rahmen (siehe Plugin.GetFrameKitEntries) - ein Rahmen kann über ganz
     // unterschiedliche Wege freigeschaltet werden (Quest, Errungenschaft, Duty, Emote/Minion/
     // Mount/Ornament-Besitz, oder ein separates "Framer's Kit"-Item). Id allein (die BannerFrame-
@@ -74,6 +93,15 @@ public class CollectibleEntry
     public bool HasGoToTarget => HasVendorLocation || WorldPosition.HasValue;
 }
 
+// Eine ZUSÄTZLICHE (nicht die erste) Währungsanforderung - siehe CollectibleEntry.AdditionalCurrencies.
+public class CollectibleCurrency
+{
+    public string Currency { get; set; } = string.Empty;
+    public uint CurrencyIconId { get; set; }
+    public uint CurrencyItemId { get; set; }
+    public uint CurrencyAmount { get; set; }
+}
+
 public enum CollectibleType
 {
     Mount,
@@ -85,6 +113,7 @@ public enum CollectibleType
     FashionAccessory,
     TripleTriadCard,
     FrameKit,
+    Hairstyle,
     Aetheryte,
     Quest,
     HuntingLog,
@@ -169,6 +198,7 @@ public static class CollectionData
         Plugin.EnrichEntriesWithVendorPosition(entries);
 
         entries.AddRange(Plugin.GetFrameKitEntries());
+        entries.AddRange(Plugin.GetHairstyleEntries());
         entries.AddRange(Plugin.GetChocobokeepEntries());
 
         cachedEntries = entries;

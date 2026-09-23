@@ -1072,6 +1072,12 @@ public class MainWindow : Window
             config.SimulateChocobokeepAutomation = simulateChocobokeep;
             config.Save();
         }
+        var simulateSightseeing = config.SimulateSightseeingAutomation;
+        if (ModernUi.ToggleRow(Loc.T("Auto Sightseeing simulieren", "Simulate Auto Sightseeing"), ref simulateSightseeing))
+        {
+            config.SimulateSightseeingAutomation = simulateSightseeing;
+            config.Save();
+        }
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Debug-Dumps (ins Log schreiben)", "Debug dumps (write to log)"));
@@ -1081,7 +1087,9 @@ public class MainWindow : Window
             (Loc.T("Aetheryten", "Aetherytes"), () => plugin.DumpAetheryteDebugInfo()),
             (Loc.T("Hunting Log", "Hunting log"), Plugin.DumpHuntingLogDebugInfo),
             (Loc.T("Sightseeing", "Sightseeing"), () => plugin.DumpSightseeingDebugInfo()),
+            (Loc.T("Eigene Position", "My position"), () => plugin.DumpPlayerPositionDebugInfo()),
             (Loc.T("Framer's Kit", "Framer's kit"), Plugin.DumpFrameKitDebugInfo),
+            (Loc.T("Moderne Ästhetik", "Modern Aesthetics"), Plugin.DumpHairstyleDebugInfo),
             (Loc.T("Chocobokeep", "Chocobokeep"), Plugin.DumpChocobokeepDebugInfo),
             (Loc.T("Händler-Positionen", "Vendor positions"), Plugin.DumpVendorPositionEnrichmentDebugInfo),
             (Loc.T("GK-Bardinghändler", "GC barding vendors"), Plugin.DumpGrandCompanyBardingVendorDebugInfo),
@@ -1095,7 +1103,7 @@ public class MainWindow : Window
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
         ModernUi.BeginCard();
         var territoryId = Plugin.ClientState.TerritoryType;
-        ImGui.TextUnformatted($"{Loc.T("Zone", "Zone")}: {plugin.GetZoneName(territoryId)} ({territoryId})");
+        ImGui.TextUnformatted($"{Loc.T("Zone", "Zone")}: {Plugin.GetZoneName(territoryId)} ({territoryId})");
 
         var playerPos = Plugin.ObjectTable.LocalPlayer?.Position;
         var posText = playerPos.HasValue

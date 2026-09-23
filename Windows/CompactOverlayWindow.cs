@@ -322,7 +322,7 @@ public class CompactOverlayWindow : Window
             return;
         }
 
-        OutlineText($"{plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
+        OutlineText($"{Plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
 
         // In geteilten Hauptstädten (Ul'dah, Limsa, Gridania, Ishgard) sollen Sammelobjekte aus
         // JEDEM Bezirk angezeigt werden, egal in welchem man gerade steht - jeder Eintrag verlinkt
@@ -335,14 +335,12 @@ public class CompactOverlayWindow : Window
             // nur in genau dieser einen Zone, nicht stadtweit wie Aetheryten/Quest-NPCs.
             .Concat(plugin.GetHuntingLogEntries(currentTerritoryId))
             .Where(e => siblingTerritories.Contains(e.TerritoryTypeId))
-            // "Saisonevent"-Einträge (Mounts/Minions/... ohne Bezug zu einem laufenden Event, siehe
-            // Plugin.IsSeasonalEventEntryCurrentlyActive) nur zeigen, wenn das zugehörige Event laut
-            // grobem Namensabgleich auch wirklich gerade läuft.
-            .Where(Plugin.IsSeasonalEventEntryCurrentlyActive)
             // Bei deaktiviertem "Alle Gegenstände anzeigen" (Configuration.ShowAllItems, siehe
             // MainWindow-Einstellungen) Einträge ausblenden, die nur durch eine noch nicht erreichte
-            // Errungenschaft/einen noch nicht freigeschalteten Rang erreichbar sind (siehe
-            // Plugin.AchievementOrRankGatedItems).
+            // Errungenschaft/einen noch nicht freigeschalteten Rang ODER (siehe
+            // ComputeGrandCompanyOrTribeGateReason) ein gerade nicht laufendes Saisonevent erreichbar
+            // sind (siehe Plugin.AchievementOrRankGatedItems) - bei aktiviertem Schalter bleiben sie
+            // sichtbar, aber mit der "Bedingung nicht erfüllt"-Markierung (siehe weiter unten).
             .Where(e => config.ShowAllItems || !Plugin.IsAchievementOrRankGated(e))
             .ToList();
 
@@ -350,16 +348,30 @@ public class CompactOverlayWindow : Window
             .Where(e => config.ShowType.GetValueOrDefault(e.Type, true))
             .ToList();
 
-        var entries = afterTypeFilter
+        // Siehe "Currencys filtern" weiter unten - blendet ALLE Einträge einer vom Nutzer
+        // ausgewählten Währung aus, unabhängig vom Typ. Prüft auch AdditionalCurrencies (siehe
+        // GetAllCurrencyLabels) - ein Eintrag mit mehreren Währungen (z.B. Triple-Triad-Karte
+        // "G-Warrior") verschwindet also auch dann, wenn nur EINE seiner mehreren Währungen
+        // ausgeblendet wurde, nicht nur bei der ersten.
+        var afterCurrencyFilter = afterTypeFilter
+            .Where(e => !GetAllCurrencyLabels(e).Any(config.HiddenCurrencies.Contains))
+            .ToList();
+
+        var entries = afterCurrencyFilter
             .Where(e => !plugin.IsOwned(e))
             .OrderBy(e => config.TypeOrder.IndexOf(e.Type))
+            .ThenBy(e => e.Vendor)
             .ThenBy(e => e.Name)
             .ToList();
 
         // Bewusst aus "allForZone" (nicht "entries") - die Automation soll unabhängig vom
-        // Typen-Filter laufen, auch wenn Quests im Overlay z.B. ausgeblendet sind.
+        // Typen-Filter laufen, auch wenn Quests im Overlay z.B. ausgeblendet sind. IsAchievementOrRankGated
+        // aber IMMER zusätzlich ausgeschlossen (nicht nur wenn "Alle Gegenstände anzeigen" aus ist,
+        // siehe allForZone) - sonst würde die Automation bei aktiviertem Schalter auch Quests
+        // anlaufen, die als "Bedingung nicht erfüllt" markiert sind (z.B. "Simply to Dye For" ohne
+        // abgeschlossene Artefakt-Rüstungsquest).
         var missingQuests = allForZone
-            .Where(e => e.Type == CollectibleType.Quest && !plugin.IsOwned(e))
+            .Where(e => e.Type == CollectibleType.Quest && !plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e))
             .ToList();
 
         // Unabhängig davon, ob die Automation läuft - damit die rote "Nicht unterstützt"-Markierung
@@ -390,11 +402,34 @@ public class CompactOverlayWindow : Window
         plugin.AetherCurrentAutomation.Update(missingAetherCurrentsInZone);
 
         // Ebenfalls nicht stadtweit - Sightseeing-Punkte kommen aus GetLiveZoneEntries mit exakter
-        // Zonen-Zuordnung (siehe Plugin.ComputeLiveZoneEntries), kein Bezirkswechsel nötig.
-        var missingSightseeingInZone = allForZone
-            .Where(e => e.Type == CollectibleType.Sightseeing && !plugin.IsOwned(e))
+        // Zonen-Zuordnung (siehe Plugin.ComputeLiveZoneEntries). Bewusst NICHT aus "allForZone" (das
+        // würde bei deaktiviertem "Alle Gegenstände anzeigen" gerade durch Wetter/Uhrzeit/Buch-
+        // Freischaltung gesperrte Punkte schon vor diesem Filter hier verlieren) - stattdessen direkt
+        // aus GetLiveZoneEntries, damit SimulateSightseeingAutomation (siehe Configuration) unabhängig
+        // von diesem Anzeige-Schalter zum Testen auch gesperrte Punkte anlaufen kann. Bewusst inkl.
+        // siblingTerritories (geteilte Hauptstädte, z.B. "Barracuda Piers" in den Limsa Upper Decks,
+        // während man selbst in den Lower Decks steht) - SightseeingAutomation reist bei Bedarf selbst
+        // per Lifestream über den nächsten freigeschalteten Aetheryten in den Zielbezirk, genau wie
+        // AetheryteAutomation/GoToAutomation (siehe SightseeingAutomation.TryTravelToDistrict).
+        // IsSightseeingUnsupportedByAutomation IMMER ausgeschlossen (auch im Simulation-Modus, der
+        // die Gate-Prüfung darunter sonst bewusst umgeht) - echte Jumping Puzzles ("The Carline
+        // Canopy", "The Leatherworkers' Guild"), die dauerhaft nur manuell aufsuchbar sind (siehe
+        // Plugin.SightseeingUnsupportedByAutomation-Kommentar).
+        var missingSightseeingInZone = plugin.GetLiveZoneEntries(effectiveTerritoryId)
+            .Where(e => e.Type == CollectibleType.Sightseeing && siblingTerritories.Contains(e.TerritoryTypeId))
+            .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id))
+            .Where(e => config.SimulateSightseeingAutomation || (!plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e)))
             .ToList();
         plugin.SightseeingAutomation.Update(missingSightseeingInZone);
+
+        // Was tatsächlich im Overlay auftaucht (siehe "allForZone", inkl. dessen "Alle Gegenstände
+        // anzeigen"-Schalter) - bewusst getrennt von missingSightseeingInZone oben, das für die
+        // Automation extra ungefiltert ist. Nur wenn hier NICHTS mehr übrig ist, soll der Knopf ganz
+        // verschwinden (siehe hasVisibleSightseeing unten); sind noch mit "Bedingung nicht erfüllt"
+        // markierte Punkte sichtbar, bleibt er stehen und wird nur ausgegraut.
+        var visibleSightseeingInZone = allForZone
+            .Where(e => e.Type == CollectibleType.Sightseeing && !plugin.IsOwned(e))
+            .ToList();
 
         // Ebenfalls nicht stadtweit - Chocobokeep-Standorte kommen aus GetChocobokeepEntries mit
         // exakter Zonen-Zuordnung, kein Bezirkswechsel nötig.
@@ -413,7 +448,11 @@ public class CompactOverlayWindow : Window
         var hasActionableAetherytes = missingAetherytesCity.Count > 0;
         var hasActionableHuntingLog = missingHuntingLogInZone.Any(e => e.WorldPosition.HasValue);
         var hasActionableAetherCurrents = missingAetherCurrentsInZone.Any(e => e.HasGoToTarget);
-        var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget);
+        // hasVisibleSightseeing entscheidet nur, ob der Knopf überhaupt gezeichnet wird (siehe
+        // DrawAutomationButtonIfNeeded) - hasActionableSightseeing (gerade durch Wetter/Uhrzeit/
+        // Buch-Freischaltung eingeschränkt) entscheidet zusätzlich, ob er dabei ausgegraut ist.
+        var hasVisibleSightseeing = visibleSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
+        var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
         var hasActionableChocobokeeps = missingChocobokeepsInZone.Any(e => e.HasGoToTarget);
 
         // Reihe der Automations-Knöpfe bricht bei Bedarf selbst in eine zweite Zeile um (statt über
@@ -426,31 +465,50 @@ public class CompactOverlayWindow : Window
         {
             var automationRowContentMaxX = ImGui.GetWindowContentRegionMax().X;
             var automationStopLabel = Loc.T("Automation stoppen", "Stop automation");
+            var isFirstAutomationButtonOnRow = true;
 
-            void ContinueAutomationRow(bool isActive, string startLabel)
+            // Ein Knopf wird komplett ausgeblendet (statt nur ausgegraut), sobald es in dieser Zone
+            // nichts (mehr) für ihn zu tun gibt - UND er nicht gerade selbst läuft (läuft er schon,
+            // muss "Automation stoppen" klickbar sichtbar bleiben, auch falls die Liste inzwischen
+            // leer aussieht). Ein fehlendes Fremdplugin blendet bewusst NICHT aus - das bleibt
+            // ausgegraut mit erklärendem Tooltip sichtbar, siehe MissingPluginTooltip in den
+            // einzelnen DrawXAutomationButton-Methoden.
+            void DrawAutomationButtonIfNeeded(bool isActive, bool hasActionable, string startLabel, Action draw)
             {
-                var label = isActive ? automationStopLabel : startLabel;
-                var width = ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f;
-                ImGui.SameLine();
-                if (ImGui.GetCursorPosX() + width > automationRowContentMaxX)
-                    ImGui.NewLine();
+                if (!isActive && !hasActionable)
+                    return;
+
+                if (!isFirstAutomationButtonOnRow)
+                {
+                    var label = isActive ? automationStopLabel : startLabel;
+                    var width = ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f;
+                    ImGui.SameLine();
+                    if (ImGui.GetCursorPosX() + width > automationRowContentMaxX)
+                        ImGui.NewLine();
+                }
+                isFirstAutomationButtonOnRow = false;
+                draw();
             }
 
-            DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId);
-            ContinueAutomationRow(plugin.AetheryteAutomation.IsActive, Loc.T("Auto Aetheryte", "Auto Aetheryte"));
-            DrawAetheryteAutomationButton(hasActionableAetherytes);
-            ContinueAutomationRow(plugin.HuntingLogAutomation.IsActive, Loc.T("Auto Hunting Log", "Auto Hunting Log"));
-            DrawHuntingLogAutomationButton(hasActionableHuntingLog);
-            ContinueAutomationRow(plugin.AetherCurrentAutomation.IsActive, Loc.T("Auto Ätherströmung", "Auto Aether Current"));
-            DrawAetherCurrentAutomationButton(hasActionableAetherCurrents);
-            ContinueAutomationRow(plugin.SightseeingAutomation.IsActive, Loc.T("Auto Sightseeing", "Auto Sightseeing"));
-            DrawSightseeingAutomationButton(hasActionableSightseeing);
-            ContinueAutomationRow(plugin.ChocobokeepAutomation.IsActive, Loc.T("Auto Chocobokeep", "Auto Chocobokeep"));
-            DrawChocobokeepAutomationButton(hasActionableChocobokeeps);
+            DrawAutomationButtonIfNeeded(plugin.QuestAutomation.IsActive, hasActionableQuests,
+                Loc.T("Auto Quest", "Auto Quest"), () => DrawQuestAutomationButton(hasActionableQuests, effectiveTerritoryId));
+            DrawAutomationButtonIfNeeded(plugin.AetheryteAutomation.IsActive, hasActionableAetherytes,
+                Loc.T("Auto Aetheryte", "Auto Aetheryte"), () => DrawAetheryteAutomationButton(hasActionableAetherytes));
+            DrawAutomationButtonIfNeeded(plugin.HuntingLogAutomation.IsActive, hasActionableHuntingLog,
+                Loc.T("Auto Hunting Log", "Auto Hunting Log"), () => DrawHuntingLogAutomationButton(hasActionableHuntingLog));
+            DrawAutomationButtonIfNeeded(plugin.AetherCurrentAutomation.IsActive, hasActionableAetherCurrents,
+                Loc.T("Auto Ätherströmung", "Auto Aether Current"), () => DrawAetherCurrentAutomationButton(hasActionableAetherCurrents));
+            DrawAutomationButtonIfNeeded(plugin.SightseeingAutomation.IsActive, hasVisibleSightseeing,
+                Loc.T("Auto Sightseeing", "Auto Sightseeing"), () => DrawSightseeingAutomationButton(hasActionableSightseeing));
+            DrawAutomationButtonIfNeeded(plugin.ChocobokeepAutomation.IsActive, hasActionableChocobokeeps,
+                Loc.T("Auto Chocobokeep", "Auto Chocobokeep"), () => DrawChocobokeepAutomationButton(hasActionableChocobokeeps));
 
-            ImGui.Spacing();
-            ImGui.Separator();
-            ImGui.Spacing();
+            if (!isFirstAutomationButtonOnRow)
+            {
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.Spacing();
+            }
         }
 
         if (plugin.QuestAutomation.ShouldShowStatusText)
@@ -481,6 +539,17 @@ public class CompactOverlayWindow : Window
 
         var filterLabel = Loc.T("Typen filtern", "Filter types") + "##CompactTypeFilter";
         var filterButtonWidth = ImGui.CalcTextSize(Loc.T("Typen filtern", "Filter types")).X + ImGui.GetStyle().FramePadding.X * 2f;
+        var currencyFilterLabel = Loc.T("Currencys filtern", "Filter currencies") + "##CompactCurrencyFilter";
+        var currencyFilterButtonWidth = ImGui.CalcTextSize(Loc.T("Currencys filtern", "Filter currencies")).X + ImGui.GetStyle().FramePadding.X * 2f;
+
+        // Beide Filter-Knöpfe ganz rechts an den Fensterrand, "Currencys filtern" links davon.
+        ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - filterButtonWidth - currencyFilterButtonWidth - ImGui.GetStyle().ItemSpacing.X);
+        var currencyFilterButtonSize = new Vector2(currencyFilterButtonWidth, ImGui.GetFrameHeight());
+        if (IsOccluded(currencyFilterButtonSize))
+            ImGui.Dummy(currencyFilterButtonSize);
+        else if (ImGui.Button(currencyFilterLabel))
+            ImGui.OpenPopup("CompactCurrencyFilterPopup");
+
         ImGui.SameLine(ImGui.GetWindowContentRegionMax().X - filterButtonWidth);
         var filterButtonSize = new Vector2(filterButtonWidth, ImGui.GetFrameHeight());
         if (IsOccluded(filterButtonSize))
@@ -492,6 +561,12 @@ public class CompactOverlayWindow : Window
         // diesen expliziten Push würde die Popup hier stattdessen mit dem ImGui-Standardgrau statt
         // dem Rest des Plugin-Looks erscheinen.
         ImGui.PushStyleColor(ImGuiCol.PopupBg, new Vector4(0.10f, 0.12f, 0.17f, 0.98f));
+        if (ImGui.BeginPopup("CompactCurrencyFilterPopup"))
+        {
+            DrawCurrencyFilterPopupContent();
+            ImGui.EndPopup();
+        }
+
         if (ImGui.BeginPopup("CompactTypeFilterPopup"))
         {
             foreach (var type in config.TypeOrder)
@@ -581,57 +656,22 @@ public class CompactOverlayWindow : Window
             ImGui.SameLine();
             DrawClickableName(entry, isNotYetPossible);
 
-            // Bewusst separat vom (klickbaren, ggf. eingefärbten) Namen - wie die Währungsanzeige
-            // unten, aber in Rot statt weiß, da es immer eine noch nicht erfüllte Voraussetzung
-            // signalisiert. Live berechnet (nicht im Entry gespeichert), siehe
-            // Plugin.GetRequirementInfo. Per Strg+Klick zur Wiki-Seite mit der Voraussetzung -
-            // normaler Klick macht bewusst nichts, damit man beim Vorbeiscrollen/Hovern nicht
-            // versehentlich den Browser öffnet.
-            var (requirementNote, requirementWikiUrl) = plugin.GetRequirementInfo(entry);
-            if (!string.IsNullOrEmpty(requirementNote))
-            {
-                ImGui.SameLine();
-                OutlineText(requirementNote, UnsupportedColor);
-
-                if (!string.IsNullOrEmpty(requirementWikiUrl) && ImGui.IsItemHovered())
-                {
-                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-                    ImGui.SetTooltip(Loc.T(
-                        "Strg+Klick, um die Wiki-Seite mit der Voraussetzung zu öffnen",
-                        "Ctrl+click to open the wiki page with the requirement"));
-
-                    if (ImGui.GetIO().KeyCtrl && ImGui.IsItemClicked())
-                        Util.OpenLink(requirementWikiUrl);
-                }
-            }
-
             if (!string.IsNullOrEmpty(entry.Currency))
             {
                 ImGui.SameLine();
                 OutlineText("-", MutedColor);
-                ImGui.SameLine();
 
-                // Icon + Menge zusammen in einer Gruppe, damit EIN Hover-Bereich beide abdeckt -
-                // der Name der Währung (z.B. "Allied Seals") steht nur noch im Tooltip, nicht mehr
-                // permanent ausgeschrieben daneben, um die Zeile kompakter zu halten.
-                ImGui.BeginGroup();
+                DrawCurrencyRequirement(entry.Currency, entry.CurrencyIconId, entry.CurrencyItemId, entry.CurrencyAmount);
 
-                if (entry.CurrencyIconId != 0)
+                // Für die wenigen Einträge, die MEHRERE Währungen gleichzeitig verlangen (z.B.
+                // Triple-Triad-Karte "G-Warrior": 1x Ruby Totem + 1x Emerald Totem + 1x Diamond
+                // Totem) - jede weitere genauso wie die erste anzeigen, siehe
+                // CollectibleEntry.AdditionalCurrencies.
+                if (entry.AdditionalCurrencies != null)
                 {
-                    var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(entry.CurrencyIconId)).GetWrapOrEmpty();
-                    var size = new Vector2(ImGui.GetTextLineHeight());
-                    ImGui.Image(icon.Handle, size);
-                    ImGui.SameLine();
+                    foreach (var additional in entry.AdditionalCurrencies)
+                        DrawCurrencyRequirement(additional.Currency, additional.CurrencyIconId, additional.CurrencyItemId, additional.CurrencyAmount);
                 }
-
-                var affordable = plugin.CanAfford(entry);
-                var color = affordable ? AffordableColor : NormalColor;
-                OutlineText(entry.CurrencyAmount.ToString("N0"), color);
-
-                ImGui.EndGroup();
-
-                if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(GetCurrencyLabel(entry.Currency));
             }
 
             // Nur sichtbar, wenn "Alle Gegenstände anzeigen" aktiviert ist (siehe Filter weiter oben
@@ -650,6 +690,47 @@ public class CompactOverlayWindow : Window
 
         if (scrollbarOccluded)
             ImGui.PopStyleVar();
+    }
+
+    /// <summary>
+    /// Zeichnet EINE Preisangabe (Icon + Menge) direkt neben dem zuletzt gezeichneten Element (per
+    /// ImGui.SameLine) - für Einträge mit mehreren gleichzeitig benötigten Währungen (siehe
+    /// CollectibleEntry.AdditionalCurrencies) mehrfach hintereinander aufgerufen, für den
+    /// Normalfall (nur eine Währung) genau einmal.
+    /// </summary>
+    private void DrawCurrencyRequirement(string currencyText, uint currencyIconId, uint currencyItemId, uint currencyAmount)
+    {
+        ImGui.SameLine();
+
+        // Icon + Menge zusammen in einer Gruppe, damit EIN Hover-Bereich beide abdeckt - der Name
+        // der Währung (z.B. "Allied Seals") steht nur noch im Tooltip, nicht mehr permanent
+        // ausgeschrieben daneben, um die Zeile kompakt zu halten.
+        ImGui.BeginGroup();
+
+        if (currencyIconId != 0)
+        {
+            var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(currencyIconId)).GetWrapOrEmpty();
+            var size = new Vector2(ImGui.GetTextLineHeight());
+            ImGui.Image(icon.Handle, size);
+        }
+
+        // CurrencyAmount 0 heißt "wird durch das Öffnen eines Packs/einer Zufallsziehung erhalten,
+        // nicht in fester Anzahl gekauft" (z.B. Platinum/Dream/Imperial/...-Triad-Card-Packs) -
+        // dort nur das Icon zeigen, da man vorher nicht weiß, wie viele Packs man dafür öffnen muss.
+        if (currencyAmount != 0)
+        {
+            if (currencyIconId != 0)
+                ImGui.SameLine();
+
+            var affordable = currencyItemId != 0 && plugin.GetCurrencyAmount(currencyItemId) >= currencyAmount;
+            var color = affordable ? AffordableColor : NormalColor;
+            OutlineText(currencyAmount.ToString("N0"), color);
+        }
+
+        ImGui.EndGroup();
+
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(GetCurrencyLabel(currencyText));
     }
 
     /// <summary>
@@ -750,6 +831,85 @@ public class CompactOverlayWindow : Window
         var t = Regex.Replace(currencyText, @"^\s*[\d,]+\s*", "");
         t = Regex.Replace(t, @"\s*\([^)]*\)\s*$", "");
         return t.Trim();
+    }
+
+    /// <summary>
+    /// Alle Währungen (Kurzname + Icon-Id) eines Eintrags - normalerweise nur eine (die primäre,
+    /// Currency/CurrencyIconId), bei mehreren gleichzeitig benötigten (siehe
+    /// CollectibleEntry.AdditionalCurrencies, z.B. Triple-Triad-Karte "G-Warrior") auch die
+    /// weiteren. Für den Currency-Filter (siehe DrawContent/DrawCurrencyFilterPopupContent), damit
+    /// ein Eintrag bei JEDER seiner Währungen gefunden/ausgeblendet werden kann, nicht nur der ersten.
+    /// </summary>
+    private static IEnumerable<(string Label, uint IconId)> GetAllCurrencies(CollectibleEntry entry)
+    {
+        if (!string.IsNullOrEmpty(entry.Currency))
+            yield return (GetCurrencyLabel(entry.Currency), entry.CurrencyIconId);
+
+        if (entry.AdditionalCurrencies != null)
+        {
+            foreach (var additional in entry.AdditionalCurrencies)
+            {
+                if (!string.IsNullOrEmpty(additional.Currency))
+                    yield return (GetCurrencyLabel(additional.Currency), additional.CurrencyIconId);
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetAllCurrencyLabels(CollectibleEntry entry) => GetAllCurrencies(entry).Select(c => c.Label);
+
+    // Suchtext im "Currencys filtern"-Popup - bleibt über mehrere Frames erhalten (Popup öffnen,
+    // tippen, wieder schließen), wird beim erneuten Öffnen bewusst NICHT zurückgesetzt.
+    private string currencyFilterSearch = string.Empty;
+
+    /// <summary>
+    /// Inhalt des "Currencys filtern"-Popups - Suchfeld + Checkbox-Liste ALLER im Plugin bekannten
+    /// Währungen (per GetCurrencyLabel-Kurzname, z.B. "MGP" statt "150.000 MGP"), unabhängig von der
+    /// aktuellen Zone (CollectionData.GetAllEntries() ist die vollständige, einmal geladene
+    /// Gesamtliste). Eine abgewählte Währung blendet ALLE Einträge mit genau dieser Währung aus dem
+    /// Overlay aus (siehe afterCurrencyFilter in DrawContent), unabhängig vom Typ.
+    /// </summary>
+    private void DrawCurrencyFilterPopupContent()
+    {
+        ImGui.SetNextItemWidth(200f);
+        ImGui.InputTextWithHint("##CompactCurrencyFilterSearch", Loc.T("Suchen...", "Search..."), ref currencyFilterSearch, 64);
+
+        var allCurrencies = CollectionData.GetAllEntries()
+            .SelectMany(GetAllCurrencies)
+            .Where(c => !string.IsNullOrEmpty(c.Label))
+            .GroupBy(c => c.Label)
+            // Pro Label bevorzugt einen Vertreter MIT bekanntem Icon (mehrere Einträge derselben
+            // Währung können unterschiedlich vollständige Icon-Daten haben) - sonst irgendeinen.
+            .Select(g => (Label: g.Key, IconId: g.Select(c => c.IconId).FirstOrDefault(id => id != 0)))
+            .OrderBy(c => c.Label, StringComparer.OrdinalIgnoreCase)
+            .Where(c => string.IsNullOrEmpty(currencyFilterSearch) || c.Label.Contains(currencyFilterSearch, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var iconSize = ImGui.GetTextLineHeight();
+        ImGui.BeginChild("CompactCurrencyFilterList", new Vector2(220f, 260f));
+        foreach (var (label, iconId) in allCurrencies)
+        {
+            if (iconId != 0)
+            {
+                var icon = Plugin.TextureProvider.GetFromGameIcon(new GameIconLookup(iconId)).GetWrapOrEmpty();
+                ImGui.Image(icon.Handle, new Vector2(iconSize));
+                ImGui.SameLine();
+            }
+
+            var enabled = !plugin.Configuration.HiddenCurrencies.Contains(label);
+            if (ImGui.Checkbox($"{label}##CompactCurrencyFilterEntry", ref enabled))
+            {
+                if (enabled)
+                    plugin.Configuration.HiddenCurrencies.Remove(label);
+                else
+                    plugin.Configuration.HiddenCurrencies.Add(label);
+                plugin.Configuration.Save();
+            }
+        }
+
+        if (allCurrencies.Count == 0)
+            OutlineText(Loc.T("Keine Treffer.", "No matches."), MutedColor);
+
+        ImGui.EndChild();
     }
 
     /// <summary>
@@ -1092,8 +1252,8 @@ public class CompactOverlayWindow : Window
                     ? MissingPluginTooltip
                     : isDisabled
                         ? Loc.T(
-                            "Keine Sightseeing-Punkte mit bekannter Position in dieser Zone.",
-                            "No sightseeing points with a known position in this zone.")
+                            "Aktuell kein Sightseeing-Punkt in dieser Zone erreichbar (keine bekannte Position, oder Wetter/Uhrzeit passt gerade nicht).",
+                            "No sightseeing point currently reachable in this zone (no known position, or the weather/time doesn't match right now).")
                         : automation.IsActive
                             ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
                             : Loc.T(
@@ -1419,7 +1579,8 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Facewear] = new(0.55f, 0.75f, 1f, 1f),
         [CollectibleType.FashionAccessory] = new(0.75f, 0.9f, 0.45f, 1f),
         [CollectibleType.TripleTriadCard] = new(1f, 0.5f, 0.5f, 1f),
-        [CollectibleType.FrameKit] = new(0.6f, 0.85f, 1f, 1f),
+        [CollectibleType.FrameKit] = new(0.55f, 0.55f, 0.95f, 1f),
+        [CollectibleType.Hairstyle] = new(0.9f, 0.7f, 0.9f, 1f),
         [CollectibleType.Aetheryte] = new(0.6f, 1f, 0.75f, 1f),
         [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
         [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
