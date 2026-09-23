@@ -1480,23 +1480,100 @@ public sealed class Plugin : IDalamudPlugin
     private static readonly Dictionary<uint, Vector3> SightseeingApproachOverrides = new()
     {
         [2162688] = new Vector3(-83.241394f, 42.393375f, -170.998f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162691] = new Vector3(-269.60074f, 29.380001f, -206.16368f), // The Skylift (Middle La Noscea)
+        [2162690] = new Vector3(-58.95674f, 27.313725f, -118.16382f),  // Seasong Grotto (Middle La Noscea)
+        [2162692] = new Vector3(194.44441f, 73.78774f, 302.63824f),    // La Thagran Eastroad (Middle La Noscea)
+        [2162708] = new Vector3(-72.16092f, 11.995184f, -416.05194f),  // Woad Whisper Canyon (Middle La Noscea)
+        [2162709] = new Vector3(213.05968f, 117.65125f, -222.40886f),  // Summerford Farms (Middle La Noscea)
     };
 
-    // Von Hand nachgetragener ZWISCHENSTOPP vor der eigentlichen Zielposition (Key = Adventure-
-    // RowId) - für Punkte, bei denen selbst der über die Karten-Flagge/FlagToPoint gefundene grobe
-    // Laufweg (siehe SightseeingAutomation.BeginNavigateToEntry) gegen eine Wand/ein Geländer läuft,
-    // statt zunächst einen sicheren nahegelegenen Punkt anzulaufen. Ist einer hinterlegt, läuft die
-    // Automation ZUERST dorthin (mit der normalen, großzügigen Toleranz) und erst von dort den
-    // letzten, engen Schritt zur echten Position (siehe SightseeingApproachOverrides/
-    // BeginFinalApproach) - der Umweg über die Karten-Flagge entfällt dann komplett.
-    private static readonly Dictionary<uint, Vector3> SightseeingApproachWaypoints = new()
+    // Je Zwischenstopp: Position + ob dieses Teilstück fliegend angeflogen werden darf (false =
+    // erzwungen zu Fuß/abgemountet, z.B. für einen Durchgang wie eine Tür, durch die man nicht
+    // hindurchfliegen kann) - siehe SightseeingApproachWaypoints-Kommentar.
+    public readonly record struct SightseeingApproachWaypoint(Vector3 Position, bool AllowFlying = true);
+
+    // Von Hand nachgetragene ZWISCHENSTOPPS (der Reihe nach abzulaufen) vor der eigentlichen
+    // Zielposition (Key = Adventure-RowId) - für Punkte, bei denen selbst der über die Karten-
+    // Flagge/FlagToPoint gefundene grobe Laufweg (siehe SightseeingAutomation.BeginNavigateToEntry)
+    // gegen eine Wand/ein Geländer läuft oder ein enger Durchgang (z.B. eine Tür) einen bestimmten,
+    // NICHT fliegenden Anflugweg braucht, statt direkt den geraden/groben Weg zu nehmen. Sind welche
+    // hinterlegt, läuft die Automation ZUERST der Reihe nach dorthin (jeweils mit der normalen,
+    // großzügigen Toleranz, fliegend nur wenn AllowFlying) und erst vom letzten Zwischenstopp aus den
+    // finalen, engen (wieder fliegend erlaubten) Schritt zur echten Position (siehe
+    // SightseeingApproachOverrides/BeginFinalApproach) - der Umweg über die Karten-Flagge entfällt
+    // dann komplett.
+    private static readonly Dictionary<uint, SightseeingApproachWaypoint[]> SightseeingApproachWaypoints = new()
     {
-        [2162688] = new Vector3(-82.96662f, 41.993416f, -170.93227f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162688] = new[] { new SightseeingApproachWaypoint(new Vector3(-82.96662f, 41.993416f, -170.93227f)) }, // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162709] = new[] // Summerford Farms (Middle La Noscea) - erst hinfliegen, dann (weiterhin beritten, nur nicht mehr fliegend, siehe SightseeingAutomation.TryBeginPathfindAccepted) durch die Tür, dann fliegend hoch zum eigentlichen Punkt
+        {
+            new SightseeingApproachWaypoint(new Vector3(210.27715f, 113.26443f, -215.51048f)),
+            new SightseeingApproachWaypoint(new Vector3(224.70628f, 113.49955f, -227.0562f), AllowFlying: false),
+            // Erst senkrecht hoch (gleiche X/Z wie der Türausgang, nur auf Höhe von Punkt 3) - direkt
+            // von der Tür aus horizontal loszufliegen führte über einen Umweg (vermutlich, weil der
+            // Türausgang selbst navmesh-technisch noch als "drinnen" gilt).
+            new SightseeingApproachWaypoint(new Vector3(224.70628f, 118.22706f, -227.0562f)),
+            new SightseeingApproachWaypoint(new Vector3(213.03912f, 118.22706f, -222.41542f)),
+        },
     };
 
     /// <summary>Siehe SightseeingApproachWaypoints-Kommentar.</summary>
-    public static bool TryGetSightseeingApproachWaypoint(uint adventureId, out Vector3 waypoint) =>
-        SightseeingApproachWaypoints.TryGetValue(adventureId, out waypoint);
+    public static bool TryGetSightseeingApproachWaypoints(uint adventureId, out IReadOnlyList<SightseeingApproachWaypoint> waypoints)
+    {
+        if (SightseeingApproachWaypoints.TryGetValue(adventureId, out var found))
+        {
+            waypoints = found;
+            return true;
+        }
+
+        waypoints = Array.Empty<SightseeingApproachWaypoint>();
+        return false;
+    }
+
+    // Von Hand nachgetragene ZWISCHENSTOPPS, die NACH dem Freischalten eines Punkts der Reihe nach
+    // zu Fuß (nie fliegend) abgelaufen werden, bevor es zum nächsten Sightseeing-Punkt weitergeht
+    // (Key = Adventure-RowId) - für Punkte, deren Anflug (siehe SightseeingApproachWaypoints) durch
+    // einen engen Durchgang wie eine Tür führt: derselbe Weg muss zu Fuß auch wieder raus, bevor
+    // erneut losgeflogen werden kann. Nur, wenn nach dem aktuellen Punkt überhaupt noch ein anderer,
+    // aktuell erreichbarer Sightseeing-Punkt übrig ist (siehe SightseeingAutomation.TryWalkOutOrFinish).
+    private static readonly Dictionary<uint, Vector3[]> SightseeingPostCompletionWaypoints = new()
+    {
+        [2162709] = new[] // Summerford Farms (Middle La Noscea) - zu Fuß zurück durch die Tür
+        {
+            new Vector3(219.65729f, 113.499664f, -223.12563f),
+            new Vector3(210.64354f, 113.49537f, -215.86862f),
+        },
+    };
+
+    /// <summary>Siehe SightseeingPostCompletionWaypoints-Kommentar.</summary>
+    public static bool TryGetSightseeingPostCompletionWaypoints(uint adventureId, out IReadOnlyList<Vector3> waypoints)
+    {
+        if (SightseeingPostCompletionWaypoints.TryGetValue(adventureId, out var found))
+        {
+            waypoints = found;
+            return true;
+        }
+
+        waypoints = Array.Empty<Vector3>();
+        return false;
+    }
+
+    // Von Hand nachgetragene, genaue Steh-Position NACH dem Abmounten am Zielpunkt (Key = Adventure-
+    // RowId) - für Punkte, bei denen die normale Lande-/Ankunftsposition nach dem Abmounten (siehe
+    // SightseeingAutomation.UpdateWaitingForUnlock) noch spürbar neben der tatsächlich zur
+    // Freischaltung nötigen Stelle liegt (z.B. weil dort gelandet statt exakt draufgelaufen wird) -
+    // dann dort noch ein letztes kurzes Stück zu Fuß hin, bevor überhaupt auf die Freischaltung
+    // gewartet/der Emote ausgeführt wird, sonst schaltet der Punkt u.U. gar nicht frei.
+    private static readonly Dictionary<uint, Vector3> SightseeingExactStandPositions = new()
+    {
+        [2162709] = new Vector3(213.07825f, 117.651245f, -222.44019f), // Summerford Farms (Middle La Noscea)
+    };
+
+    /// <summary>Siehe SightseeingExactStandPositions-Kommentar.</summary>
+    public static bool TryGetSightseeingExactStandPosition(uint adventureId, out Vector3 position)
+    {
+        return SightseeingExactStandPositions.TryGetValue(adventureId, out position);
+    }
 
     private static List<CollectibleEntry>? sightseeingEntriesCache;
     private static List<(uint FirstAdventureId, uint LastAdventureId, uint QuestId)>? sightseeingGateQuestsCache;
@@ -1649,14 +1726,21 @@ public sealed class Plugin : IDalamudPlugin
     /// Client-Uhr, damit eine falsch eingestellte PC-Uhrzeit die Prüfung nicht verfälscht - dieselbe
     /// Formel wie im Dalamud-Plugin "AutoSightseeingLog" (Core/Time/EorzeaTime.cs).
     /// </summary>
-    private static unsafe int GetCurrentEorzeaBell()
+    private static int GetCurrentEorzeaBell()
     {
-        var serverTime = Framework.GetServerTime();
-        if (serverTime <= 0)
-            serverTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-        return (int)(serverTime / 175 % 24);
+        return (int)(GetServerUnixSeconds() / 175 % 24);
     }
+
+    /// <summary>
+    /// Unix-Sekunden für die Eorzeazeit-/Wetterberechnung - bewusst die lokale Uhr (DateTime.UtcNow),
+    /// NICHT Framework.GetServerTime(): Framework.GetServerTime() spiegelt offenbar nur den zuletzt
+    /// vom Server empfangenen Zeitstempel wider (aktualisiert sich nicht jeden Frame live), wodurch
+    /// er ein paar Sekunden hinter der tatsächlichen Zeit zurückliegen kann - das führte zu einer
+    /// spürbaren (~2s) Abweichung gegenüber dem Dalamud-Plugin "Tourist", das (wie die meisten
+    /// Wetter-Tools) durchgängig die lokale Uhr nutzt. Bei korrekt eingestellter PC-Uhr (Standard bei
+    /// automatischer Zeitsynchronisation) ist die lokale Uhr hier daher tatsächlich genauer.
+    /// </summary>
+    private static long GetServerUnixSeconds() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     /// <summary>
     /// Ob die aktuelle Eorzea-Zeit im (ggf. über Mitternacht laufenden) Zeitfenster des Punkts liegt.
@@ -1671,15 +1755,309 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Ob das aktuelle Wetter der Zone des Punkts zu seiner SightseeingWeatherMask passt - live über
-    /// FFXIVClientStructs' WeatherManager (funktioniert für JEDE Zone, nicht nur die aktuell
-    /// geladene, da FFXIV-Wetter deterministisch aus der Zone selbst berechnet wird). Nur für
-    /// Einträge mit SightseeingWeatherMask != 0 relevant (ausschließlich A-Realm-Reborn-Punkte).
+    /// Ob das aktuelle Wetter der Zone des Punkts zu seiner SightseeingWeatherMask passt - über
+    /// GetWeatherIdAtUnixSeconds (funktioniert für JEDE Zone, nicht nur die aktuell geladene, da
+    /// FFXIV-Wetter deterministisch aus Zone + Zeit berechnet wird). Nur für Einträge mit
+    /// SightseeingWeatherMask != 0 relevant (ausschließlich A-Realm-Reborn-Punkte).
     /// </summary>
-    private static unsafe bool IsSightseeingWeatherOk(CollectibleEntry entry)
+    private static bool IsSightseeingWeatherOk(CollectibleEntry entry)
     {
-        var weatherId = WeatherManager.Instance()->GetWeatherForHour((ushort)entry.TerritoryTypeId, 0);
-        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << weatherId)) != 0;
+        var weatherId = GetWeatherIdAtUnixSeconds(entry.TerritoryTypeId, GetServerUnixSeconds());
+        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << (int)weatherId)) != 0;
+    }
+
+    // Exakter FFXIV-Wetteralgorithmus (SaintCoinach/community-verifiziert, siehe
+    // github.com/karashiiro/FFXIVWeather, FFXIVWeatherService.CalculateTarget/GetCurrentWeather) -
+    // direkt gegen unsere eigenen Lumina-Daten (TerritoryType.WeatherRate -> WeatherRate-Sheet)
+    // nachgebaut, statt sich auf FFXIVClientStructs' WeatherManager.GetWeatherForHour(hourOffset) zu
+    // verlassen: dessen Ergebnisse für hourOffset != 0 wichen spürbar von etablierten Referenz-Tools
+    // wie dem Dalamud-Plugin "Tourist" ab (das denselben SaintCoinach-Algorithmus nutzt). Wetter-
+    // Perioden sind auf FESTE 1400-Sekunden-Blöcke (23min20s = 8 Eorzea-Stunden) seit der Unix-Epoche
+    // ausgerichtet, nicht relativ zu "jetzt" - diese Variante berechnet den exakten Perioden-Beginn
+    // direkt, keine Rundung auf ganze Eorzea-Stunden nötig.
+    private const long WeatherPeriodSeconds = 1400;
+
+    private static int CalculateWeatherTarget(long periodStartUnixSeconds)
+    {
+        var bell = periodStartUnixSeconds / 175;
+        // "Magic" aus SaintCoinach: für die Berechnung ist 16:00 = 0, 00:00 = 8, 08:00 = 16.
+        var increment = (uint)(bell + 8 - (bell % 8)) % 24;
+        var totalDays = (uint)(periodStartUnixSeconds / 4200);
+
+        var calcBase = totalDays * 100 + increment;
+        var step1 = (calcBase << 11) ^ calcBase;
+        var step2 = (step1 >> 8) ^ step1;
+        return (int)(step2 % 100);
+    }
+
+    /// <summary>
+    /// Wetter-Sheet-RowId für eine Zone zu einem beliebigen (auch zukünftigen) Zeitpunkt - 0, wenn
+    /// TerritoryType/WeatherRate nicht auflösbar sind.
+    /// </summary>
+    private static uint GetWeatherIdAtUnixSeconds(uint territoryId, long unixSeconds)
+    {
+        var periodStart = unixSeconds - (((unixSeconds % WeatherPeriodSeconds) + WeatherPeriodSeconds) % WeatherPeriodSeconds);
+        var target = CalculateWeatherTarget(periodStart);
+
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null || !territorySheet.TryGetRow(territoryId, out var territory))
+            return 0;
+
+        var weatherRateSheet = DataManager.GetExcelSheet<WeatherRate>();
+        if (weatherRateSheet == null || !weatherRateSheet.TryGetRow(territory.WeatherRate.RowId, out var weatherRate))
+            return 0;
+
+        var cumulative = 0;
+        for (var i = 0; i < weatherRate.Rate.Count; i++)
+        {
+            cumulative += weatherRate.Rate[i];
+            if (target < cumulative)
+                return weatherRate.Weather[i].RowId;
+        }
+
+        return 0;
+    }
+
+    // Wetter ist KEIN festes Rotationsmuster - deterministisch aus Zone + absoluter Eorzea-Zeit
+    // berechnet (siehe GetWeatherIdAtUnixSeconds/CalculateWeatherTarget), ein seltenes Wetter kann
+    // daher mehrere Eorzea-Tage auf sich warten lassen. 120 Wetter-Perioden (168000 Sekunden, ca. 7
+    // Erdentage) als Obergrenze reichen praktisch immer, ohne den Scan unbegrenzt laufen zu lassen.
+    private const int SightseeingAvailabilityLookaheadPeriods = 120;
+    private static readonly TimeSpan SightseeingAvailabilityCacheTtl = TimeSpan.FromSeconds(30);
+
+    // Absolute Zeitpunkte statt fertiger Restdauern gecacht, damit die Anzeige (siehe
+    // GetSightseeingAvailabilityLabel/GetSightseeingActiveUntilLabel) bei jedem Aufruf frisch
+    // "verfügbar in X" nachrechnen und so wie ein echter Countdown runterzählen kann, ohne bei
+    // jedem UI-Frame den teuren Perioden-Scan erneut laufen zu lassen (der nur alle
+    // SightseeingAvailabilityCacheTtl neu passiert).
+    private static readonly Dictionary<uint, (DateTime ComputedAt, DateTime? AvailableAtUtc)> sightseeingAvailableAtCache = new();
+    private static readonly Dictionary<uint, (DateTime ComputedAt, DateTime? UnavailableAtUtc)> sightseeingUnavailableAtCache = new();
+
+    /// <summary>
+    /// Ob die Eorzea-Bell "bell" im (ggf. über Mitternacht laufenden) Zeitfenster des Punkts liegt.
+    /// </summary>
+    private static bool IsBellInSightseeingWindow(CollectibleEntry entry, int bell) =>
+        entry.SightseeingFirstBell <= entry.SightseeingLastBell
+            ? bell >= entry.SightseeingFirstBell && bell <= entry.SightseeingLastBell
+            : bell >= entry.SightseeingFirstBell || bell <= entry.SightseeingLastBell;
+
+    /// <summary>Ob das Wetter zum gegebenen Unix-Zeitpunkt zur SightseeingWeatherMask passt (true, wenn der Punkt gar keine Wetter-Bedingung hat).</summary>
+    private static bool IsWeatherOkAtUnixSeconds(CollectibleEntry entry, long unixSeconds)
+    {
+        if (entry.SightseeingWeatherMask == 0)
+            return true;
+
+        var weatherId = GetWeatherIdAtUnixSeconds(entry.TerritoryTypeId, unixSeconds);
+        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << (int)weatherId)) != 0;
+    }
+
+    /// <summary>
+    /// Absoluter Zeitpunkt (UTC), ab dem Wetter UND Uhrzeit gleichzeitig zum Punkt passen - null,
+    /// wenn der Punkt keine solche Bedingung hat, oder wenn dafür (innerhalb von
+    /// SightseeingAvailabilityLookaheadPeriods) partout keine passende Kombination gefunden wird.
+    /// Scannt dafür in EXAKTEN Wetter-Perioden (1400 Sekunden, absolut seit Unix-Epoche ausgerichtet
+    /// - siehe GetWeatherIdAtUnixSeconds/WeatherPeriodSeconds) vorwärts, nicht in 175-Sekunden-
+    /// Schritten relativ zu "jetzt": Wetter ist innerhalb einer Periode konstant, ein an "jetzt"
+    /// ausgerichtetes Raster würde die echte (an der Epoche ausgerichtete) Wechselgrenze verfehlen
+    /// und bis zu eine ganze Periode zu spät melden - genau das führte zu einer spürbaren Abweichung
+    /// gegenüber dem Dalamud-Plugin "Tourist". Innerhalb einer wetterlich passenden Periode wird bei
+    /// zusätzlichem Zeitfenster die exakte Bell-Grenze gesucht (175-Sekunden-Raster, 8 Bells je
+    /// Periode).
+    /// </summary>
+    private static DateTime? GetSightseeingAvailableAtUtc(CollectibleEntry entry)
+    {
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return null;
+
+        if (sightseeingAvailableAtCache.TryGetValue(entry.Id, out var cached) && DateTime.UtcNow - cached.ComputedAt < SightseeingAvailabilityCacheTtl)
+            return cached.AvailableAtUtc;
+
+        var now = DateTime.UtcNow;
+        var nowUnix = GetServerUnixSeconds();
+        var currentPeriodStart = nowUnix - (nowUnix % WeatherPeriodSeconds);
+        DateTime? result = null;
+
+        for (var p = 0; p <= SightseeingAvailabilityLookaheadPeriods && result == null; p++)
+        {
+            var candidatePeriodStart = currentPeriodStart + p * WeatherPeriodSeconds;
+
+            if (!IsWeatherOkAtUnixSeconds(entry, candidatePeriodStart))
+                continue;
+
+            if (!entry.SightseeingHasTimeWindow)
+            {
+                var candidateUnix = Math.Max(candidatePeriodStart, nowUnix);
+                result = now.AddSeconds(candidateUnix - nowUnix);
+                break;
+            }
+
+            for (var bellOffset = 0; bellOffset < 8; bellOffset++)
+            {
+                var candidateUnix = candidatePeriodStart + bellOffset * 175L;
+                if (candidateUnix < nowUnix)
+                    continue;
+
+                var bell = (int)(candidateUnix / 175 % 24);
+                if (IsBellInSightseeingWindow(entry, bell))
+                {
+                    result = now.AddSeconds(candidateUnix - nowUnix);
+                    break;
+                }
+            }
+        }
+
+        sightseeingAvailableAtCache[entry.Id] = (now, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Gegenstück zu GetSightseeingAvailableAtUtc - absoluter Zeitpunkt (UTC), ab dem Wetter ODER
+    /// Uhrzeit NICHT mehr passen (erste exakte Wetter-Perioden-/Bell-Grenze, an der mindestens eine
+    /// der beiden Bedingungen kippt, siehe dortigen Kommentar zur Perioden-Ausrichtung). Nur
+    /// sinnvoll, wenn der Punkt gerade aktiv ist - sonst (siehe GetSightseeingActiveUntilLabel) wird
+    /// diese Funktion gar nicht erst aufgerufen.
+    /// </summary>
+    private static DateTime? GetSightseeingUnavailableAtUtc(CollectibleEntry entry)
+    {
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return null;
+
+        if (sightseeingUnavailableAtCache.TryGetValue(entry.Id, out var cached) && DateTime.UtcNow - cached.ComputedAt < SightseeingAvailabilityCacheTtl)
+            return cached.UnavailableAtUtc;
+
+        var now = DateTime.UtcNow;
+        var nowUnix = GetServerUnixSeconds();
+        var currentPeriodStart = nowUnix - (nowUnix % WeatherPeriodSeconds);
+        DateTime? result = null;
+
+        for (var p = 0; p <= SightseeingAvailabilityLookaheadPeriods && result == null; p++)
+        {
+            var candidatePeriodStart = currentPeriodStart + p * WeatherPeriodSeconds;
+
+            if (!IsWeatherOkAtUnixSeconds(entry, candidatePeriodStart))
+            {
+                var candidateUnix = Math.Max(candidatePeriodStart, nowUnix);
+                result = now.AddSeconds(candidateUnix - nowUnix);
+                break;
+            }
+
+            if (!entry.SightseeingHasTimeWindow)
+                continue;
+
+            for (var bellOffset = 0; bellOffset < 8; bellOffset++)
+            {
+                var candidateUnix = candidatePeriodStart + bellOffset * 175L;
+                if (candidateUnix < nowUnix)
+                    continue;
+
+                var bell = (int)(candidateUnix / 175 % 24);
+                if (!IsBellInSightseeingWindow(entry, bell))
+                {
+                    result = now.AddSeconds(candidateUnix - nowUnix);
+                    break;
+                }
+            }
+        }
+
+        sightseeingUnavailableAtCache[entry.Id] = (now, result);
+        return result;
+    }
+
+    private static TimeSpan? GetRemaining(DateTime? targetUtc)
+    {
+        if (targetUtc == null)
+            return null;
+
+        var remaining = targetUtc.Value - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// Dauer als echter HH:MM:SS-Countdown (z.B. "02:15:30") - wird bei jedem Aufruf frisch aus dem
+    /// gecachten Zielzeitpunkt neu berechnet (siehe GetRemaining), zählt dadurch bis auf die Sekunde
+    /// genau runter, nicht nur in groben Stunden-/Minutenschritten.
+    /// </summary>
+    private static string FormatSightseeingAvailableIn(TimeSpan span)
+    {
+        if (span < TimeSpan.Zero)
+            span = TimeSpan.Zero;
+
+        return $"{(int)span.TotalHours:00}:{span.Minutes:00}:{span.Seconds:00}";
+    }
+
+    /// <summary>
+    /// Ob bei diesem Sightseeing-Punkt alle Voraussetzungen MIT HÖHERER PRIORITÄT als Jumping-
+    /// Puzzle-Status/Wetter/Uhrzeit bereits erfüllt sind - Log freigeschaltet, Fliegen freigeschaltet,
+    /// ggf. erste 20 A-Realm-Reborn-Punkte erledigt und das Buch per Quest freigeschaltet (siehe
+    /// ComputeGrandCompanyOrTribeGateReason für die genaue Reihenfolge). Erst wenn das hier true ist,
+    /// sind Jumping-Puzzle-Status oder Wetter/Uhrzeit überhaupt der tatsächlich aktuelle Blockierer.
+    /// Ohne diese Prüfung würde z.B. bei noch gesperrtem Log/Fliegen ein irreführender Wetter/Zeit-
+    /// Timer angezeigt, obwohl der Punkt aus einem ganz anderen Grund nicht erreichbar ist.
+    /// </summary>
+    public static bool IsSightseeingBookAccessible(CollectibleEntry entry)
+    {
+        if (!IsSightseeingLogUnlocked())
+            return false;
+        if (!CanFly)
+            return false;
+        if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
+            return false;
+        if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Ob AKTUELL wirklich fehlendes Fliegen der Blockierer eines Sightseeing-Punkts ist (Log ist
+    /// schon freigeschaltet, sonst wäre DAS die eigentliche Ursache) - für den spezifischen inline
+    /// "(Bedingung nicht erfüllt (Fliegen nicht freigeschaltet))"-Hinweis im Overlay (siehe
+    /// CompactOverlayWindow), statt nur des generischen Labels.
+    /// </summary>
+    public static bool IsSightseeingBlockedByFlying(CollectibleEntry entry) =>
+        entry.Type == CollectibleType.Sightseeing && IsSightseeingLogUnlocked() && !CanFly;
+
+    /// <summary>
+    /// " - <Dauer>"-Zusatz fürs inline "(Bedingung nicht erfüllt)"-Label im Overlay (siehe
+    /// CompactOverlayWindow) - NUR für Sightseeing-Punkte, die AKTUELL wirklich durch Wetter/Uhrzeit
+    /// gesperrt sind (siehe IsSightseeingBookAccessible). Leer, wenn nicht anwendbar (anderer Typ/
+    /// anderer Sperrgrund) oder innerhalb der Vorschau partout kein Zeitpunkt gefunden wurde. Rechnet
+    /// die Restdauer bei jedem Aufruf frisch aus dem gecachten Zielzeitpunkt - zählt dadurch wie ein
+    /// echter Countdown runter, ohne den Scan selbst jedes Mal zu wiederholen.
+    /// </summary>
+    public static string GetSightseeingAvailabilityLabel(CollectibleEntry entry)
+    {
+        if (entry.Type != CollectibleType.Sightseeing || !IsSightseeingBookAccessible(entry))
+            return string.Empty;
+
+        var remaining = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+        return remaining.HasValue ? $" - {FormatSightseeingAvailableIn(remaining.Value)}" : string.Empty;
+    }
+
+    /// <summary>
+    /// " - noch <Dauer>"-Zusatz für einen grünen "(aktiv)"-Hinweis im Overlay (siehe
+    /// CompactOverlayWindow) - NUR für Sightseeing-Punkte mit Wetter-/Zeitfenster-Bedingung, die
+    /// GERADE aktiv (also nicht gesperrt) sind, mit Restdauer bis diese Bedingung wieder kippt.
+    /// Leer für Punkte ohne eine solche Bedingung (die sind ja nie "gesperrt", ein Aktiv-Hinweis
+    /// wäre dort bedeutungslos) oder wenn der Punkt gerade tatsächlich gesperrt ist.
+    /// </summary>
+    public static string GetSightseeingActiveUntilLabel(CollectibleEntry entry)
+    {
+        if (entry.Type != CollectibleType.Sightseeing)
+            return string.Empty;
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return string.Empty;
+        if (!IsSightseeingBookAccessible(entry))
+            return string.Empty;
+        if (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
+            return string.Empty;
+        if (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry))
+            return string.Empty;
+
+        var remaining = GetRemaining(GetSightseeingUnavailableAtUtc(entry));
+        return remaining.HasValue
+            ? $" - {FormatSightseeingAvailableIn(remaining.Value)}"
+            : string.Empty;
     }
 
     /// <summary>
@@ -2586,9 +2964,6 @@ public sealed class Plugin : IDalamudPlugin
         // geprüft, damit die Markierung sofort verschwindet, sobald die Quest erledigt ist.
         if (entry.Type == CollectibleType.Sightseeing)
         {
-            if (SightseeingUnsupportedByAutomation.TryGetValue(entry.Id, out var unsupportedReason))
-                return Loc.T(unsupportedReason.De, unsupportedReason.En);
-
             if (!IsSightseeingLogUnlocked())
             {
                 return Loc.T(
@@ -2596,6 +2971,23 @@ public sealed class Plugin : IDalamudPlugin
                     "Sightseeing Log not unlocked yet (quest \"A Sight to Behold\").");
             }
 
+            // Explizite Nutzeranforderung: die Automation/das Feature soll NUR mit freigeschaltetem
+            // Fliegen funktionieren - direkt nach der Log-Prüfung, noch vor allem Weiteren (auch vor
+            // Jumping-Puzzle-Unterstützung, siehe Priorität 1 unten). CanFly berücksichtigt dabei auch
+            // Zonen, in denen Fliegen erst durch genug gesammelte Ätherströmungen freigeschaltet wird.
+            if (!CanFly)
+            {
+                return Loc.T(
+                    "Bedingung nicht erfüllt (Fliegen nicht freigeschaltet).",
+                    "Condition not met (flying not unlocked).");
+            }
+
+            // Priorität 1 (siehe Nutzeranfrage): erst die ersten 20 A-Realm-Reborn-Punkte, DANN erst
+            // Jumping-Puzzle-Unterstützung, DANN Wetter/Uhrzeit prüfen - ein noch nicht freigeschaltetes
+            // Buch ist der fundamentalste Blocker und soll daher vor allem anderen angezeigt werden,
+            // auch wenn der jeweilige Punkt zusätzlich noch ein Jumping Puzzle wäre oder gerade
+            // falsches Wetter hätte.
+            //
             // Die ersten 20 A-Realm-Reborn-Punkte sind mit dem Log selbst verfügbar - die restlichen
             // 60 (SightseeingNeedsFirstTwenty) erst, wenn ALLE ersten 20 aufgezeichnet sind (danach
             // schaltet Millith Ironheart in Old Gridania das Buch frei) - siehe SightseeingFirstBookCount.
@@ -2608,6 +3000,8 @@ public sealed class Plugin : IDalamudPlugin
 
             // Heavensward (feste Quest) bzw. Stormblood und später (siehe ResolveSightseeingGateQuests,
             // aus Lumina "AdventureExPhase" aufgelöst) - jedes spätere Buch braucht seine eigene Quest.
+            // Gleiche Kategorie wie SightseeingNeedsFirstTwenty oben (Buch-Freischaltung), daher direkt
+            // danach geprüft.
             if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
             {
                 var gateQuestName = ResolveQuestNameById(entry.SightseeingGateQuestId);
@@ -2618,20 +3012,36 @@ public sealed class Plugin : IDalamudPlugin
                         $"Requires the completed quest \"{gateQuestName}\" to unlock this sightseeing log book.");
             }
 
-            // Nur A-Realm-Reborn-Punkte verlangen ein bestimmtes Wetter (SightseeingWeatherMask != 0),
-            // siehe RealmRebornVistaWeathers.
+            // Priorität 2: Jumping-Puzzle-Unterstützung (siehe SightseeingUnsupportedByAutomation).
+            if (SightseeingUnsupportedByAutomation.TryGetValue(entry.Id, out var unsupportedReason))
+                return Loc.T(unsupportedReason.De, unsupportedReason.En);
+
+            // Priorität 3: Wetter/Uhrzeit. Nur A-Realm-Reborn-Punkte verlangen ein bestimmtes Wetter
+            // (SightseeingWeatherMask != 0),
+            // siehe RealmRebornVistaWeathers. Hängt bei beiden Meldungen unten zusätzlich einen
+            // "verfügbar in..."-Timer an (siehe GetSightseeingAvailableAtUtc), der - falls der Punkt
+            // ZUSÄTZLICH auch ein Zeitfenster hat - beide Bedingungen gemeinsam berücksichtigt, nicht
+            // nur die hier gerade geprüfte.
             if (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
             {
+                var availableIn = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+                var suffix = availableIn.HasValue
+                    ? Loc.T($" (verfügbar in {FormatSightseeingAvailableIn(availableIn.Value)})", $" (available in {FormatSightseeingAvailableIn(availableIn.Value)})")
+                    : "";
                 return Loc.T(
-                    "Das Wetter in dieser Zone passt gerade nicht (nur bei bestimmtem Wetter sichtbar/abschließbar).",
-                    "The weather in this zone isn't right currently (only visible/completable with specific weather).");
+                    $"Das Wetter in dieser Zone passt gerade nicht (nur bei bestimmtem Wetter sichtbar/abschließbar).{suffix}",
+                    $"The weather in this zone isn't right currently (only visible/completable with specific weather).{suffix}");
             }
 
             if (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry))
             {
+                var availableIn = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+                var suffix = availableIn.HasValue
+                    ? Loc.T($" (verfügbar in {FormatSightseeingAvailableIn(availableIn.Value)})", $" (available in {FormatSightseeingAvailableIn(availableIn.Value)})")
+                    : "";
                 return Loc.T(
-                    $"Nur zwischen {entry.SightseeingFirstBell:00}:00 und {entry.SightseeingLastBell:00}:59 Eorzeazeit sichtbar/abschließbar.",
-                    $"Only visible/completable between {entry.SightseeingFirstBell:00}:00 and {entry.SightseeingLastBell:00}:59 Eorzea time.");
+                    $"Nur zwischen {entry.SightseeingFirstBell:00}:00 und {entry.SightseeingLastBell:00}:59 Eorzeazeit sichtbar/abschließbar.{suffix}",
+                    $"Only visible/completable between {entry.SightseeingFirstBell:00}:00 and {entry.SightseeingLastBell:00}:59 Eorzea time.{suffix}");
             }
         }
 
@@ -3933,6 +4343,48 @@ public sealed class Plugin : IDalamudPlugin
             return;
 
         actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
+    }
+
+    private const string AllaganToolsInternalName = "InventoryTools"; // Anzeigename im Spiel ist "Allagan Tools"
+
+    /// <summary>
+    /// Ob das optionale Fremdplugin "Allagan Tools" aktuell installiert und geladen ist - für die
+    /// Freischaltung von Configuration.EnableAllaganToolsIntegration (siehe MainWindow QoL-
+    /// Einstellungen), die dort automatisch wieder ausgeschaltet wird, falls das Plugin nachträglich
+    /// entfernt wird.
+    /// </summary>
+    public static bool IsAllaganToolsAvailable() =>
+        PluginInterface.InstalledPlugins.Any(p => p.InternalName == AllaganToolsInternalName && p.IsLoaded);
+
+    /// <summary>
+    /// Öffnet Allagan Tools' "Mehr Informationen"-Fenster für ein Item - per SHIFT + Linksklick auf
+    /// einen Sammelobjekt-Namen oder eine Währungsangabe im kompakten Overlay (siehe
+    /// CompactOverlayWindow.DrawClickableName/DrawCurrencyRequirement), nur wenn Configuration.
+    /// EnableAllaganToolsIntegration aktiv UND das Plugin geladen ist. Ruft dessen selbst
+    /// registrierten Chat-Befehl "/moreinfo" auf (akzeptiert sowohl Item-Namen als auch Item-ID) -
+    /// Allagan Tools' eigene IPC bietet aktuell keine Methode, um das Item-Fenster zu öffnen (nur
+    /// Bestands-/Filter-bezogene Funktionen, siehe dessen IPC/IPCService.cs).
+    /// </summary>
+    public static void OpenAllaganToolsItemInfo(string itemNameOrId)
+    {
+        if (!instance.Configuration.EnableAllaganToolsIntegration || !IsAllaganToolsAvailable())
+            return;
+
+        try
+        {
+            CommandManager.ProcessCommand($"/moreinfo {itemNameOrId}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Öffnen von Allagan Tools' Item-Fenster.");
+        }
+    }
+
+    /// <summary>Wie OpenAllaganToolsItemInfo(string), für eine bekannte Item-RowId (z.B. eine Währung).</summary>
+    public static void OpenAllaganToolsItemInfo(uint itemId)
+    {
+        if (itemId != 0)
+            OpenAllaganToolsItemInfo(itemId.ToString());
     }
 
     // Von Hand als "nicht von der Automation unterstützt" markierte Sightseeing-Punkte (Key =

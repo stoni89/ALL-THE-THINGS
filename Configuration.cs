@@ -114,6 +114,13 @@ public class Configuration : IPluginConfiguration
     // Overlay.
     public bool SimulateSightseeingAutomation { get; set; } = false;
 
+    // Aktiviert SHIFT + Linksklick auf einen Sammelobjekt-Namen oder eine Währungsangabe im
+    // kompakten Overlay, um Allagan Tools' "Mehr Informationen"-Fenster für das jeweilige Item zu
+    // öffnen (siehe Plugin.OpenAllaganToolsItemInfo/Windows.CompactOverlayWindow). Nur wirksam,
+    // solange Allagan Tools (interner Name "InventoryTools") installiert/geladen ist - wird in den
+    // Einstellungen automatisch wieder ausgeschaltet, falls das Plugin nachträglich entfernt wird.
+    public bool EnableAllaganToolsIntegration { get; set; } = false;
+
     public void Save()
     {
         Plugin.PluginInterface.SavePluginConfig(this);
