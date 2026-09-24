@@ -439,7 +439,7 @@ public sealed class GoToAutomation
             return;
         }
 
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
         {
             Plugin.Log.Info($"[GoToAutomation] UpdateMoving({currentEntryName}): nie sichtbar losgelaufen - abgebrochen.");
             Finish();

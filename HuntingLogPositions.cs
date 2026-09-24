@@ -231,9 +231,9 @@ public static class HuntingLogPositions
         [239] = new Vector3(-524f, 0f, 26f), // Blowfly Swarm (Eastern Thanalan)
         [240] = new Vector3(-174f, 0f, 126f), // Myotragus Billy (Eastern Thanalan)
         [241] = new Vector3(-174f, 0f, 26f), // Myotragus Nanny (Eastern Thanalan)
-        [242] = new Vector3(-374f, 0f, -274f), // Rotting Noble (Eastern Thanalan)
+        [242] = new Vector3(-345.98752f, -11.730836f, -248.9227f), // Rotting Noble (Eastern Thanalan) - per /pos im Spiel korrigiert, Scraper-Wert war falsch
         [243] = new Vector3(-324f, 0f, -274f), // Rotting Corpse (Eastern Thanalan)
-        [244] = new Vector3(-424f, 0f, -524f), // Bloated Bogy (Western Thanalan)
+        [244] = new Vector3(-415.16f, 24.356073f, -481.06354f), // Bloated Bogy (Western Thanalan) - per /pos im Spiel korrigiert, Scraper-Wert war falsch
         [245] = new Vector3(-424f, 0f, -574f), // Lead Coblyn (Western Thanalan)
         [246] = new Vector3(-324f, 0f, -724f), // Yarzon Scavenger (Western Thanalan)
         [247] = new Vector3(-374f, 0f, -724f), // Laughing Toad (Western Thanalan)

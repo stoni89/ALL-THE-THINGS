@@ -33,6 +33,14 @@ public enum MenuLanguage
 }
 
 [Serializable]
+/// <summary>Ein Eintrag der Blacklist (siehe Configuration.Blacklist).</summary>
+public class BlacklistedEntry
+{
+    public CollectibleType Type { get; set; }
+    public uint Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+}
+
 public class Configuration : IPluginConfiguration
 {
     public int Version { get; set; } = 1;
@@ -166,6 +174,17 @@ public class Configuration : IPluginConfiguration
     // Stance als Default, da sie (anders als Attacker/Defender/Healer) kein eigenes Stance-Level
     // braucht und somit immer sofort nutzbar ist (siehe Plugin.IsChocoboStanceUnlocked).
     public ChocoboStance ChocoboStance { get; set; } = ChocoboStance.FreeStance;
+
+    // Welches Kampf-Plugin die Automationen nutzen (siehe CombatPluginBridge) - null bzw. ein nicht
+    // (mehr) installiertes wird automatisch auf das installierte umgestellt (siehe
+    // Plugin.EnsureCombatPluginDefault), wählbar unter Allgemein > Automation, sobald mehrere
+    // installiert sind.
+    public CombatPluginKind? CombatPlugin { get; set; }
+
+    // Vom Nutzer komplett ausgeblendete Einträge (STRG + SHIFT + Klick im Overlay, verwaltet auf der
+    // Blacklist-Seite im Hauptmenü) - weder im Overlay angezeigt noch von einer Automation angelaufen
+    // (siehe Plugin.IsBlacklisted). Name nur zur Anzeige auf der Blacklist-Seite, maßgeblich ist Typ + Id.
+    public List<BlacklistedEntry> Blacklist { get; set; } = new();
 
     // Sprache NUR fürs Menü (Windows.MainWindow) - siehe Loc-Klassenkommentar. Vorbelegt anhand der
     // aktuell im Spielclient eingestellten Sprache (bei Deutsch -> Deutsch, sonst Englisch), danach

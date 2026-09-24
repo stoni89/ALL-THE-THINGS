@@ -814,7 +814,7 @@ public sealed class AetheryteAutomation
 
             return;
         }
-        else if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        else if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
         {
             // Auch nach der Gnadenfrist nie sichtbar losgelaufen - vnavmesh hat den Auftrag zwar
             // angenommen, aber offenbar doch nie wirklich ausgeführt.

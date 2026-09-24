@@ -1,5 +1,7 @@
 using System;
+using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Plugin.Ipc;
 
 namespace TheExplorersCodex;
 
@@ -29,6 +31,36 @@ public sealed class ChocoboCompanionSupport
     // fehlschlagen (gleiches Muster wie SightseeingAutomation.DismountSettleDelay).
     private static readonly TimeSpan DismountSettleDelay = TimeSpan.FromSeconds(1);
 
+    // Wie lange nach einem Lande-Auftrag an vnavmesh (siehe TryRequestLanding) mindestens gewartet
+    // wird, bevor ein neuer erteilt wird - der Pfad startet u.U. erst ein paar Frames später.
+    private static readonly TimeSpan LandingRetryInterval = TimeSpan.FromSeconds(5);
+
+    // Horizontaler Suchradius für den Bodenpunkt unter dem Charakter (vnavmesh PointOnFloor).
+    private const float LandingSearchHalfExtentXZ = 10f;
+
+    // Wie genau der Bodenpunkt erreicht werden muss - eng, damit wirklich gelandet (nicht nur
+    // knapp darüber geschwebt) wird (gleicher Wert wie SightseeingAutomation.ApproachWaypointLandingTolerance).
+    private const float LandingTolerance = 0.5f;
+
+    // vnavmesh-IPC fürs Landen, falls beim blockierenden Start-Schritt noch in der Luft (siehe
+    // Tick) - ein Absteige-Befehl allein wird vom Spiel in größerer Höhe schlicht ignoriert.
+    // (Punkt, allowUnlandable, halfExtentXZ) -> Bodenpunkt oder null.
+    private readonly ICallGateSubscriber<Vector3, bool, float, Vector3?> queryPointOnFloor;
+    // (Ziel, fly, Toleranz) -> angenommen? Mit fly=false landet vnavmesh zuerst (wie bei SightseeingAutomation).
+    private readonly ICallGateSubscriber<Vector3, bool, float, bool> pathfindAndMoveCloseTo;
+    private readonly ICallGateSubscriber<bool> pathIsRunning;
+    private readonly ICallGateSubscriber<bool> pathfindInProgress;
+
+    private DateTime lastLandingRequestAt = DateTime.MinValue;
+
+    public ChocoboCompanionSupport()
+    {
+        queryPointOnFloor = Plugin.PluginInterface.GetIpcSubscriber<Vector3, bool, float, Vector3?>("vnavmesh.Query.Mesh.PointOnFloor");
+        pathfindAndMoveCloseTo = Plugin.PluginInterface.GetIpcSubscriber<Vector3, bool, float, bool>("vnavmesh.SimpleMove.PathfindAndMoveCloseTo");
+        pathIsRunning = Plugin.PluginInterface.GetIpcSubscriber<bool>("vnavmesh.Path.IsRunning");
+        pathfindInProgress = Plugin.PluginInterface.GetIpcSubscriber<bool>("vnavmesh.SimpleMove.PathfindInProgress");
+    }
+
     // Wie lange nach einem angenommenen Beschwören-Versuch gewartet wird, bis er tatsächlich als
     // beschworen zählt (Plugin.IsChocoboCompanionSummoned), bevor er als gescheitert gilt und ein
     // neuer Versuch erlaubt wird - großzügig, da UseAction bereits true zurückgeben kann, bevor
@@ -50,6 +82,11 @@ public sealed class ChocoboCompanionSupport
     // gewartet wird, meldet aber jeden neuen Beginn/Ende einer Wartephase.
     private bool wasLockedLastTick;
 
+    // Wie wasLockedLastTick, nur für das Warten auf ein natürliches Absteigen (siehe Tick).
+    private bool wasWaitingForDismountLastTick;
+
+    private DateTime lastDismountAttemptAt = DateTime.MinValue;
+
     // Verhindert, dass TrySetChocoboStance nach einem bereits erfolgreichen Setzen weiter alle
     // RetryInterval erneut aufgerufen wird - es gibt keinen zuverlässig auslesbaren "aktuelle
     // Stance"-Wert, an dem sich das sonst festmachen ließe. Wird bei jedem frischen Beschwören
@@ -64,6 +101,18 @@ public sealed class ChocoboCompanionSupport
     /// </summary>
     public bool HasAppliedStanceForCurrentSummon => stanceAppliedForCurrentSummon;
 
+    /// <summary>
+    /// Ob (neu) beschworen werden müsste - Feature aktiv/freigeschaltet, Gysahl Greens vorhanden und
+    /// der Begleiter gar nicht draußen oder mit weniger als ResummonThresholdSeconds Restzeit. Für
+    /// die blockierenden Beschwören-Schritte der Automationen (Start und zwischen zwei Hunting-Log-
+    /// Zielen, siehe HuntingLogAutomation.TryStartNext).
+    /// </summary>
+    public static bool NeedsSummon =>
+        Plugin.UseChocoboCompanion
+        && Plugin.IsChocoboCompanionUnlocked()
+        && Plugin.GetGysahlGreensCount() > 0
+        && (!Plugin.IsChocoboCompanionSummoned() || Plugin.GetChocoboSummonTimeLeft() < ResummonThresholdSeconds);
+
     /// <summary>Vor jedem neuen Automation-Lauf (siehe QuestAutomation/HuntingLogAutomation.Start).</summary>
     public void Reset()
     {
@@ -73,7 +122,52 @@ public sealed class ChocoboCompanionSupport
         summonAttemptInFlight = false;
         summonAttemptStartedAt = DateTime.MinValue;
         wasLockedLastTick = false;
+        wasWaitingForDismountLastTick = false;
+        lastDismountAttemptAt = DateTime.MinValue;
+        lastLandingRequestAt = DateTime.MinValue;
         stanceAppliedForCurrentSummon = false;
+    }
+
+    private bool IsLandingPathActive()
+    {
+        try
+        {
+            return pathIsRunning.InvokeFunc() || pathfindInProgress.InvokeFunc();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Lässt vnavmesh zum Bodenpunkt direkt unter dem Charakter fliegen und dort landen - gibt
+    /// false zurück, falls vnavmesh fehlt, kein Bodenpunkt gefunden wurde oder der Auftrag abgelehnt wurde.
+    /// </summary>
+    private bool TryRequestLanding()
+    {
+        var player = Plugin.ObjectTable.LocalPlayer;
+        if (player == null)
+            return false;
+
+        try
+        {
+            var floor = queryPointOnFloor.InvokeFunc(player.Position, false, LandingSearchHalfExtentXZ);
+            if (floor == null)
+            {
+                Plugin.Log.Info($"[ChocoboCompanionSupport] Kein Bodenpunkt unter {player.Position} gefunden.");
+                return false;
+            }
+
+            var accepted = pathfindAndMoveCloseTo.InvokeFunc(floor.Value, false, LandingTolerance);
+            Plugin.Log.Info($"[ChocoboCompanionSupport] Lande bei {floor.Value} (von {player.Position}), angenommen={accepted}.");
+            return accepted;
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning(ex, "[ChocoboCompanionSupport] Landen per vnavmesh fehlgeschlagen.");
+            return false;
+        }
     }
 
     // Nur für die Diagnose-Logzeile direkt unten - verhindert Log-Spam (Tick läuft jeden Frame),
@@ -82,7 +176,11 @@ public sealed class ChocoboCompanionSupport
     private static readonly TimeSpan GateDiagnosticLogInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>Muss jeden Frame aufgerufen werden, während die haltende Automation aktiv ist (siehe Klassenkommentar).</summary>
-    public void Tick()
+    /// <param name="allowDismount">
+    /// Ob Tick() selbst abmounten darf, um beschwören zu können - nur im blockierenden Start-Schritt
+    /// der Automationen (State.SummoningChocobo), nie während einer laufenden Reise.
+    /// </param>
+    public void Tick(bool allowDismount)
     {
         var useChocobo = Plugin.UseChocoboCompanion;
         var unlocked = Plugin.IsChocoboCompanionUnlocked();
@@ -115,10 +213,15 @@ public sealed class ChocoboCompanionSupport
 
         if (Plugin.IsChocoboCompanionSummoned())
         {
-            if (summonAttemptInFlight)
+            // Erst bestätigt, wenn die Restzeit tatsächlich über der Schwelle liegt - beim Neu-
+            // Beschwören eines noch draußen stehenden Begleiters (Restzeit < 1 Minute) ist
+            // "beschworen" schon vorher true, ein sofortiges Freigeben würde nach RetryInterval
+            // gleich die nächsten Gysahl Greens verbrauchen.
+            if (summonAttemptInFlight && Plugin.GetChocoboSummonTimeLeft() >= ResummonThresholdSeconds)
+            {
                 Plugin.Log.Info($"[ChocoboCompanionSupport] Beschworen bestätigt (TimeLeft={Plugin.GetChocoboSummonTimeLeft():F1}s).");
-
-            summonAttemptInFlight = false;
+                summonAttemptInFlight = false;
+            }
 
             // Noch genug Zeit übrig - nicht neu beschwören, sondern (falls noch nicht geschehen)
             // die gewünschte Stance setzen.
@@ -127,12 +230,18 @@ public sealed class ChocoboCompanionSupport
                 if (stanceAppliedForCurrentSummon)
                     return;
 
+                // Beritten lehnt das Spiel Begleiter-Befehle ab ("Cannot execute at this time") -
+                // die Stance wird einfach beim nächsten Absteigen nachgeholt, statt dafür extra
+                // abzumounten (siehe auch UpdateSummoningChocobo der Automationen).
+                if (Plugin.Condition[ConditionFlag.Mounted])
+                    return;
+
                 if (DateTime.UtcNow - lastStanceAttemptAt < RetryInterval)
                     return;
 
                 lastStanceAttemptAt = DateTime.UtcNow;
-                if (Plugin.TrySetChocoboStance(Plugin.ChocoboStance))
-                    stanceAppliedForCurrentSummon = true;
+                stanceAppliedForCurrentSummon = Plugin.TrySetChocoboStance(Plugin.ChocoboStance);
+                Plugin.Log.Info($"[ChocoboCompanionSupport] Stance {Plugin.ChocoboStance} setzen, angenommen={stanceAppliedForCurrentSummon} (TimeLeft={Plugin.GetChocoboSummonTimeLeft():F1}s).");
 
                 return;
             }
@@ -150,14 +259,55 @@ public sealed class ChocoboCompanionSupport
             summonAttemptInFlight = false;
         }
 
-        // Beschwören schlägt fehl, solange man noch auf einem normalen Mount sitzt - erst abmounten
-        // und die Absteige-/Lande-Animation kurz abwarten, dann erst den eigentlichen Versuch starten.
+        // Beschwören schlägt fehl, solange man noch auf einem normalen Mount sitzt. Nur im
+        // blockierenden Start-Schritt (allowDismount) selbst abmounten - mitten in einer Reise
+        // (vnavmesh/Questionable fliegen/reiten gerade) kollidiert ein Abmount-Versuch nur mit
+        // deren Steuerung (in der Luft bleibt der Charakter dann einfach hängen); stattdessen
+        // abwarten, bis die Automation ohnehin absteigt (Kampf, NPC-Interaktion, ...).
         if (Plugin.Condition[ConditionFlag.Mounted])
         {
-            Plugin.TryDismount();
             dismountedAt = null;
+            if (!allowDismount)
+            {
+                if (!wasWaitingForDismountLastTick)
+                    Plugin.Log.Info("[ChocoboCompanionSupport] Beritten unterwegs - Beschwören wartet, bis abgestiegen.");
+
+                wasWaitingForDismountLastTick = true;
+                return;
+            }
+
+            wasWaitingForDismountLastTick = false;
+
+            // Landeflug läuft noch - abwarten, erst danach absteigen.
+            if (IsLandingPathActive())
+                return;
+
+            // Noch in der Luft - ein Absteige-Befehl wird in größerer Höhe vom Spiel ignoriert,
+            // daher erst per vnavmesh zum Boden direkt darunter fliegen und landen lassen.
+            var inFlight = Plugin.Condition[ConditionFlag.InFlight];
+            if (inFlight && DateTime.UtcNow - lastLandingRequestAt >= LandingRetryInterval)
+            {
+                lastLandingRequestAt = DateTime.UtcNow;
+                if (TryRequestLanding())
+                {
+                    // Dem Pfad Zeit zum Anlaufen geben, bevor unten doch schon abgestiegen wird.
+                    lastDismountAttemptAt = DateTime.UtcNow;
+                    return;
+                }
+            }
+
+            // Gedrosselt statt jeden Frame - ein erneuter Dismount-Aufruf mitten im Sinkflug/in der
+            // Absteige-Animation kann den laufenden Vorgang wieder abbrechen.
+            if (DateTime.UtcNow - lastDismountAttemptAt < RetryInterval)
+                return;
+
+            lastDismountAttemptAt = DateTime.UtcNow;
+            var accepted = Plugin.TryDismount();
+            Plugin.Log.Info($"[ChocoboCompanionSupport] Beritten (InFlight={inFlight}) - Absteigen versucht, angenommen={accepted}.");
             return;
         }
+
+        wasWaitingForDismountLastTick = false;
 
         dismountedAt ??= DateTime.UtcNow;
         if (DateTime.UtcNow - dismountedAt.Value < DismountSettleDelay)

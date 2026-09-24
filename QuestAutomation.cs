@@ -28,8 +28,9 @@ public sealed class QuestAutomation
 
     // Wie lange maximal auf das Beschwören + Setzen der Stance gewartet wird, bevor trotzdem mit der
     // eigentlichen Automation begonnen wird (z.B. falls keine Gysahl Greens vorhanden sind) - siehe
-    // UpdateSummoningChocobo.
-    private static readonly TimeSpan ChocoboSummonWaitTimeout = TimeSpan.FromSeconds(10);
+    // UpdateSummoningChocobo. Großzügig, da ggf. erst aus der Luft gelandet werden muss (siehe
+    // ChocoboCompanionSupport.TryRequestLanding).
+    private static readonly TimeSpan ChocoboSummonWaitTimeout = TimeSpan.FromSeconds(30);
 
     // Wie lange nach dem Start einer Quest gewartet wird, bis Questionable sie tatsächlich
     // übernimmt (IsRunning == true) - reagiert es nicht, gilt die Quest als nicht unterstützt.
@@ -72,12 +73,6 @@ public sealed class QuestAutomation
 
     private readonly ICallGateSubscriber<string, bool> startSingleQuest;
     private readonly ICallGateSubscriber<bool> isRunning;
-
-    // Nur für die proaktive Ausgrau-Prüfung im Overlay (siehe IsRotationSolverAvailable) - Quest-
-    // Automation steuert RotationSolver selbst NICHT an (anders als HuntingLogAutomation), aber
-    // während Questionable läuft können durchaus kampfpflichtige Quest-Schritte auftreten, die ohne
-    // eine laufende Kampf-Rotation ins Stocken geraten würden.
-    private readonly ICallGateSubscriber<bool> rsrAutorotationActive;
 
     // questId -> "gesperrt"? Prüft nur (ohne Nebenwirkung), ob Questionable eine Quest aktuell
     // bearbeiten könnte - für die proaktive Support-Markierung im Overlay direkt beim Betreten
@@ -147,7 +142,6 @@ public sealed class QuestAutomation
         startSingleQuest = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.StartSingleQuest");
         isRunning = Plugin.PluginInterface.GetIpcSubscriber<bool>("Questionable.IsRunning");
         isQuestLocked = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.IsQuestLocked");
-        rsrAutorotationActive = Plugin.PluginInterface.GetIpcSubscriber<bool>("RotationSolverReborn.AutorotationActive");
 
         lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
         lifestreamIsBusy = Plugin.PluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
@@ -192,23 +186,6 @@ public sealed class QuestAutomation
         try
         {
             return startSingleQuest.HasFunction && isRunning.HasFunction;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Prüft, ob RotationSolver Reborn aktuell installiert/geladen ist - siehe Feldkommentar an
-    /// rsrAutorotationActive, warum das auch für die Quest-Automation relevant ist, obwohl sie
-    /// selbst keine RotationSolver-IPC aufruft.
-    /// </summary>
-    public bool IsRotationSolverAvailable()
-    {
-        try
-        {
-            return rsrAutorotationActive.HasFunction;
         }
         catch
         {
@@ -370,9 +347,15 @@ public sealed class QuestAutomation
         var settled = !Plugin.UseChocoboCompanion || !Plugin.IsChocoboCompanionUnlocked();
         if (!settled)
         {
-            settled = Plugin.IsChocoboCompanionSummoned()
-                ? Plugin.ChocoboCompanionSupport.HasAppliedStanceForCurrentSummon || !Plugin.IsChocoboStanceUnlocked(Plugin.ChocoboStance)
-                : Plugin.GetGysahlGreensCount() == 0;
+            // Erst fertig, wenn nicht (mehr) beschworen werden muss (auch bei weniger als 1 Minute
+            // Restzeit, siehe ChocoboCompanionSupport.NeedsSummon) UND die Stance steht.
+            settled = !ChocoboCompanionSupport.NeedsSummon
+                && (!Plugin.IsChocoboCompanionSummoned()
+                    || Plugin.ChocoboCompanionSupport.HasAppliedStanceForCurrentSummon
+                    || !Plugin.IsChocoboStanceUnlocked(Plugin.ChocoboStance)
+                    // Beritten wird die Stance erst beim nächsten Absteigen gesetzt (siehe ChocoboCompanionSupport.Tick) -
+                    // bereits beschworen reicht dann, statt den Start dafür zu blockieren.
+                    || Plugin.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Mounted]);
         }
 
         if (settled || DateTime.UtcNow - stateEnteredAt > ChocoboSummonWaitTimeout)
@@ -395,7 +378,7 @@ public sealed class QuestAutomation
         if (!IsActive)
             return;
 
-        Plugin.ChocoboCompanionSupport.Tick();
+        Plugin.ChocoboCompanionSupport.Tick(allowDismount: state == State.SummoningChocobo);
 
         try
         {
