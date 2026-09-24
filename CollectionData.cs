@@ -77,6 +77,16 @@ public class CollectibleEntry
     public string? RequiredQuest { get; set; }
     public string? RequiredAchievement { get; set; }
 
+    // Mehrere Voraussetzungs-Quests (z.B. Triple-Triad-NPC-Gegner, siehe Plugin.GetTripleTriadNpcEntries) -
+    // RequiredQuestsAny = true: EINE davon genügt (z.B. die drei Stadt-Varianten derselben MSQ),
+    // sonst müssen ALLE abgeschlossen sein. Zusätzlich zu RequiredQuest geprüft.
+    public List<string>? RequiredQuests { get; set; }
+    public bool RequiredQuestsAny { get; set; }
+
+    // Nur für Triple-Triad-NPC-Gegner-Karten (siehe Plugin.GetTripleTriadNpcEntries) - ENpc-RowId des
+    // Gegners, damit TripleTriadAutomation das NPC-Objekt in der Welt findet (IGameObject.BaseId).
+    public uint EventNpcId { get; init; }
+
     // Name eines Events ohne auslesbaren Festival-Status (z.B. "Moogle Treasure Trove" - läuft wie die
     // Cross-Game-Kollaborationen NICHT über GameMain.ActiveFestivals, per Log bestätigt), während dem
     // dieser Eintrag erhältlich ist - geprüft über Plugin.KnownEventWindows und als Eventname im
@@ -141,6 +151,7 @@ public enum CollectibleType
     AetherCurrent,
     Sightseeing,
     Chocobokeep,
+    Achievement, // bewusst am Ende - gespeicherte Einstellungen (ShowType/TypeOrder) referenzieren die Enum-Werte als Zahl
 }
 
 /// <summary>
@@ -221,6 +232,8 @@ public static class CollectionData
         entries.AddRange(Plugin.GetFrameKitEntries());
         entries.AddRange(Plugin.GetHairstyleEntries());
         entries.AddRange(Plugin.GetChocobokeepEntries());
+        entries.AddRange(Plugin.GetAchievementEntries());
+        entries.AddRange(Plugin.GetTripleTriadNpcEntries());
 
         // Itinerant Moogle (Moogle Treasure Trove): nur die aktuell unter "Newest"/"Previous"
         // erhältlichen Waren, live aus den Spieldaten (siehe Plugin.GetItinerantMoogleEntries) - von

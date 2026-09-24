@@ -39,6 +39,7 @@ public static class Loc
         CollectibleType.AetherCurrent => T("Ätherströmung", "Aether Current"),
         CollectibleType.Sightseeing => T("Sightseeing", "Sightseeing"),
         CollectibleType.Chocobokeep => T("Chocobokeep", "Chocobokeep"),
+        CollectibleType.Achievement => T("Errungenschaft", "Achievement"),
         _ => type.ToString(),
     };
 }

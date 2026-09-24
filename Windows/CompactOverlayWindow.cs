@@ -338,27 +338,44 @@ public class CompactOverlayWindow : Window
         plugin.QuestAutomation.RefreshSupportStatus(missingQuests);
         plugin.QuestAutomation.Update(missingQuests, effectiveTerritoryId);
 
+        // Sonderfall "The Eight Sentinels" (Flugverbots-Bereich in Mor Dhona, siehe NoFlyAreaExit): erst
+        // über das Crystal Gate hinaus, dann die angehaltene Automation neu starten. Solange das läuft,
+        // bekommen die vnavmesh-Automationen unten KEIN Update (würden sonst gegenlenken).
+        var exitingNoFlyArea = plugin.NoFlyAreaExit.Update(new (Func<bool> IsActive, Action Restart)[]
+        {
+            (() => plugin.AetheryteAutomation.IsActive, () => { plugin.AetheryteAutomation.Stop(); plugin.AetheryteAutomation.Start(); }),
+            (() => plugin.HuntingLogAutomation.IsActive, () => { plugin.HuntingLogAutomation.Stop(); plugin.HuntingLogAutomation.Start(); }),
+            (() => plugin.AetherCurrentAutomation.IsActive, () => { plugin.AetherCurrentAutomation.Stop(); plugin.AetherCurrentAutomation.Start(); }),
+            (() => plugin.SightseeingAutomation.IsActive, () => { plugin.SightseeingAutomation.Stop(); plugin.SightseeingAutomation.Start(); }),
+            (() => plugin.ChocobokeepAutomation.IsActive, () => { plugin.ChocobokeepAutomation.Stop(); plugin.ChocobokeepAutomation.Start(); }),
+            (() => plugin.TripleTriadAutomation.IsActive, () => { plugin.TripleTriadAutomation.Stop(); plugin.TripleTriadAutomation.Start(); }),
+            (() => plugin.GoToAutomation.ActiveEntry != null, () => { if (plugin.GoToAutomation.ActiveEntry is { } goToEntry) plugin.GoToAutomation.GoTo(goToEntry); }),
+        });
+
         // Bewusst die ganze Stadt (inkl. Kristalle aus Nachbarbezirken einer geteilten Hauptstadt,
         // siehe allForZone) - die Automation reist bei Bedarf selbst mit Lifestream zwischen den
         // Bezirken hin und her (siehe AetheryteAutomation.cs).
         var missingAetherytesCity = allForZone
             .Where(e => e.Type == CollectibleType.Aetheryte && (config.SimulateAetheryteAutomation || !plugin.IsOwned(e)))
             .ToList();
-        plugin.AetheryteAutomation.Update(missingAetherytesCity);
+        if (!exitingNoFlyArea)
+            plugin.AetheryteAutomation.Update(missingAetherytesCity);
 
         // Bewusst NICHT stadtweit wie Aetheryten/Quests - Hunting-Log-Monster gibt es nur in genau
         // dieser einen Zone (siehe Plugin.GetHuntingLogEntries), kein Bezirkswechsel nötig/möglich.
         var missingHuntingLogInZone = allForZone
             .Where(e => e.Type == CollectibleType.HuntingLog && !Plugin.IsAchievementOrRankGated(e)) // Kills zählen erst ab erreichter Rang-Stufe
             .ToList();
-        plugin.HuntingLogAutomation.Update(missingHuntingLogInZone);
+        if (!exitingNoFlyArea)
+            plugin.HuntingLogAutomation.Update(missingHuntingLogInZone);
 
         // Wie Hunting Log bewusst NICHT stadtweit - Ätherströmungen kommen aus aethercurrents.json
         // mit exakter Zonen-Zuordnung, kein Bezirkswechsel nötig.
         var missingAetherCurrentsInZone = allForZone
             .Where(e => e.Type == CollectibleType.AetherCurrent && !plugin.IsOwned(e))
             .ToList();
-        plugin.AetherCurrentAutomation.Update(missingAetherCurrentsInZone);
+        if (!exitingNoFlyArea)
+            plugin.AetherCurrentAutomation.Update(missingAetherCurrentsInZone);
 
         // Ebenfalls nicht stadtweit - Sightseeing-Punkte kommen aus GetLiveZoneEntries mit exakter
         // Zonen-Zuordnung (siehe Plugin.ComputeLiveZoneEntries). Bewusst NICHT aus "allForZone" (das
@@ -382,7 +399,15 @@ public class CompactOverlayWindow : Window
             .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id) && !Plugin.IsSightseeingBlockedByFlying(e))
             .Where(e => config.SimulateSightseeingAutomation || (!plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e)))
             .ToList();
-        plugin.SightseeingAutomation.Update(missingSightseeingInZone);
+        // Punkte, die NUR wegen Wetter/Uhrzeit gerade nicht gehen (siehe
+        // Plugin.IsSightseeingOnlyTemporarilyUnavailable) - solange davon noch welche übrig sind, wartet
+        // die Automation darauf (AFK-Modus), statt sich zu beenden.
+        var pendingSightseeingInZone = plugin.GetLiveZoneEntries(effectiveTerritoryId)
+            .Where(e => e.Type == CollectibleType.Sightseeing && siblingTerritories.Contains(e.TerritoryTypeId))
+            .Where(e => !Plugin.IsBlacklisted(e) && !plugin.IsOwned(e) && Plugin.IsSightseeingOnlyTemporarilyUnavailable(e))
+            .ToList();
+        if (!exitingNoFlyArea)
+            plugin.SightseeingAutomation.Update(missingSightseeingInZone, pendingSightseeingInZone);
 
         // Was tatsächlich im Overlay auftaucht (siehe "allForZone", inkl. dessen "Alle Gegenstände
         // anzeigen"-Schalter) - bewusst getrennt von missingSightseeingInZone oben, das für die
@@ -398,11 +423,22 @@ public class CompactOverlayWindow : Window
         var missingChocobokeepsInZone = allForZone
             .Where(e => e.Type == CollectibleType.Chocobokeep && (config.SimulateChocobokeepAutomation || !plugin.IsOwned(e)))
             .ToList();
-        plugin.ChocobokeepAutomation.Update(missingChocobokeepsInZone);
+        if (!exitingNoFlyArea)
+            plugin.ChocobokeepAutomation.Update(missingChocobokeepsInZone);
+
+        // Triple-Triad-NPC-Gegner (siehe Plugin.GetTripleTriadNpcEntries) - nur tatsächlich
+        // erreichbare Karten (keine "Bedingung nicht erfüllt", Blacklist ist über allForZone schon raus).
+        var missingNpcCardsInZone = allForZone
+            .Where(e => e.Type == CollectibleType.TripleTriadCard && e.Category == Plugin.TripleTriadNpcCategory && e.EventNpcId != 0)
+            .Where(e => !plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e))
+            .ToList();
+        if (!exitingNoFlyArea)
+            plugin.TripleTriadAutomation.Update(missingNpcCardsInZone);
 
         // Unabhängig von den Automationen oben - das "Hinlaufen"-Icon (siehe DrawClickableName)
         // betrifft immer nur einen einzelnen Eintrag, egal ob gerade eine Automation läuft.
-        plugin.GoToAutomation.Update();
+        if (!exitingNoFlyArea)
+            plugin.GoToAutomation.Update();
 
         // "Unterstützt" heißt hier: noch nicht als von Questionable abgelehnt bekannt (siehe
         // QuestAutomation.IsKnownUnsupported) - erst nach einem Versuch bekannt, siehe dort.
@@ -416,6 +452,7 @@ public class CompactOverlayWindow : Window
         var hasVisibleSightseeing = visibleSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
         var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
         var hasActionableChocobokeeps = missingChocobokeepsInZone.Any(e => e.HasGoToTarget);
+        var hasActionableTripleTriad = missingNpcCardsInZone.Count > 0;
 
         // Siehe Configuration.HideOverlayWhenEmpty-Kommentar - erst NACH allen Automation.Update()-
         // Aufrufen oben geprüft (die laufen immer weiter, unabhängig von der Sichtbarkeit), aber
@@ -539,6 +576,8 @@ public class CompactOverlayWindow : Window
                 Loc.T("Auto Sightseeing", "Auto Sightseeing"), () => DrawSightseeingAutomationButton(hasActionableSightseeing));
             DrawAutomationButtonIfNeeded(plugin.ChocobokeepAutomation.IsActive, hasActionableChocobokeeps,
                 Loc.T("Auto Chocobokeep", "Auto Chocobokeep"), () => DrawChocobokeepAutomationButton(hasActionableChocobokeeps));
+            DrawAutomationButtonIfNeeded(plugin.TripleTriadAutomation.IsActive, hasActionableTripleTriad,
+                Loc.T("Auto Triple Triad", "Auto Triple Triad"), () => DrawTripleTriadAutomationButton(hasActionableTripleTriad));
 
             if (!isFirstAutomationButtonOnRow)
             {
@@ -565,6 +604,12 @@ public class CompactOverlayWindow : Window
 
         if (plugin.ChocobokeepAutomation.ShouldShowStatusText)
             OutlineText(plugin.ChocobokeepAutomation.StatusText, plugin.ChocobokeepAutomation.IsActive ? AffordableColor : VendorLinkColor);
+
+        if (plugin.NoFlyAreaExit.IsBusy)
+            OutlineText(plugin.NoFlyAreaExit.StatusText, AffordableColor);
+
+        if (plugin.TripleTriadAutomation.ShouldShowStatusText)
+            OutlineText(plugin.TripleTriadAutomation.StatusText, plugin.TripleTriadAutomation.IsActive ? AffordableColor : VendorLinkColor);
 
         if (config.ShowDebugInfo)
             OutlineText($"debug: zone={allForZone.Count} typefilter={afterTypeFilter.Count} missing={entries.Count}", MutedColor);
@@ -663,6 +708,10 @@ public class CompactOverlayWindow : Window
         // Rest des (frei durch den Spieler skalierbaren) Fensters.
         ImGui.BeginChild("##CompactEntryList", new Vector2(0, 0), false);
 
+        // Hat KEIN sichtbarer Eintrag ein Laufziel, bräuchte die "Hinlaufen"-Spalte nur Platzhalter -
+        // dann gar nicht erst reservieren, statt die ganze Liste grundlos einzurücken (siehe DrawGoToColumn).
+        showGoToColumn = plugin.Configuration.ShowGoToIcon && entries.Any(e => e.HasGoToTarget);
+
         foreach (var entry in entries)
         {
             // Liegt genau DIESE Zeile gerade unter einem nativen Fenster (siehe Draw/
@@ -699,7 +748,17 @@ public class CompactOverlayWindow : Window
                 OutlineText("-", MutedColor);
 
                 var currencyAllaganToolsEligible = AllaganToolsEligibleTypes.Contains(entry.Type);
-                DrawCurrencyRequirement(entry.Currency, entry.CurrencyIconId, entry.CurrencyItemId, entry.CurrencyAmount, currencyAllaganToolsEligible);
+                if (IsTripleTriadNpcFight(entry))
+                {
+                    // Kein Preis mit Icon/Menge (DrawCurrencyRequirement zeigt nur diese, den Namen
+                    // bloß im Tooltip) - stattdessen direkt der Name des NPC-Gegners.
+                    ImGui.SameLine();
+                    OutlineText($"NPC: {entry.Currency}", NormalColor);
+                }
+                else
+                {
+                    DrawCurrencyRequirement(entry.Currency, entry.CurrencyIconId, entry.CurrencyItemId, entry.CurrencyAmount, currencyAllaganToolsEligible);
+                }
 
                 // Für die wenigen Einträge, die MEHRERE Währungen gleichzeitig verlangen (z.B.
                 // Triple-Triad-Karte "G-Warrior": 1x Ruby Totem + 1x Emerald Totem + 1x Diamond
@@ -1030,8 +1089,21 @@ public class CompactOverlayWindow : Window
     /// Label ist bereits kanonisiert (siehe CanonicalizeCurrencyLabel), damit Singular-/Plural-
     /// Schreibvarianten derselben Währung als EINE zählen.
     /// </summary>
+    /// <summary>Triple-Triad-NPC-Kampf (siehe Plugin.GetTripleTriadNpcEntries) - Currency enthält dort den Gegner-Namen statt eines Preises.</summary>
+    private static bool IsTripleTriadNpcFight(CollectibleEntry entry) =>
+        entry.Category == Plugin.TripleTriadNpcCategory && entry.CurrencyItemId == 0 && !string.IsNullOrEmpty(entry.Currency);
+
     private static IEnumerable<(string Label, uint IconId)> GetAllCurrencies(CollectibleEntry entry)
     {
+        // Triple-Triad-NPC-Kämpfe tragen statt eines Preises den Gegner-Namen im Currency-Feld (siehe
+        // Plugin.GetTripleTriadNpcEntries) - für den Currency-Filter alle zu EINEM Eintrag
+        // zusammenfassen, statt jeden der über 100 Gegner einzeln aufzulisten.
+        if (IsTripleTriadNpcFight(entry))
+        {
+            yield return (Loc.T("NPC-Kampf", "NPC Fight"), 0);
+            yield break;
+        }
+
         if (!string.IsNullOrEmpty(entry.Currency))
             yield return (CanonicalizeCurrencyLabel(GetCurrencyLabel(entry.Currency)), entry.CurrencyIconId);
 
@@ -1151,7 +1223,8 @@ public class CompactOverlayWindow : Window
         || (plugin.HuntingLogAutomation.IsActive && !ReferenceEquals(self, plugin.HuntingLogAutomation))
         || (plugin.AetherCurrentAutomation.IsActive && !ReferenceEquals(self, plugin.AetherCurrentAutomation))
         || (plugin.SightseeingAutomation.IsActive && !ReferenceEquals(self, plugin.SightseeingAutomation))
-        || (plugin.ChocobokeepAutomation.IsActive && !ReferenceEquals(self, plugin.ChocobokeepAutomation));
+        || (plugin.ChocobokeepAutomation.IsActive && !ReferenceEquals(self, plugin.ChocobokeepAutomation))
+        || (plugin.TripleTriadAutomation.IsActive && !ReferenceEquals(self, plugin.TripleTriadAutomation));
 
     private static string InstancedContentTooltip => Loc.T(
         "In Instanz-Inhalten (Dungeon, Trial, Raid, ...) nicht verfügbar.",
@@ -1599,6 +1672,67 @@ public class CompactOverlayWindow : Window
         }
     }
 
+    /// <summary>
+    /// Knopf für die Triple-Triad-Automation (siehe TripleTriadAutomation.cs) - fliegt nacheinander
+    /// alle NPC-Gegner der Zone mit noch fehlenden, erreichbaren Karten an und lässt Saucy spielen.
+    /// Ausgegraut (mit eigenem Hinweis), solange Saucy nicht installiert ist.
+    /// </summary>
+    private void DrawTripleTriadAutomationButton(bool hasActionableTripleTriad)
+    {
+        var automation = plugin.TripleTriadAutomation;
+        var label = automation.IsActive
+            ? Loc.T("Automation stoppen", "Stop automation")
+            : Loc.T("Auto Triple Triad", "Auto Triple Triad");
+
+        var buttonSize = new Vector2(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2f, ImGui.GetFrameHeight());
+        if (IsOccluded(buttonSize))
+        {
+            ImGui.Dummy(buttonSize);
+            return;
+        }
+
+        var saucyMissing = !TripleTriadAutomation.IsSaucyAvailable();
+        var hasMissingPlugin = MainWindow.HasMissingRequiredDependency();
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableTripleTriad || saucyMissing || hasMissingPlugin || inInstancedContent || otherAutomationActive);
+
+        PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.TripleTriadCard]);
+        if (isDisabled)
+            ImGui.BeginDisabled();
+        var clicked = ImGui.Button(label + "##CompactTripleTriadAutomation");
+        if (isDisabled)
+            ImGui.EndDisabled();
+        ImGui.PopStyleColor(2);
+
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(saucyMissing
+                ? Loc.T("Saucy ist nicht installiert - wird für die Triple-Triad-Automation benötigt (siehe Plugins-Seite).", "Saucy isn't installed - it's required for the Triple Triad automation (see the Plugins page).")
+                : hasMissingPlugin
+                    ? MissingPluginTooltip
+                    : inInstancedContent
+                        ? InstancedContentTooltip
+                        : otherAutomationActive
+                            ? OtherAutomationActiveTooltip
+                            : isDisabled
+                                ? Loc.T("Keine NPC-Gegner mit noch erreichbaren Karten in dieser Zone.", "No NPC opponents with obtainable cards left in this zone.")
+                                : automation.IsActive
+                                    ? Loc.T("Stoppt Laufweg und Saucy sofort.", "Immediately stops movement and Saucy.")
+                                    : Loc.T(
+                                        "Fliegt nacheinander alle NPC-Gegner dieser Zone mit noch fehlenden Karten an, lässt Saucy spielen, bis alle Karten des Gegners gedroppt sind, und lernt sie danach.",
+                                        "Flies to every NPC opponent in this zone with missing cards, lets Saucy play until all of the opponent's cards have dropped, then learns them."));
+        }
+
+        if (!clicked)
+            return;
+
+        if (automation.IsActive)
+            automation.Stop();
+        else if (!saucyMissing && !hasMissingPlugin)
+            automation.Start();
+    }
+
     private void DrawClickableName(CollectibleEntry entry, bool isNotYetPossible = false)
     {
         var affordable = plugin.CanAfford(entry);
@@ -1678,13 +1812,16 @@ public class CompactOverlayWindow : Window
     /// Ganz vorne in jeder Zeile (vor dem [Typ]-Tag) statt des früheren Aufzählungspunkts - zeigt
     /// das "Hinlaufen"-Icon (siehe DrawGoToIcon), oder wenn keins gezeigt wird, weil DIESER Eintrag
     /// kein Laufziel hat (Einstellung aber an), einen gleich breiten Platzhalter, damit der [Typ]-Tag
-    /// in jeder Zeile an derselben X-Position beginnt. Ist die Einstellung GLOBAL aus, wird gar keine
-    /// Spalte reserviert - dann rutscht der [Typ]-Tag ganz an den Zeilenanfang, statt eine für immer
-    /// leere Lücke stehen zu lassen.
+    /// in jeder Zeile an derselben X-Position beginnt. Ist die Einstellung GLOBAL aus ODER hat gerade
+    /// kein einziger sichtbarer Eintrag ein Laufziel (siehe showGoToColumn), wird gar keine Spalte
+    /// reserviert - dann rutscht der [Typ]-Tag ganz an den Zeilenanfang, statt eine leere Lücke stehen zu lassen.
     /// </summary>
+    // Siehe DrawContent - pro Frame neu bestimmt: Einstellung an UND mindestens ein Eintrag mit Laufziel.
+    private bool showGoToColumn;
+
     private void DrawGoToColumn(CollectibleEntry entry)
     {
-        if (!plugin.Configuration.ShowGoToIcon)
+        if (!showGoToColumn)
             return;
 
         if (entry.HasGoToTarget)
@@ -1889,6 +2026,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
         [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
         [CollectibleType.Chocobokeep] = new(0.95f, 0.85f, 0.2f, 1f),
+        [CollectibleType.Achievement] = new(0.95f, 0.6f, 0.3f, 1f),
     };
 
     // Typen, deren Name tatsächlich einem echten Item-Sheet-Eintrag entspricht, den Allagan Tools'

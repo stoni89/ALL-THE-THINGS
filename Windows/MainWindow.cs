@@ -1489,6 +1489,10 @@ public class MainWindow : Window
             "Für Reisen zwischen Bezirken einer geteilten Hauptstadt während der Automation.",
             "For traveling between districts of a split capital city during automation.",
             true, null),
+        ("Saucy", "Saucy",
+            "Spielt bei der Triple-Triad-Automation die Partien gegen NPC-Gegner, bis alle ihre Karten gedroppt sind.",
+            "Plays the matches against NPC opponents during the Triple Triad automation until all of their cards have dropped.",
+            true, null),
         ("TextAdvance", "TextAdvance",
             "Klickt automatisch durch Dialoge/Cutscenes während der Quest-Automation.",
             "Automatically clicks through dialogue/cutscenes during the quest automation.",
@@ -1526,7 +1530,7 @@ public class MainWindow : Window
     {
         CollectibleType.Mount, CollectibleType.Minion, CollectibleType.Orchestrion, CollectibleType.Barding,
         CollectibleType.Emote, CollectibleType.Facewear, CollectibleType.FashionAccessory, CollectibleType.TripleTriadCard,
-        CollectibleType.FrameKit, CollectibleType.AetherCurrent,
+        CollectibleType.FrameKit, CollectibleType.AetherCurrent, CollectibleType.Achievement,
     };
 
     private static void DrawStatRow(string label, int owned, int total, float barHeight = 6f)

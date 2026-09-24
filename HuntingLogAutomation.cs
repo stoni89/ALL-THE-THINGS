@@ -151,6 +151,7 @@ public sealed class HuntingLogAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
     private DateTime? mountedAt;
     private DateTime? dismountedAt;
 
@@ -736,6 +737,7 @@ public sealed class HuntingLogAutomation
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
         stuckDetector.Reset();
+        flightUpgrade.OnPathStarted(triedFlying && accepted);
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -822,6 +824,14 @@ public sealed class HuntingLogAutomation
             Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
             if (TryUpgradeToFlyingPath(playerPos))
                 return;
+
+            // Beritten im Flugverbots-Bereich losgelaufen und ihn jetzt verlassen (siehe FlightPathUpgrade).
+            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))

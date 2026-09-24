@@ -72,6 +72,7 @@ public sealed class AetherCurrentAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
     private bool hasInteractedThisCycle;
     private DateTime? interactObjectNotFoundSince;
 
@@ -270,6 +271,7 @@ public sealed class AetherCurrentAutomation
     {
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
+        var flyingAccepted = false;
 
         // Fliegend zuerst versuchen, aber nur wenn Plugin.CanFly gerade true ist (Fliegen in dieser
         // Zone bereits freigeschaltet) - vnavmesh nimmt einen Flugauftrag sonst teils trotzdem an,
@@ -279,7 +281,7 @@ public sealed class AetherCurrentAutomation
         // erst frei, wenn alle Strömungen der Zone eingesammelt sind) - zu Fuß ist also immer ein
         // gültiger Fallback.
         if (mounted && Plugin.CanFly)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
+            accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ArrivalTolerance);
@@ -294,6 +296,7 @@ public sealed class AetherCurrentAutomation
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
         stuckDetector.Reset();
+        flightUpgrade.OnPathStarted(flyingAccepted);
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -334,6 +337,14 @@ public sealed class AetherCurrentAutomation
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
             // erreicht ist, erneut aufsitzen.
             Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
+            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))
