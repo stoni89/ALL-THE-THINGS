@@ -1423,9 +1423,12 @@ public sealed class SightseeingAutomation
         if (currentPuzzle?.DismountAtStart == true && Plugin.Condition[ConditionFlag.Mounted])
         {
             SetExactPathTolerance(true);
+            // Fliegend, wo möglich - sonst beritten am Boden (dort genauso erst am Startpunkt absteigen).
             var accepted = Plugin.CanFly && pathfindAndMoveCloseTo.InvokeFunc(currentPuzzle.Start, true, PuzzleFlyToStartTolerance);
             if (!accepted)
-                moveToPath.InvokeAction(new List<Vector3> { currentPuzzle.Start }, true);
+                accepted = pathfindAndMoveCloseTo.InvokeFunc(currentPuzzle.Start, false, PuzzleFlyToStartTolerance);
+            if (!accepted)
+                moveToPath.InvokeAction(new List<Vector3> { currentPuzzle.Start }, Plugin.CanFly);
             SetPuzzlePhase(PuzzlePhase.FlyingToStart);
             StatusText = Loc.T($"Fliege genau zum Startpunkt: {currentTargetEntry?.Name}...", $"Flying precisely to the start point: {currentTargetEntry?.Name}...");
             return;
