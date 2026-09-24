@@ -663,6 +663,10 @@ public class CompactOverlayWindow : Window
         // Rest des (frei durch den Spieler skalierbaren) Fensters.
         ImGui.BeginChild("##CompactEntryList", new Vector2(0, 0), false);
 
+        // Hat KEIN sichtbarer Eintrag ein Laufziel, bräuchte die "Hinlaufen"-Spalte nur Platzhalter -
+        // dann gar nicht erst reservieren, statt die ganze Liste grundlos einzurücken (siehe DrawGoToColumn).
+        showGoToColumn = plugin.Configuration.ShowGoToIcon && entries.Any(e => e.HasGoToTarget);
+
         foreach (var entry in entries)
         {
             // Liegt genau DIESE Zeile gerade unter einem nativen Fenster (siehe Draw/
@@ -1678,13 +1682,16 @@ public class CompactOverlayWindow : Window
     /// Ganz vorne in jeder Zeile (vor dem [Typ]-Tag) statt des früheren Aufzählungspunkts - zeigt
     /// das "Hinlaufen"-Icon (siehe DrawGoToIcon), oder wenn keins gezeigt wird, weil DIESER Eintrag
     /// kein Laufziel hat (Einstellung aber an), einen gleich breiten Platzhalter, damit der [Typ]-Tag
-    /// in jeder Zeile an derselben X-Position beginnt. Ist die Einstellung GLOBAL aus, wird gar keine
-    /// Spalte reserviert - dann rutscht der [Typ]-Tag ganz an den Zeilenanfang, statt eine für immer
-    /// leere Lücke stehen zu lassen.
+    /// in jeder Zeile an derselben X-Position beginnt. Ist die Einstellung GLOBAL aus ODER hat gerade
+    /// kein einziger sichtbarer Eintrag ein Laufziel (siehe showGoToColumn), wird gar keine Spalte
+    /// reserviert - dann rutscht der [Typ]-Tag ganz an den Zeilenanfang, statt eine leere Lücke stehen zu lassen.
     /// </summary>
+    // Siehe DrawContent - pro Frame neu bestimmt: Einstellung an UND mindestens ein Eintrag mit Laufziel.
+    private bool showGoToColumn;
+
     private void DrawGoToColumn(CollectibleEntry entry)
     {
-        if (!plugin.Configuration.ShowGoToIcon)
+        if (!showGoToColumn)
             return;
 
         if (entry.HasGoToTarget)
@@ -1889,6 +1896,7 @@ public class CompactOverlayWindow : Window
         [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
         [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
         [CollectibleType.Chocobokeep] = new(0.95f, 0.85f, 0.2f, 1f),
+        [CollectibleType.Achievement] = new(0.95f, 0.6f, 0.3f, 1f),
     };
 
     // Typen, deren Name tatsächlich einem echten Item-Sheet-Eintrag entspricht, den Allagan Tools'

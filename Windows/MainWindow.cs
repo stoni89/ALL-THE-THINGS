@@ -1526,7 +1526,7 @@ public class MainWindow : Window
     {
         CollectibleType.Mount, CollectibleType.Minion, CollectibleType.Orchestrion, CollectibleType.Barding,
         CollectibleType.Emote, CollectibleType.Facewear, CollectibleType.FashionAccessory, CollectibleType.TripleTriadCard,
-        CollectibleType.FrameKit, CollectibleType.AetherCurrent,
+        CollectibleType.FrameKit, CollectibleType.AetherCurrent, CollectibleType.Achievement,
     };
 
     private static void DrawStatRow(string label, int owned, int total, float barHeight = 6f)

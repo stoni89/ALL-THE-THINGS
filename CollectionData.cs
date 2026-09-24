@@ -141,6 +141,7 @@ public enum CollectibleType
     AetherCurrent,
     Sightseeing,
     Chocobokeep,
+    Achievement, // bewusst am Ende - gespeicherte Einstellungen (ShowType/TypeOrder) referenzieren die Enum-Werte als Zahl
 }
 
 /// <summary>
@@ -221,6 +222,7 @@ public static class CollectionData
         entries.AddRange(Plugin.GetFrameKitEntries());
         entries.AddRange(Plugin.GetHairstyleEntries());
         entries.AddRange(Plugin.GetChocobokeepEntries());
+        entries.AddRange(Plugin.GetAchievementEntries());
 
         // Itinerant Moogle (Moogle Treasure Trove): nur die aktuell unter "Newest"/"Previous"
         // erhältlichen Waren, live aus den Spieldaten (siehe Plugin.GetItinerantMoogleEntries) - von
