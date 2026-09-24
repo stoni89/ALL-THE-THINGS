@@ -1,4 +1,5 @@
 using Dalamud.Configuration;
+using Dalamud.Game;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -11,6 +12,24 @@ public enum CompactFontMode
     Standard,
     Mono,
     Custom,
+}
+
+// Reihenfolge bewusst nach Freischalt-Rang sortiert (siehe Plugin.ChocoboStanceRequiredRank) -
+// Attacker ab Rang 1, Defender ab Rang 2, Healer ab Rang 3, Free Stance ab Rang 4.
+public enum ChocoboStance
+{
+    Attacker,
+    Defender,
+    Healer,
+    FreeStance,
+}
+
+// Siehe Configuration.MenuLanguage/Loc-Klassenkommentar - erzwingt Deutsch/Englisch NUR fürs Menü
+// (Windows.MainWindow), nicht fürs kompakte Overlay (das folgt immer der Spielsprache).
+public enum MenuLanguage
+{
+    German,
+    English,
 }
 
 [Serializable]
@@ -56,11 +75,28 @@ public class Configuration : IPluginConfiguration
     // läuft per vnavmesh/Lifestream automatisch zum Fundort, siehe GoToAutomation.
     public bool ShowGoToIcon { get; set; } = true;
 
+    // Blendet das kompakte Overlay komplett aus (schrumpft auf 0x0, siehe CompactOverlayWindow.
+    // DrawContent), solange es in der aktuellen Zone keine fehlenden Gegenstände gibt (nach allen
+    // aktiven Filtern) - laufende Automationen werden davon NICHT beeinflusst, die werden immer
+    // VOR dieser Prüfung aktualisiert. Default aus, da das Overlay sonst z.B. beim bloßen
+    // Durchqueren einer Zone unerwartet verschwinden würde.
+    public bool HideOverlayWhenEmpty { get; set; } = false;
+
+    // Zeigt hinter jeder Währung unter "Deine Währungen" zusätzlich "(<Anzahl>)", wie viel davon auf
+    // den eigenen Retainern liegt (siehe Plugin.GetRetainerItemCounts) - nur wirksam, solange
+    // Allagan Tools installiert/geladen ist (dieselbe Quelle wie EnableAllaganToolsIntegration).
+    public bool ShowRetainerItemCounts { get; set; } = true;
+
     // Standardmäßig AN: zeigt auch Sammelobjekte, die aktuell nur durch eine noch nicht erreichte
     // Errungenschaft oder einen noch nicht erreichten Stammes-/Grad-Rang erreichbar sind (siehe
     // Plugin.AchievementOrRankGatedItems, von Hand gepflegte Liste). Deaktiviert blendet genau diese
     // Einträge aus, statt sie als vermeintlich "gleich erreichbar" mit allen anderen zu vermischen.
     public bool ShowAllItems { get; set; } = true;
+
+    // Blendet im kompakten Overlay Saisonevent-Einträge (Category "Saisonevent", siehe Plugin.
+    // IsSeasonalEventEntryCurrentlyActive) aus, deren Event GERADE NICHT läuft - alle anderen
+    // Einträge (auch alle normalen, nicht event-gebundenen) bleiben unverändert sichtbar.
+    public bool ShowOnlyActiveEventItems { get; set; } = false;
 
     // Reihe der Automation-Start/Stopp-Knöpfe (Quest/Aetheryte/Hunting Log/Ätherströmung/Sightseeing/
     // Chocobokeep) im Overlay - die Automationen selbst laufen unabhängig davon weiter, nur die
@@ -120,6 +156,23 @@ public class Configuration : IPluginConfiguration
     // solange Allagan Tools (interner Name "InventoryTools") installiert/geladen ist - wird in den
     // Einstellungen automatisch wieder ausgeschaltet, falls das Plugin nachträglich entfernt wird.
     public bool EnableAllaganToolsIntegration { get; set; } = false;
+
+    // Lässt die Quest- und Hunting-Log-Automation den Chocobo-Begleiter beschwören/am Leben
+    // erhalten (siehe ChocoboCompanionSupport) - nur wirksam, solange die Quest "My Feisty Little
+    // Chocobo" abgeschlossen (das System freigeschaltet) ist, siehe Plugin.IsChocoboCompanionUnlocked.
+    public bool UseChocoboCompanion { get; set; } = true;
+
+    // In welcher Stance der Chocobo-Begleiter gehalten wird (siehe UseChocoboCompanion) - Free
+    // Stance als Default, da sie (anders als Attacker/Defender/Healer) kein eigenes Stance-Level
+    // braucht und somit immer sofort nutzbar ist (siehe Plugin.IsChocoboStanceUnlocked).
+    public ChocoboStance ChocoboStance { get; set; } = ChocoboStance.FreeStance;
+
+    // Sprache NUR fürs Menü (Windows.MainWindow) - siehe Loc-Klassenkommentar. Vorbelegt anhand der
+    // aktuell im Spielclient eingestellten Sprache (bei Deutsch -> Deutsch, sonst Englisch), danach
+    // aber ein fester, manuell änderbarer Wert - kein dauerhaftes "folgt der Spielsprache". Das
+    // kompakte Overlay folgt davon unberührt weiter der Spielsprache.
+    public MenuLanguage MenuLanguage { get; set; } =
+        Plugin.ClientState.ClientLanguage == ClientLanguage.German ? MenuLanguage.German : MenuLanguage.English;
 
     public void Save()
     {

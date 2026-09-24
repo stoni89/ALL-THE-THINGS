@@ -19,6 +19,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
 using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using LuminaSupplemental.Excel.Model;
@@ -76,6 +77,15 @@ public sealed class Plugin : IDalamudPlugin
     public SightseeingAutomation SightseeingAutomation { get; init; }
     public ChocobokeepAutomation ChocobokeepAutomation { get; init; }
 
+    // Eine einzige, geteilte Instanz statt je einer pro Automation - es gibt nur EINEN Chocobo-
+    // Begleiter/eine Gysahl-Greens-Abklingzeit im Spiel; mit getrennten Instanzen könnten
+    // QuestAutomation und HuntingLogAutomation (falls beide gleichzeitig aktiv) unabhängig
+    // voneinander gleichzeitig einen Beschwören-Versuch auslösen, ohne voneinander zu wissen.
+    public ChocoboCompanionSupport ChocoboCompanionSupportInstance { get; init; }
+
+    /// <summary>Siehe ChocoboCompanionSupportInstance-Kommentar - für QuestAutomation/HuntingLogAutomation, die keine Plugin-Instanz halten.</summary>
+    public static ChocoboCompanionSupport ChocoboCompanionSupport => instance.ChocoboCompanionSupportInstance;
+
     public Plugin()
     {
         instance = this;
@@ -85,6 +95,7 @@ public sealed class Plugin : IDalamudPlugin
 
         navigationFlagToPointQuery = PluginInterface.GetIpcSubscriber<Vector3?>("vnavmesh.Query.Mesh.FlagToPoint");
 
+        ChocoboCompanionSupportInstance = new ChocoboCompanionSupport();
         QuestAutomation = new QuestAutomation();
         AetheryteAutomation = new AetheryteAutomation();
         GoToAutomation = new GoToAutomation();
@@ -1217,9 +1228,45 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         EnrichHairstyleVendors(result);
+        EnrichHairstyleSpecialCurrencyVendors(result);
 
         hairstyleEntriesCache = result;
         return result;
+    }
+
+    // Von Hand nachgetragene Händler für "Modern Aesthetics"-Bücher, die NICHT für Gil, sondern über
+    // einen Sonderwährungs-Tauschhändler (SpecialShop) verkauft werden - EnrichHairstyleVendors
+    // deckt bewusst nur reine Gil-Händler ab (siehe dessen Kommentar), solche Fälle blieben sonst
+    // ohne Fundort. Schlüssel ist der Buchname (nicht die CharaMakeCustomize-RowId) - dasselbe Buch
+    // taucht im Sheet einmal PRO Rasse/Geschlecht auf (mehrere RowIds, ein Name), hier reicht ein
+    // einziger Eintrag für alle.
+    private static readonly Dictionary<string, (string Vendor, uint TerritoryId, uint MapId, float X, float Y, string CurrencyText, uint CurrencyIconId, uint CurrencyItemId, uint CurrencyAmount)> HairstyleSpecialVendorOverrides = new()
+    {
+        // Ose Wyd (Il Mheg) - Pilgrim's-Traverse-Tauschhändler, siehe Plugin.cs-Git-Historie.
+        ["Modern Aesthetics - Simple and Clean"] = ("Ose Wyd", 816, 494, 29.9f, 5.9f, "99 Luminous Oil", 22654, 47342, 99),
+    };
+
+    private static void EnrichHairstyleSpecialCurrencyVendors(List<CollectibleEntry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            if (entry.Type != CollectibleType.Hairstyle || entry.TerritoryTypeId != 0)
+                continue;
+
+            if (!HairstyleSpecialVendorOverrides.TryGetValue(entry.Name, out var vendor))
+                continue;
+
+            entry.Vendor = vendor.Vendor;
+            entry.TerritoryTypeId = vendor.TerritoryId;
+            entry.MapId = vendor.MapId;
+            entry.VendorMapX = vendor.X;
+            entry.VendorMapY = vendor.Y;
+            entry.Currency = vendor.CurrencyText;
+            entry.CurrencyIconId = vendor.CurrencyIconId;
+            entry.CurrencyItemId = vendor.CurrencyItemId;
+            entry.CurrencyAmount = vendor.CurrencyAmount;
+            entry.Source = $"{vendor.Vendor} - {vendor.CurrencyText}";
+        }
     }
 
     /// <summary>
@@ -1485,6 +1532,12 @@ public sealed class Plugin : IDalamudPlugin
         [2162692] = new Vector3(194.44441f, 73.78774f, 302.63824f),    // La Thagran Eastroad (Middle La Noscea)
         [2162708] = new Vector3(-72.16092f, 11.995184f, -416.05194f),  // Woad Whisper Canyon (Middle La Noscea)
         [2162709] = new Vector3(213.05968f, 117.65125f, -222.40886f),  // Summerford Farms (Middle La Noscea)
+        [2162695] = new Vector3(425.21655f, 15.025984f, 464.70297f),   // The Brewer's Beacon (Western La Noscea)
+        [2162694] = new Vector3(597.14575f, 73.67687f, -112.00588f),   // Red Rooster Stead (Lower La Noscea)
+        [2162710] = new Vector3(503.04245f, 106.69299f, -434.7053f),   // The Grey Fleet (Lower La Noscea)
+        [2162715] = new Vector3(67.52792f, 1.9575521f, 47.7629f),      // Camp Skull Valley (Western La Noscea)
+        [2162719] = new Vector3(381.97714f, 5.188155f, 198.84981f),    // Jijiroon's Trading Post (Upper La Noscea)
+        [2162718] = new Vector3(-428.29407f, 69.60198f, 28.178936f),   // Thalaos (Upper La Noscea)
     };
 
     // Je Zwischenstopp: Position + ob dieses Teilstück fliegend angeflogen werden darf (false =
@@ -2384,6 +2437,22 @@ public sealed class Plugin : IDalamudPlugin
     /// Formulierung), wird der Eintrag trotzdem ausgeblendet - siehe Nutzerentscheidung dazu.
     /// Alle anderen Categories sind von diesem Filter unberührt (liefert dafür immer true).
     /// </summary>
+    // Von Hand nachgetragene, offiziell verifizierte Zeitfenster einzelner Cross-Game-
+    // Kollaborationen (siehe IsSeasonalEventEntryCurrentlyActive-Kommentar) - Schlüssel ist ein
+    // Teilstring, der gegen entry.Source geprüft wird. Ergänzt bei Bedarf für jede weitere
+    // Kollaboration, sobald ihr offizielles Zeitfenster bekannt ist (z.B. aus der SQUARE ENIX-/
+    // Lodestone-Ankündigung) - noch NICHT hier eingetragene Kollaborationen fallen weiterhin auf
+    // "generell erfüllt" zurück (siehe unten), nicht auf "nie erfüllt".
+    private static readonly (string SourceContains, DateTime StartUtc, DateTime EndUtc)[] KnownCollaborationWindows =
+    {
+        // "A Nocturne for Heroes" (FINAL FANTASY XV-Kollaboration, Regalia Type-G etc.) - offiziell
+        // Do. 24.09.2026 01:00 bis Di. 13.10.2026 07:59 (jeweils PDT/UTC-7), Quelle: offizielle
+        // SQUARE ENIX-/Lodestone-Ankündigung.
+        ("Final Fantasy XV Collaboration",
+            new DateTime(2026, 9, 24, 8, 0, 0, DateTimeKind.Utc),
+            new DateTime(2026, 10, 13, 14, 59, 0, DateTimeKind.Utc)),
+    };
+
     public static bool IsSeasonalEventEntryCurrentlyActive(CollectibleEntry entry)
     {
         if (entry.Category != "Saisonevent")
@@ -2395,11 +2464,23 @@ public sealed class Plugin : IDalamudPlugin
         // (Starlight, Hatching-tide, ...) ab. GetActiveFestivalNames() liefert für Kollaborationen
         // deshalb IMMER eine leere Liste, auch während die Kollaboration tatsächlich live ist
         // (per Debug-Dump bestätigt: beim laufenden Yo-kai-Watch-Event war die Liste leer, der
-        // Eintrag wurde fälschlich dauerhaft als "Bedingung nicht erfüllt" markiert). Es gibt
-        // dafür keine bekannte, live auslesbare Quelle - Kollaborationen gelten daher generell als
-        // erfüllt (nicht gated), statt permanent falsch negativ zu sein.
+        // Eintrag wurde fälschlich dauerhaft als "Bedingung nicht erfüllt" markiert).
         if (entry.Source.Contains("Collaboration", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var (sourceContains, startUtc, endUtc) in KnownCollaborationWindows)
+            {
+                if (entry.Source.Contains(sourceContains, StringComparison.OrdinalIgnoreCase))
+                {
+                    var nowUtc = DateTime.UtcNow;
+                    return nowUtc >= startUtc && nowUtc <= endUtc;
+                }
+            }
+
+            // Kein bekanntes Zeitfenster hinterlegt (siehe KnownCollaborationWindows) - es gibt
+            // dafür keine bekannte, live auslesbare Quelle, daher generell als erfüllt werten
+            // (nicht gated), statt permanent falsch negativ zu sein.
             return true;
+        }
 
         var activeNames = GetActiveFestivalNames();
         if (activeNames.Count == 0)
@@ -4345,6 +4426,157 @@ public sealed class Plugin : IDalamudPlugin
         actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
     }
 
+    /// <summary>Siehe Configuration.UseChocoboCompanion/ChocoboCompanionSupport.</summary>
+    public static bool UseChocoboCompanion => instance.Configuration.UseChocoboCompanion;
+
+    /// <summary>Siehe Configuration.ChocoboStance/ChocoboCompanionSupport.</summary>
+    public static ChocoboStance ChocoboStance => instance.Configuration.ChocoboStance;
+
+    // Quest "My Feisty Little Chocobo" - schaltet das komplette Chocobo-Begleiter-System frei
+    // (Beschwören per Gysahl Greens, Rang/Stances), unabhängig von Großkompanie o.ä. Bewusst kein
+    // "const" (siehe (ushort)-Cast in IsChocoboCompanionUnlocked): die volle Lumina-RowId liegt über
+    // ushort.MaxValue, ein "const" würde dort einen Compile-Fehler (CS0221) auslösen statt der
+    // gewollten Laufzeit-Trunkierung auf die 16-Bit-Quest-ID des Spielclients.
+    private static readonly uint ChocoboCompanionUnlockQuestId = 66698;
+
+    // Item "Gysahl Greens" - wird beim Beschwören automatisch vom Spiel verbraucht (wie ein
+    // Verzehr-Item), kein eigenständiges "Item benutzen" nötig - siehe TrySummonChocoboCompanion.
+    private const uint GysahlGreensItemId = 4868;
+
+    // Lumina-Sheet "BuddyAction"-RowIds für die vier Chocobo-Stances - über ActionManager.UseAction
+    // mit ActionType.BuddyAction ausgelöst (siehe TrySetChocoboStance), wie ein "Companion Order"-Klick
+    // im Buddy-Fenster.
+    private static readonly Dictionary<ChocoboStance, uint> ChocoboStanceBuddyActionIds = new()
+    {
+        [ChocoboStance.Attacker] = 6,
+        [ChocoboStance.Defender] = 5,
+        [ChocoboStance.Healer] = 7,
+        [ChocoboStance.FreeStance] = 4,
+    };
+
+    // Index in UIState.Buddy.CompanionInfo.Levels (FixedSizeArray3<byte>, siehe FFXIVClientStructs-
+    // Quelltext) - JEDE dieser drei Stances hat ein eigenes, per Kampfeinsatz in dieser Stance
+    // steigendes Level (unabhängig vom Gesamt-Rang des Begleiters, siehe GetChocoboCompanionRank)
+    // und ist erst ab Level 1 überhaupt nutzbar. Free Stance hat KEIN eigenes Level und ist von
+    // Anfang an nutzbar (siehe IsChocoboStanceUnlocked).
+    private static readonly Dictionary<ChocoboStance, int> ChocoboStanceLevelIndex = new()
+    {
+        [ChocoboStance.Defender] = 0,
+        [ChocoboStance.Attacker] = 1,
+        [ChocoboStance.Healer] = 2,
+    };
+
+    public static bool IsChocoboCompanionUnlocked() => QuestManager.IsQuestComplete((ushort)ChocoboCompanionUnlockQuestId);
+
+    public static unsafe int GetChocoboCompanionRank() => UIState.Instance()->Buddy.CompanionInfo.Rank;
+
+    public static unsafe bool IsChocoboStanceUnlocked(ChocoboStance stance)
+    {
+        if (stance == ChocoboStance.FreeStance)
+            return true;
+
+        return UIState.Instance()->Buddy.CompanionInfo.Levels[ChocoboStanceLevelIndex[stance]] >= 1;
+    }
+
+    /// <summary>Verbleibende Beschwörungsdauer in Sekunden - 0 (oder kleiner), solange gerade nicht beschworen.</summary>
+    public static unsafe float GetChocoboSummonTimeLeft() => UIState.Instance()->Buddy.CompanionInfo.TimeLeft;
+
+    /// <summary>
+    /// Ob gerade eine Aktion/ein Item-Einsatz "sperrt" (echte Zauberzeit ODER die kurze
+    /// Animationssperre eines instant genutzten Items wie Gysahl Greens) - für
+    /// ChocoboCompanionSupport, damit nicht mitten in einem laufenden Beschwören-Versuch ein
+    /// zweiter losgeschickt wird (würde den ersten abbrechen/neu starten).
+    /// </summary>
+    public static unsafe bool IsAnimationLocked()
+    {
+        var actionManager = ActionManager.Instance();
+        return actionManager != null && actionManager->AnimationLock > 0f;
+    }
+
+    /// <summary>
+    /// Ob man sich gerade in einem Instanz-Inhalt (Dungeon, Trial, Raid, ...) befindet - für die
+    /// im Overlay ausgegrauten "Auto ..."-Knöpfe (siehe CompactOverlayWindow), da vnavmesh/die
+    /// hier gesteuerten Fremdplugins dort ohnehin nicht sinnvoll funktionieren. Die üblichen drei
+    /// ConditionFlags decken zusammen alle Varianten ab (BoundByDuty = normale Duty, BoundByDuty56
+    /// = z.B. Deep Dungeons/Eureka, BoundByDuty95 = z.B. Bozja/Zadnor-Gebiete).
+    /// </summary>
+    public static bool IsInInstancedContent() =>
+        Condition[ConditionFlag.BoundByDuty] || Condition[ConditionFlag.BoundByDuty56] || Condition[ConditionFlag.BoundByDuty95];
+
+    public static bool IsChocoboCompanionSummoned() => GetChocoboSummonTimeLeft() > 0f;
+
+    public static uint GetGysahlGreensCount() => instance.GetCurrencyAmount(GysahlGreensItemId);
+
+    // In welchen der vier normalen Inventar-Bags nach Gysahl Greens gesucht wird (siehe
+    // TrySummonChocoboCompanion) - dieselbe Reihenfolge wie im echten Inventar-Fenster.
+    private static readonly InventoryType[] ChocoboSummonSearchBags =
+    {
+        InventoryType.Inventory1,
+        InventoryType.Inventory2,
+        InventoryType.Inventory3,
+        InventoryType.Inventory4,
+    };
+
+    /// <summary>
+    /// Beschwört den Chocobo-Begleiter (verbraucht dabei automatisch eine Gysahl Greens aus dem
+    /// Inventar) - für ChocoboCompanionSupport. Gibt false zurück (ohne Nebenwirkung), falls das
+    /// System noch nicht freigeschaltet ist oder keine Gysahl Greens gefunden werden. Bewusst NICHT
+    /// über ActionManager.UseAction(ActionType.Item, ...) (das hat sich für dieses Item als
+    /// zuverlässig wirkungslos herausgestellt - Gysahl Greens hat laut Lumina ItemAction-Sheet einen
+    /// besonderen Typ (5), keinen normalen "Verzehr"-Typ), sondern über AgentInventoryContext.
+    /// UseItem - exakt derselbe Aufruf, den ein Rechtsklick -> "Benutzen" im Inventar-Fenster selbst
+    /// auslöst, und damit unabhängig vom jeweiligen ItemAction-Typ zuverlässig.
+    /// </summary>
+    public static unsafe bool TrySummonChocoboCompanion()
+    {
+        if (!IsChocoboCompanionUnlocked())
+            return false;
+
+        var inventoryManager = InventoryManager.Instance();
+        if (inventoryManager == null)
+            return false;
+
+        foreach (var bag in ChocoboSummonSearchBags)
+        {
+            var container = inventoryManager->GetInventoryContainer(bag);
+            if (container == null)
+                continue;
+
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = container->GetInventorySlot(i);
+                if (slot == null || slot->ItemId != GysahlGreensItemId || slot->Quantity <= 0)
+                    continue;
+
+                var agent = AgentInventoryContext.Instance();
+                if (agent == null)
+                    return false;
+
+                agent->UseItem(GysahlGreensItemId, bag, (uint)slot->Slot, 0);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Stellt die gewünschte Chocobo-Stance ein (wie ein Klick im Buddy-Fenster) - für
+    /// ChocoboCompanionSupport. Gibt false zurück (ohne Nebenwirkung), falls der Begleiter gerade
+    /// nicht beschworen ist oder der nötige Rang für diese Stance fehlt.
+    /// </summary>
+    public static unsafe bool TrySetChocoboStance(ChocoboStance stance)
+    {
+        if (!IsChocoboCompanionSummoned() || !IsChocoboStanceUnlocked(stance))
+            return false;
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return false;
+
+        return actionManager->UseAction(ActionType.BuddyAction, ChocoboStanceBuddyActionIds[stance]);
+    }
+
     private const string AllaganToolsInternalName = "InventoryTools"; // Anzeigename im Spiel ist "Allagan Tools"
 
     /// <summary>
@@ -4385,6 +4617,64 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (itemId != 0)
             OpenAllaganToolsItemInfo(itemId.ToString());
+    }
+
+    // Anders als OpenAllaganToolsItemInfo (Chat-Befehl) hier bewusst echte IPC - "AllaganTools.
+    // GetItemCountsByCharacter(itemId, currentCharacterOnly, inventoryCategories, includeSharedStorage)"
+    // liefert je Charakter-/Retainer-ID (ulong) die besessene Menge, unabhängig davon, ob dessen
+    // Inventar in DIESER Sitzung schon einmal geöffnet wurde (Allagan Tools hält eine eigene,
+    // sitzungsübergreifende Datenbank) - name/RowId und Registrierung per Dekompilieren von
+    // InventoryTools/IPC/IPCService.cs verifiziert (dort registriert unter genau diesem Namen).
+    private static ICallGateSubscriber<uint, bool, uint[], bool, Dictionary<ulong, uint>>? allaganToolsGetItemCountsByCharacter;
+
+    /// <summary>
+    /// Wie viel eines Items auf den eigenen Retainern liegt, aufgeschlüsselt je Retainer-Name - für
+    /// den "(<Anzahl>)"-Zusatz hinter "Deine Währungen" (siehe CompactOverlayWindow.
+    /// DrawCurrencyWallet/Configuration.ShowRetainerItemCounts). Leer (kein Fehler), solange Allagan
+    /// Tools nicht installiert/geladen ist oder der IPC-Aufruf aus irgendeinem Grund fehlschlägt.
+    /// Retainer-IDs/-Namen kommen bewusst NICHT aus Allagan Tools selbst (das liefert nur IDs, keine
+    /// Namen) - stattdessen aus RetainerManager (immer verfügbar für alle eigenen Retainer, auch
+    /// ohne sie in dieser Sitzung geöffnet zu haben), gegen das die von Allagan Tools gelieferten
+    /// IDs abgeglichen werden (schließt dabei automatisch Werte für die eigene Spielfigur/FC-Truhen
+    /// aus, auch ohne die genaue InventoryCategory-Aufschlüsselung von Allagan Tools zu kennen).
+    /// </summary>
+    public static unsafe Dictionary<string, uint> GetRetainerItemCounts(uint itemId)
+    {
+        var result = new Dictionary<string, uint>();
+        if (itemId == 0 || !instance.Configuration.ShowRetainerItemCounts || !IsAllaganToolsAvailable())
+            return result;
+
+        allaganToolsGetItemCountsByCharacter ??=
+            PluginInterface.GetIpcSubscriber<uint, bool, uint[], bool, Dictionary<ulong, uint>>("AllaganTools.GetItemCountsByCharacter");
+
+        Dictionary<ulong, uint> byCharacter;
+        try
+        {
+            if (!allaganToolsGetItemCountsByCharacter.HasFunction)
+                return result;
+
+            byCharacter = allaganToolsGetItemCountsByCharacter.InvokeFunc(itemId, true, Array.Empty<uint>(), false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Abfragen der Retainer-Bestände über Allagan Tools.");
+            return result;
+        }
+
+        var retainerManager = RetainerManager.Instance();
+        if (retainerManager == null)
+            return result;
+
+        foreach (var retainer in retainerManager->Retainers)
+        {
+            if (retainer.RetainerId == 0)
+                continue;
+
+            if (byCharacter.TryGetValue(retainer.RetainerId, out var count) && count > 0)
+                result[retainer.NameString] = count;
+        }
+
+        return result;
     }
 
     // Von Hand als "nicht von der Automation unterstützt" markierte Sightseeing-Punkte (Key =

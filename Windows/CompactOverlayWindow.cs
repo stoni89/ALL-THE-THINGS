@@ -75,11 +75,21 @@ public class CompactOverlayWindow : Window
     private bool collapsedLastFrame;
     private Vector2 expandedSize = new(260, 200);
 
+    // Wie collapsedLastFrame, aber für Configuration.HideOverlayWhenEmpty (siehe DrawContent, ganz
+    // am Anfang gesetzt/gelesen) - ohne diese Wiederherstellung in PreDraw würde das Fenster nach
+    // dem Schrumpfen auf 0x0 dauerhaft winzig bleiben, auch nachdem wieder etwas fehlt.
+    private bool hiddenDueToEmptyLastFrame;
+
     // Umschaltet zwischen "Deine Währungen:" (besessene Menge) und "Benötigte Währung:" (Summe der
     // noch fehlenden Menge über alle aktuell angezeigten, noch nicht besessenen Einträge hinweg) -
     // siehe DrawCurrencyWallet. Bewusst kein Configuration-Feld, da es sich nur um eine
     // Sitzungs-Ansicht handelt, kein dauerhaft zu speichernder Zustand.
     private bool showCurrencyCostMode;
+
+    // Wiederverwendetes leeres Dictionary statt bei jeder Währung im "Benötigte Währung"-Modus neu
+    // zu allozieren (siehe DrawCurrencyWallet) - dort wird gar nicht erst nach Retainer-Beständen
+    // gefragt.
+    private static readonly Dictionary<string, uint> EmptyRetainerCounts = new();
 
     /// <summary>
     /// Ob das Element, das man an der AKTUELLEN Cursor-Position mit der übergebenen Größe zeichnen
@@ -158,7 +168,7 @@ public class CompactOverlayWindow : Window
         // an. Das Schrumpfen beim EINklappen passiert dagegen bewusst NICHT hier, sondern erst in
         // DrawContent (nach Begin()) - dort ist die tatsächlich benötigte Höhe der Kopfzeile bekannt
         // (abhängig von config.CompactFontScale), hier vorher noch nicht.
-        if (!collapsed && collapsedLastFrame)
+        if ((!collapsed && collapsedLastFrame) || hiddenDueToEmptyLastFrame)
         {
             Size = expandedSize;
             SizeCondition = ImGuiCond.Always;
@@ -263,67 +273,6 @@ public class CompactOverlayWindow : Window
         // verwendet werden. Nur für Datenabfragen, nicht für die angezeigte Zonenüberschrift unten.
         var effectiveTerritoryId = Plugin.ResolveEffectiveTerritoryId(currentTerritoryId);
 
-        // Titel + Schloss-/Einklapp-/Schließen-Knopf in einer Gruppe - so lässt sich ihre
-        // tatsächliche Höhe direkt danach per ImGui.GetItemRectSize() messen (siehe collapsed unten),
-        // ohne sie an eine feste, skalierungsabhängige Pixelzahl zu koppeln.
-        ImGui.BeginGroup();
-
-        OutlineText("The Explorer's Codex", TitleColor);
-        if (ImGui.IsItemHovered())
-            ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-
-        if (ImGui.IsItemClicked())
-            plugin.OpenOptions();
-
-        // Alle drei Knöpfe gleich groß und direkt nebeneinander ganz am rechten Rand - die reine
-        // Frame-Höhe war schmaler als die tatsächlichen Icon-Glyphen (Schloss/Times), wodurch beide
-        // in ihrem eigenen Knopf beschnitten wirkten. Größe daher an der breiteren der Icon-Glyphen
-        // ausgerichtet, plus ein kleiner rechter Rand, damit "x" nicht am Fensterrand klebt.
-        float topRightIconWidth;
-        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-        {
-            topRightIconWidth = MathF.Max(
-                ImGui.CalcTextSize(FontAwesomeIcon.Lock.ToIconString()).X,
-                MathF.Max(
-                    ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X,
-                    ImGui.CalcTextSize(FontAwesomeIcon.ChevronUp.ToIconString()).X));
-        }
-
-        var topRightButtonSize = MathF.Max(ImGui.GetFrameHeight(), topRightIconWidth + ImGui.GetStyle().FramePadding.X * 2f);
-        const float TopRightMargin = 4f;
-
-        if (DrawLockButtonTopRight(config.CompactLocked, topRightButtonSize, TopRightMargin))
-        {
-            config.CompactLocked = !config.CompactLocked;
-            config.Save();
-        }
-
-        if (DrawCollapseButtonTopRight(collapsed, topRightButtonSize, TopRightMargin))
-            collapsed = !collapsed;
-
-        if (DrawCloseButtonTopRight(topRightButtonSize, TopRightMargin))
-        {
-            IsOpen = false;
-            config.ShowCompactOverlay = false;
-            config.Save();
-        }
-
-        ImGui.EndGroup();
-
-        if (collapsed)
-        {
-            // Fenster auf genau die Höhe der eben gezeichneten Kopfzeile (plus das obere/untere
-            // Innenpolster, siehe PreDraw) schrumpfen - erst jetzt (nach dem Zeichnen) bekannt, siehe
-            // Kommentar bei DrawContent-Aufruf/PreDraw. ImGuiCond.Always wirkt hier sofort, auch
-            // innerhalb desselben Begin()/End(), nicht erst nächsten Frame.
-            var windowPaddingY = ImGui.GetStyle().WindowPadding.Y;
-            var neededHeight = ImGui.GetItemRectSize().Y + windowPaddingY * 2f;
-            ImGui.SetWindowSize(new Vector2(ImGui.GetWindowSize().X, neededHeight), ImGuiCond.Always);
-            return;
-        }
-
-        OutlineText($"{Plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
-
         // In geteilten Hauptstädten (Ul'dah, Limsa, Gridania, Ishgard) sollen Sammelobjekte aus
         // JEDEM Bezirk angezeigt werden, egal in welchem man gerade steht - jeder Eintrag verlinkt
         // trotzdem auf seinen tatsächlichen Bezirk (siehe FlagTerritoryTypeId/MapId je Eintrag).
@@ -359,6 +308,10 @@ public class CompactOverlayWindow : Window
 
         var entries = afterCurrencyFilter
             .Where(e => !plugin.IsOwned(e))
+            // Siehe Configuration.ShowOnlyActiveEventItems-Kommentar - blendet bei aktiviertem
+            // Schalter NUR die Saisonevent-Einträge aus, deren Event gerade NICHT läuft; alle
+            // anderen Einträge (auch alle normalen, nicht event-gebundenen) bleiben unverändert.
+            .Where(e => !config.ShowOnlyActiveEventItems || e.Category != "Saisonevent" || Plugin.IsSeasonalEventEntryCurrentlyActive(e))
             .OrderBy(e => config.TypeOrder.IndexOf(e.Type))
             .ThenBy(e => e.Vendor)
             .ThenBy(e => e.Name)
@@ -456,6 +409,81 @@ public class CompactOverlayWindow : Window
         var hasVisibleSightseeing = visibleSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
         var hasActionableSightseeing = missingSightseeingInZone.Any(e => e.HasGoToTarget) && Plugin.IsSightseeingLogUnlocked();
         var hasActionableChocobokeeps = missingChocobokeepsInZone.Any(e => e.HasGoToTarget);
+
+        // Siehe Configuration.HideOverlayWhenEmpty-Kommentar - erst NACH allen Automation.Update()-
+        // Aufrufen oben geprüft (die laufen immer weiter, unabhängig von der Sichtbarkeit), aber
+        // VOR jeglichem Zeichnen (auch vor dem Kopfbereich) - schrumpft das Fenster auf 0x0 und
+        // überspringt den Rest von DrawContent komplett, für echte Unsichtbarkeit statt nur einer
+        // leeren Kopfzeile wie bei "collapsed".
+        if (config.HideOverlayWhenEmpty && entries.Count == 0)
+        {
+            hiddenDueToEmptyLastFrame = true;
+            ImGui.SetWindowSize(Vector2.Zero, ImGuiCond.Always);
+            return;
+        }
+
+        hiddenDueToEmptyLastFrame = false;
+
+        // Titel + Schloss-/Einklapp-/Schließen-Knopf in einer Gruppe - so lässt sich ihre
+        // tatsächliche Höhe direkt danach per ImGui.GetItemRectSize() messen (siehe collapsed unten),
+        // ohne sie an eine feste, skalierungsabhängige Pixelzahl zu koppeln.
+        ImGui.BeginGroup();
+
+        OutlineText("The Explorer's Codex", TitleColor);
+        if (ImGui.IsItemHovered())
+            ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+
+        if (ImGui.IsItemClicked())
+            plugin.OpenOptions();
+
+        // Alle drei Knöpfe gleich groß und direkt nebeneinander ganz am rechten Rand - die reine
+        // Frame-Höhe war schmaler als die tatsächlichen Icon-Glyphen (Schloss/Times), wodurch beide
+        // in ihrem eigenen Knopf beschnitten wirkten. Größe daher an der breiteren der Icon-Glyphen
+        // ausgerichtet, plus ein kleiner rechter Rand, damit "x" nicht am Fensterrand klebt.
+        float topRightIconWidth;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            topRightIconWidth = MathF.Max(
+                ImGui.CalcTextSize(FontAwesomeIcon.Lock.ToIconString()).X,
+                MathF.Max(
+                    ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString()).X,
+                    ImGui.CalcTextSize(FontAwesomeIcon.ChevronUp.ToIconString()).X));
+        }
+
+        var topRightButtonSize = MathF.Max(ImGui.GetFrameHeight(), topRightIconWidth + ImGui.GetStyle().FramePadding.X * 2f);
+        const float TopRightMargin = 4f;
+
+        if (DrawLockButtonTopRight(config.CompactLocked, topRightButtonSize, TopRightMargin))
+        {
+            config.CompactLocked = !config.CompactLocked;
+            config.Save();
+        }
+
+        if (DrawCollapseButtonTopRight(collapsed, topRightButtonSize, TopRightMargin))
+            collapsed = !collapsed;
+
+        if (DrawCloseButtonTopRight(topRightButtonSize, TopRightMargin))
+        {
+            IsOpen = false;
+            config.ShowCompactOverlay = false;
+            config.Save();
+        }
+
+        ImGui.EndGroup();
+
+        if (collapsed)
+        {
+            // Fenster auf genau die Höhe der eben gezeichneten Kopfzeile (plus das obere/untere
+            // Innenpolster, siehe PreDraw) schrumpfen - erst jetzt (nach dem Zeichnen) bekannt, siehe
+            // Kommentar bei DrawContent-Aufruf/PreDraw. ImGuiCond.Always wirkt hier sofort, auch
+            // innerhalb desselben Begin()/End(), nicht erst nächsten Frame.
+            var windowPaddingY = ImGui.GetStyle().WindowPadding.Y;
+            var neededHeight = ImGui.GetItemRectSize().Y + windowPaddingY * 2f;
+            ImGui.SetWindowSize(new Vector2(ImGui.GetWindowSize().X, neededHeight), ImGuiCond.Always);
+            return;
+        }
+
+        OutlineText($"{Plugin.GetZoneName(currentTerritoryId)} ({currentTerritoryId})", MutedColor);
 
         // Reihe der Automations-Knöpfe bricht bei Bedarf selbst in eine zweite Zeile um (statt über
         // den Fensterrand hinauszulaufen), wenn das kompakte Fenster nicht breit genug gezogen
@@ -858,7 +886,17 @@ public class CompactOverlayWindow : Window
             var label = GetCurrencyLabel(sample.Currency);
             var text = $"{amount.ToString("N0", CultureInfo.InvariantCulture)} {label}";
             var hasIcon = sample.CurrencyIconId != 0;
-            var itemWidth = ImGui.CalcTextSize(text).X + (hasIcon ? iconSize + itemSpacing : 0f);
+
+            // Nur im "Deine Währungen"-Modus (nicht "Benötigte Währung") - siehe Configuration.
+            // ShowRetainerItemCounts-Kommentar. Leeres Dictionary (nicht null), solange Allagan
+            // Tools fehlt/der Schalter aus ist - GetRetainerItemCounts prüft das selbst.
+            var retainerCounts = showCurrencyCostMode
+                ? EmptyRetainerCounts
+                : Plugin.GetRetainerItemCounts(sample.CurrencyItemId);
+            var retainerTotal = retainerCounts.Count == 0 ? 0u : (uint)retainerCounts.Values.Sum(v => (long)v);
+            var retainerSuffix = retainerTotal > 0 ? $" ({retainerTotal})" : string.Empty;
+
+            var itemWidth = ImGui.CalcTextSize(text + retainerSuffix).X + (hasIcon ? iconSize + itemSpacing : 0f);
 
             if (!isFirst)
             {
@@ -885,6 +923,18 @@ public class CompactOverlayWindow : Window
             }
 
             OutlineText(text, NormalColor);
+
+            if (!string.IsNullOrEmpty(retainerSuffix))
+            {
+                ImGui.SameLine(0f, 0f);
+                OutlineText(retainerSuffix, MutedColor);
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip(string.Join("\n", retainerCounts
+                        .OrderByDescending(kv => kv.Value)
+                        .Select(kv => $"{kv.Key}: {kv.Value.ToString("N0", CultureInfo.InvariantCulture)}")));
+                }
+            }
         }
 
         ImGui.Spacing();
@@ -899,24 +949,79 @@ public class CompactOverlayWindow : Window
         return t.Trim();
     }
 
-    /// <summary>
-    /// Alle Währungen (Kurzname + Icon-Id) eines Eintrags - normalerweise nur eine (die primäre,
-    /// Currency/CurrencyIconId), bei mehreren gleichzeitig benötigten (siehe
-    /// CollectibleEntry.AdditionalCurrencies, z.B. Triple-Triad-Karte "G-Warrior") auch die
-    /// weiteren. Für den Currency-Filter (siehe DrawContent/DrawCurrencyFilterPopupContent), damit
-    /// ein Eintrag bei JEDER seiner Währungen gefunden/ausgeblendet werden kann, nicht nur der ersten.
-    /// </summary>
-    private static IEnumerable<(string Label, uint IconId)> GetAllCurrencies(CollectibleEntry entry)
+    // Manche Roh-Quelldaten schreiben dieselbe Währung uneinheitlich mal im Singular, mal im Plural
+    // (z.B. "Bicolor Gemstone" vs. "Bicolor Gemstones") - ohne Abgleich taucht sie im "Currencys
+    // filtern"-Popup fälschlich zweimal auf UND ein Ausblenden über die eine Schreibweise würde
+    // Einträge mit der jeweils anderen gar nicht erfassen (siehe CanonicalizeCurrencyLabel). Reiner
+    // Vergleichsschlüssel (nicht die Anzeige) - entfernt ein einzelnes anhängendes "s" (aber nicht
+    // "ss", z.B. bei "Skybuilders' Scrips" oder generell Wörtern, die schon auf "ss" enden).
+    private static string NormalizeCurrencyLabelKey(string label)
+    {
+        var lower = label.ToLowerInvariant();
+        return lower.Length > 1 && lower.EndsWith('s') && !lower.EndsWith("ss") ? lower[..^1] : lower;
+    }
+
+    // Je Vergleichsschlüssel (siehe NormalizeCurrencyLabelKey) DIE Schreibweise, die unter allen
+    // bekannten Einträgen am häufigsten vorkommt (bei Gleichstand die kürzere, meist die
+    // Singular-Form) - einmalig aus der kompletten Sammlung aufgebaut, da Spielinhalte sich zur
+    // Laufzeit nicht ändern.
+    private static Dictionary<string, string>? currencyLabelCanonicalCache;
+
+    private static string CanonicalizeCurrencyLabel(string rawLabel)
+    {
+        if (string.IsNullOrEmpty(rawLabel))
+            return rawLabel;
+
+        currencyLabelCanonicalCache ??= CollectionData.GetAllEntries()
+            .SelectMany(GetRawCurrencyLabels)
+            .Where(l => !string.IsNullOrEmpty(l))
+            .GroupBy(NormalizeCurrencyLabelKey)
+            .ToDictionary(
+                g => g.Key,
+                g => g.GroupBy(l => l, StringComparer.Ordinal)
+                    .OrderByDescending(gg => gg.Count())
+                    .ThenBy(gg => gg.Key.Length)
+                    .First().Key);
+
+        var key = NormalizeCurrencyLabelKey(rawLabel);
+        return currencyLabelCanonicalCache.TryGetValue(key, out var canonical) ? canonical : rawLabel;
+    }
+
+    private static IEnumerable<string> GetRawCurrencyLabels(CollectibleEntry entry)
     {
         if (!string.IsNullOrEmpty(entry.Currency))
-            yield return (GetCurrencyLabel(entry.Currency), entry.CurrencyIconId);
+            yield return GetCurrencyLabel(entry.Currency);
 
         if (entry.AdditionalCurrencies != null)
         {
             foreach (var additional in entry.AdditionalCurrencies)
             {
                 if (!string.IsNullOrEmpty(additional.Currency))
-                    yield return (GetCurrencyLabel(additional.Currency), additional.CurrencyIconId);
+                    yield return GetCurrencyLabel(additional.Currency);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Alle Währungen (Kurzname + Icon-Id) eines Eintrags - normalerweise nur eine (die primäre,
+    /// Currency/CurrencyIconId), bei mehreren gleichzeitig benötigten (siehe
+    /// CollectibleEntry.AdditionalCurrencies, z.B. Triple-Triad-Karte "G-Warrior") auch die
+    /// weiteren. Für den Currency-Filter (siehe DrawContent/DrawCurrencyFilterPopupContent), damit
+    /// ein Eintrag bei JEDER seiner Währungen gefunden/ausgeblendet werden kann, nicht nur der ersten.
+    /// Label ist bereits kanonisiert (siehe CanonicalizeCurrencyLabel), damit Singular-/Plural-
+    /// Schreibvarianten derselben Währung als EINE zählen.
+    /// </summary>
+    private static IEnumerable<(string Label, uint IconId)> GetAllCurrencies(CollectibleEntry entry)
+    {
+        if (!string.IsNullOrEmpty(entry.Currency))
+            yield return (CanonicalizeCurrencyLabel(GetCurrencyLabel(entry.Currency)), entry.CurrencyIconId);
+
+        if (entry.AdditionalCurrencies != null)
+        {
+            foreach (var additional in entry.AdditionalCurrencies)
+            {
+                if (!string.IsNullOrEmpty(additional.Currency))
+                    yield return (CanonicalizeCurrencyLabel(GetCurrencyLabel(additional.Currency)), additional.CurrencyIconId);
             }
         }
     }
@@ -1008,6 +1113,15 @@ public class CompactOverlayWindow : Window
         "At least one required plugin is missing - see the Plugins page.");
 
     /// <summary>
+    /// Gemeinsamer Tooltip-Text für JEDEN Automations-Knopf, solange man sich in einem
+    /// Instanz-Inhalt befindet (siehe Plugin.IsInInstancedContent) - dort funktionieren vnavmesh/
+    /// die angesteuerten Fremdplugins ohnehin nicht sinnvoll.
+    /// </summary>
+    private static string InstancedContentTooltip => Loc.T(
+        "In Instanz-Inhalten (Dungeon, Trial, Raid, ...) nicht verfügbar.",
+        "Not available in instanced content (dungeon, trial, raid, ...).");
+
+    /// <summary>
     /// Knopf, der die Questionable-Automation (siehe QuestAutomation.cs) für die aktuell
     /// fehlenden Quests dieser Zone an-/ausschaltet. Ausgegraut, sobald irgendein als "Required"
     /// markiertes Plugin fehlt (nicht nur Questionable selbst) - siehe MissingPluginTooltip.
@@ -1031,7 +1145,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts sinnvoll zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableQuests || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!hasActionableQuests || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Quest]);
         if (isDisabled)
@@ -1045,9 +1160,11 @@ public class CompactOverlayWindow : Window
         {
             ImGui.SetTooltip(hasMissingPlugin
                 ? MissingPluginTooltip
-                : isDisabled
-                    ? Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
-                    : automation.IsActive
+                : inInstancedContent
+                    ? InstancedContentTooltip
+                    : isDisabled
+                        ? Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
+                        : automation.IsActive
                         ? Loc.T("Bricht die aktuelle Quest sofort ab und stoppt die Automation.", "Immediately cancels the current quest and stops the automation.")
                         : Loc.T(
                             "Lässt Questionable nacheinander alle fehlenden Quests dieser Zone annehmen und abschließen.",
@@ -1096,7 +1213,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableAetherytes || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!hasActionableAetherytes || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Aetheryte]);
         if (isDisabled)
@@ -1110,9 +1228,11 @@ public class CompactOverlayWindow : Window
         {
             ImGui.SetTooltip(hasMissingPlugin
                 ? MissingPluginTooltip
-                : isDisabled
-                    ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
-                    : automation.IsActive
+                : inInstancedContent
+                    ? InstancedContentTooltip
+                    : isDisabled
+                        ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
+                        : automation.IsActive
                         ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
                         : Loc.T(
                             "Läuft mit vnavmesh nacheinander alle fehlenden Aetheryten/Kristalle ab und interagiert mit ihnen.",
@@ -1162,7 +1282,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableHuntingLog || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!hasActionableHuntingLog || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.HuntingLog]);
         if (isDisabled)
@@ -1176,11 +1297,13 @@ public class CompactOverlayWindow : Window
         {
             ImGui.SetTooltip(hasMissingPlugin
                 ? MissingPluginTooltip
-                : isDisabled
-                    ? Loc.T(
-                        "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
-                        "No hunting log targets with a known position in this zone.")
-                    : automation.IsActive
+                : inInstancedContent
+                    ? InstancedContentTooltip
+                    : isDisabled
+                        ? Loc.T(
+                            "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
+                            "No hunting log targets with a known position in this zone.")
+                        : automation.IsActive
                         ? Loc.T(
                             "Stoppt die Automation - ein laufender Kampf wird noch zu Ende gebracht, statt den Charakter wehrlos stehen zu lassen.",
                             "Stops the automation - an ongoing fight is finished first instead of leaving the character defenseless.")
@@ -1230,7 +1353,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableAetherCurrents || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!hasActionableAetherCurrents || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.AetherCurrent]);
         if (isDisabled)
@@ -1244,10 +1368,12 @@ public class CompactOverlayWindow : Window
         {
             ImGui.SetTooltip(hasMissingPlugin
                 ? MissingPluginTooltip
-                : isDisabled
-                    ? Loc.T(
-                        "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
-                        "No aether currents with a known position in this zone.")
+                : inInstancedContent
+                    ? InstancedContentTooltip
+                    : isDisabled
+                        ? Loc.T(
+                            "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
+                            "No aether currents with a known position in this zone.")
                     : automation.IsActive
                         ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
                         : Loc.T(
@@ -1300,7 +1426,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!logUnlocked || !hasActionableSightseeing || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!logUnlocked || !hasActionableSightseeing || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Sightseeing]);
         if (isDisabled)
@@ -1316,11 +1443,13 @@ public class CompactOverlayWindow : Window
                 ? Loc.T("Sightseeing Log noch nicht freigeschaltet.", "Sightseeing Log not unlocked yet.")
                 : hasMissingPlugin
                     ? MissingPluginTooltip
-                    : isDisabled
-                        ? Loc.T(
-                            "Aktuell kein Sightseeing-Punkt in dieser Zone erreichbar (keine bekannte Position, oder Wetter/Uhrzeit passt gerade nicht).",
-                            "No sightseeing point currently reachable in this zone (no known position, or the weather/time doesn't match right now).")
-                        : automation.IsActive
+                    : inInstancedContent
+                        ? InstancedContentTooltip
+                        : isDisabled
+                            ? Loc.T(
+                                "Aktuell kein Sightseeing-Punkt in dieser Zone erreichbar (keine bekannte Position, oder Wetter/Uhrzeit passt gerade nicht).",
+                                "No sightseeing point currently reachable in this zone (no known position, or the weather/time doesn't match right now).")
+                            : automation.IsActive
                             ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
                             : Loc.T(
                                 "Läuft mit vnavmesh nacheinander alle fehlenden Sightseeing-Punkte ab und wartet auf die automatische Freischaltung.",
@@ -1368,7 +1497,8 @@ public class CompactOverlayWindow : Window
         // Nur ausgrauen, wenn NICHT aktiv - läuft sie schon, muss der Knopf zum Stoppen klickbar
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
-        var isDisabled = !automation.IsActive && (!hasActionableChocobokeeps || hasMissingPlugin);
+        var inInstancedContent = Plugin.IsInInstancedContent();
+        var isDisabled = !automation.IsActive && (!hasActionableChocobokeeps || hasMissingPlugin || inInstancedContent);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Chocobokeep]);
         if (isDisabled)
@@ -1382,11 +1512,13 @@ public class CompactOverlayWindow : Window
         {
             ImGui.SetTooltip(hasMissingPlugin
                 ? MissingPluginTooltip
-                : isDisabled
-                    ? Loc.T(
-                        "Keine noch nicht besuchten Chocobokeeps in dieser Zone.",
-                        "No unvisited chocobokeeps in this zone.")
-                    : automation.IsActive
+                : inInstancedContent
+                    ? InstancedContentTooltip
+                    : isDisabled
+                        ? Loc.T(
+                            "Keine noch nicht besuchten Chocobokeeps in dieser Zone.",
+                            "No unvisited chocobokeeps in this zone.")
+                        : automation.IsActive
                         ? Loc.T("Bricht die Laufbewegung sofort ab und stoppt die Automation.", "Immediately stops movement and the automation.")
                         : Loc.T(
                             "Läuft mit vnavmesh nacheinander alle noch nicht besuchten Chocobokeeps ab und interagiert mit ihnen.",
