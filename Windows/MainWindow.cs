@@ -354,6 +354,24 @@ public class MainWindow : Window
 
     public override void Draw()
     {
+        // Setzt Loc.MenuLanguageOverride NUR für die Dauer dieses einen Draw()-Aufrufs (siehe
+        // Loc-Klassenkommentar) - das kompakte Overlay/Automation-Statustexte laufen über eigene,
+        // später im selben Frame folgende Draw()-Aufrufe und sehen den Override dadurch nie.
+        var config = plugin.Configuration;
+        Loc.MenuLanguageOverride = config.MenuLanguage == MenuLanguage.German;
+
+        try
+        {
+            DrawInner();
+        }
+        finally
+        {
+            Loc.MenuLanguageOverride = null;
+        }
+    }
+
+    private void DrawInner()
+    {
         // Nur merken, solange NICHT eingeklappt - sonst würde die (künstlich auf Kopfzeilenhöhe
         // geschrumpfte) Größe während des Einklappens versehentlich als "neue Normalgröße"
         // gespeichert und beim Ausklappen fälschlich wiederhergestellt.
@@ -677,6 +695,34 @@ public class MainWindow : Window
             Loc.T("Allgemein", "General"),
             Loc.T("Zeigt fehlende Sammelobjekte der aktuellen Zone an.", "Shows missing collectibles for the current zone."));
 
+        ModernUi.GroupLabel(Loc.T("Sprache", "Language"));
+        ModernUi.BeginCard();
+        var languageLabels = new (MenuLanguage Language, string Label)[]
+        {
+            (MenuLanguage.German, "Deutsch"),
+            (MenuLanguage.English, "English"),
+        };
+
+        ModernUi.LabelRow(Loc.T("Menüsprache", "Menu language"), 280f, Loc.T(
+            "Gilt nur für dieses Menü - das kompakte Overlay folgt weiterhin der Spielsprache.",
+            "Only affects this menu - the compact overlay keeps following the game language."));
+        var currentLanguageLabel = languageLabels.First(l => l.Language == config.MenuLanguage).Label;
+        if (ImGui.BeginCombo("##MenuLanguage", currentLanguageLabel))
+        {
+            foreach (var (language, label) in languageLabels)
+            {
+                if (ImGui.Selectable(label, config.MenuLanguage == language))
+                {
+                    config.MenuLanguage = language;
+                    config.Save();
+                }
+            }
+
+            ImGui.EndCombo();
+        }
+
+        ModernUi.EndCard();
+
         ModernUi.GroupLabel(Loc.T("Overlay", "Overlay"));
         ModernUi.BeginCard();
         var showOverlay = config.ShowCompactOverlay;
@@ -730,16 +776,71 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Spacing();
 
+        var hideOverlayWhenEmpty = config.HideOverlayWhenEmpty;
+        if (ModernUi.ToggleRow(Loc.T("Overlay bei leerer Zone ausblenden", "Hide overlay when zone is empty"), ref hideOverlayWhenEmpty, Loc.T(
+                "Blendet das Overlay komplett aus, solange es in der aktuellen Zone (nach allen aktiven Filtern) nichts Fehlendes gibt - laufende Automationen laufen davon unbeeinflusst weiter.",
+                "Completely hides the overlay while there's nothing missing in the current zone (after all active filters) - running automations keep running unaffected.")))
+        {
+            config.HideOverlayWhenEmpty = hideOverlayWhenEmpty;
+            config.Save();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        // Automatisch abschalten, falls Allagan Tools nachträglich deinstalliert/deaktiviert wurde -
+        // gleiches Muster wie EnableAllaganToolsIntegration (siehe QoL-Karte weiter unten).
+        var allaganToolsAvailableForRetainerCounts = Plugin.IsAllaganToolsAvailable();
+        if (config.ShowRetainerItemCounts && !allaganToolsAvailableForRetainerCounts)
+        {
+            config.ShowRetainerItemCounts = false;
+            config.Save();
+        }
+
+        if (!allaganToolsAvailableForRetainerCounts)
+            ImGui.BeginDisabled();
+
+        var showRetainerItemCounts = config.ShowRetainerItemCounts;
+        if (ModernUi.ToggleRow(Loc.T("Retainer-Bestände bei Währungen anzeigen", "Show retainer stock next to currencies"), ref showRetainerItemCounts, Loc.T(
+                "Zeigt hinter jeder Währung unter \"Deine Währungen\" zusätzlich \"(<Anzahl>)\" mit der auf den eigenen Retainern liegenden Menge - Hover zeigt, welcher Retainer wie viel besitzt. Erfordert Allagan Tools.",
+                "Shows \"(<count>)\" after each currency under \"Your currencies\" with how much of it sits on your retainers - hover to see which retainer holds how much. Requires Allagan Tools.")))
+        {
+            config.ShowRetainerItemCounts = showRetainerItemCounts;
+            config.Save();
+        }
+
+        if (!allaganToolsAvailableForRetainerCounts)
+            ImGui.EndDisabled();
+
+        if (!allaganToolsAvailableForRetainerCounts && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip(Loc.T("Allagan Tools ist nicht installiert.", "Allagan Tools is not installed."));
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         var showAllItems = config.ShowAllItems;
-        if (ModernUi.ToggleRow(Loc.T("Alle Gegenstände anzeigen", "Show all items"), ref showAllItems))
+        if (ModernUi.ToggleRow(Loc.T("Alle Gegenstände anzeigen", "Show all items"), ref showAllItems, Loc.T(
+                "Zeige alle Items/Daten, auch wenn sie durch ein nicht erreichtes Achievement oder nicht freigeschaltete Ränge (z.B. bei Beast-Tribe-Händlern) aktuell nicht erreichbar sind.",
+                "Show all items/data, even if they're currently unreachable due to a not-yet-completed achievement or unlocked rank (e.g. with beast tribe vendors).")))
         {
             config.ShowAllItems = showAllItems;
             config.Save();
         }
-        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 5f);
-        TextDisabledWrapped(Loc.T(
-            "Zeige alle Items/Daten, auch wenn sie durch ein nicht erreichtes Achievement oder nicht freigeschaltete Ränge (z.B. bei Beast-Tribe-Händlern) aktuell nicht erreichbar sind.",
-            "Show all items/data, even if they're currently unreachable due to a not-yet-completed achievement or unlocked rank (e.g. with beast tribe vendors)."));
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var showOnlyActiveEventItems = config.ShowOnlyActiveEventItems;
+        if (ModernUi.ToggleRow(Loc.T("Nur aktive Event-Gegenstände anzeigen", "Show only active event items"), ref showOnlyActiveEventItems, Loc.T(
+                "Blendet nur Saisonevent-Gegenstände aus, deren Event gerade nicht läuft - alle anderen Gegenstände bleiben sichtbar.",
+                "Only hides seasonal event items whose event isn't currently running - all other items stay visible.")))
+        {
+            config.ShowOnlyActiveEventItems = showOnlyActiveEventItems;
+            config.Save();
+        }
         ModernUi.EndCard();
 
         ModernUi.GroupLabel("QoL");
@@ -786,7 +887,9 @@ public class MainWindow : Window
             ImGui.BeginDisabled();
 
         var enableAllaganTools = config.EnableAllaganToolsIntegration;
-        if (ModernUi.ToggleRow(Loc.T("Allagan-Tools-Integration aktivieren", "Enable Allagan Tools integration"), ref enableAllaganTools))
+        if (ModernUi.ToggleRow(Loc.T("Allagan-Tools-Integration aktivieren", "Enable Allagan Tools integration"), ref enableAllaganTools, Loc.T(
+                "Aktiviert die Möglichkeit, mit SHIFT + Linksklick mehr Informationen zu den Items oder Currencys zu bekommen.",
+                "Enables the ability to get more information about items or currencies via SHIFT + left-click.")))
         {
             config.EnableAllaganToolsIntegration = enableAllaganTools;
             config.Save();
@@ -798,17 +901,109 @@ public class MainWindow : Window
         if (!allaganToolsAvailable && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(Loc.T("Allagan Tools ist nicht installiert.", "Allagan Tools is not installed."));
 
-        ImGui.SetCursorPosY(ImGui.GetCursorPosY() + 5f);
-        TextDisabledWrapped(Loc.T(
-            "Aktiviert die Möglichkeit, mit SHIFT + Linksklick mehr Informationen zu den Items oder Currencys zu bekommen.",
-            "Enables the ability to get more information about items or currencies via SHIFT + left-click."));
-
         ModernUi.EndCard();
 
         ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
         ModernUi.BeginCard();
         DrawAetheryteMountPicker(config);
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        DrawChocoboCompanionSettings(config);
         ModernUi.EndCard();
+    }
+
+    /// <summary>
+    /// Chocobo-Begleiter-Automation (siehe Configuration.UseChocoboCompanion/ChocoboCompanionSupport) -
+    /// der Haupt-Toggle ist ausgegraut, bis die Quest "My Feisty Little Chocobo" abgeschlossen ist
+    /// (Plugin.IsChocoboCompanionUnlocked, schaltet das System überhaupt erst frei); die Stance-
+    /// Combobox zusätzlich, solange der Toggle selbst aus ist. Jede einzelne Stance in der Combobox
+    /// ist wiederum erst ab ihrem eigenen Stance-Level wählbar (Plugin.IsChocoboStanceUnlocked) -
+    /// außer Free Stance, die keins braucht - auch wenn Toggle/Combobox insgesamt schon aktivierbar sind.
+    /// </summary>
+    private static void DrawChocoboCompanionSettings(Configuration config)
+    {
+        var unlocked = Plugin.IsChocoboCompanionUnlocked();
+
+        if (!unlocked)
+            ImGui.BeginDisabled();
+
+        var useChocobo = config.UseChocoboCompanion;
+        if (ModernUi.ToggleRow(Loc.T("Chocobo-Begleiter nutzen", "Use Chocobo Companion"), ref useChocobo, Loc.T(
+                "Lässt die Quest- und Hunting-Log-Automation den Chocobo-Begleiter beschwören und am Leben erhalten (verbraucht dabei Gysahl Greens).",
+                "Lets the quest and hunting log automation summon and keep the Chocobo Companion alive (consumes Gysahl Greens).")))
+        {
+            config.UseChocoboCompanion = useChocobo;
+            config.Save();
+        }
+
+        if (!unlocked)
+            ImGui.EndDisabled();
+
+        if (!unlocked && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+        {
+            ImGui.SetTooltip(Loc.T(
+                "Erfordert die abgeschlossene Quest \"My Feisty Little Chocobo\".",
+                "Requires the completed quest \"My Feisty Little Chocobo\"."));
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        var stanceComboEnabled = unlocked && config.UseChocoboCompanion;
+        if (!stanceComboEnabled)
+            ImGui.BeginDisabled();
+
+        var stances = new (ChocoboStance Stance, string Label)[]
+        {
+            (ChocoboStance.Attacker, Loc.T("Angreifer", "Attacker")),
+            (ChocoboStance.Defender, Loc.T("Verteidiger", "Defender")),
+            (ChocoboStance.Healer, Loc.T("Heiler", "Healer")),
+            (ChocoboStance.FreeStance, Loc.T("Freie Haltung", "Free Stance")),
+        };
+
+        ModernUi.LabelRow(Loc.T("Chocobo-Haltung", "Chocobo stance"), 280f);
+        var currentStanceLabel = string.Empty;
+        foreach (var (stance, label) in stances)
+        {
+            if (stance == config.ChocoboStance)
+                currentStanceLabel = label;
+        }
+
+        if (ImGui.BeginCombo("##ChocoboStance", currentStanceLabel))
+        {
+            foreach (var (stance, label) in stances)
+            {
+                var stanceUnlocked = Plugin.IsChocoboStanceUnlocked(stance);
+                if (!stanceUnlocked)
+                    ImGui.BeginDisabled();
+
+                if (ImGui.Selectable(label, config.ChocoboStance == stance) && stanceUnlocked)
+                {
+                    config.ChocoboStance = stance;
+                    config.Save();
+                }
+
+                if (!stanceUnlocked)
+                {
+                    ImGui.EndDisabled();
+                    if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                    {
+                        ImGui.SetTooltip(Loc.T(
+                            "Erfordert mindestens Level 1 in dieser Stance (steigt durch Kampfeinsatz in ihr).",
+                            "Requires at least level 1 in this stance (gained by using it in combat)."));
+                    }
+                }
+            }
+
+            ImGui.EndCombo();
+        }
+
+        if (!stanceComboEnabled)
+            ImGui.EndDisabled();
     }
 
     private void DrawDisplayTab()

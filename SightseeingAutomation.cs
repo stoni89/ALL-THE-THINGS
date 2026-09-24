@@ -36,7 +36,9 @@ public sealed class SightseeingAutomation
     // nach dem groben Laufweg (der über den navmesh-genähten "floorPoint" nur die Erreichbarkeit
     // sicherstellt, siehe StartMovingTo) folgt daher ein zweiter, viel engerer Laufauftrag direkt zur
     // echten geloggten Position, siehe BeginFinalApproach.
-    private const float FinalApproachTolerance = 0f;
+    // Buchstäblich 0 lässt den fliegenden Anflug (Schweben mit dem Mount) hier und da nie exakt
+    // "ankommen" (pathIsRunning bleibt endlos true) - deshalb ein winziger, aber nicht-null Wert.
+    private const float FinalApproachTolerance = 0.1f;
 
     // Toleranz für den (optionalen) letzten Schritt NACH dem Abmounten am Zielpunkt, siehe Plugin.
     // SightseeingExactStandPositions/UpdateEnsuringExactPosition - noch enger als

@@ -30,15 +30,43 @@ public sealed class HuntingLogAutomation
 {
     private enum State
     {
+        SummoningChocobo,
         Idle,
         Mounting,
         MovingTo,
         SearchingMonster,
         ApproachingMonster,
+        DismountingForFight,
         Fighting,
+        FinishingCombat,
     }
 
+    // Wie lange maximal auf das Beschwören + Setzen der Stance gewartet wird, bevor trotzdem mit der
+    // eigentlichen Automation begonnen wird (z.B. falls keine Gysahl Greens vorhanden sind) - siehe
+    // UpdateSummoningChocobo.
+    private static readonly TimeSpan ChocoboSummonWaitTimeout = TimeSpan.FromSeconds(10);
+
     private static readonly TimeSpan MountWaitTimeout = TimeSpan.FromSeconds(6);
+
+    // Wie lange nach dem Aufsteigen (Condition[Mounted] wird VOR dem Ende der sichtbaren
+    // Aufsteige-Animation true) noch gewartet wird, bevor der erste Laufauftrag losgeschickt wird -
+    // ohne diese kurze Verzögerung war Plugin.CanFly (siehe BeginPathfind) in genau diesem Moment
+    // manchmal noch false, wodurch der Charakter beritten am Boden lief statt zu fliegen (siehe
+    // Git-Historie/Nutzer-Report "ist er nur gelaufen mit dem Mount anstatt zu fliegen").
+    private static readonly TimeSpan MountSettleDelay = TimeSpan.FromSeconds(1);
+
+    // Wie lange nach dem Erreichen der Angriffsreichweite auf das tatsächliche Abmounten gewartet
+    // wird (siehe UpdateDismountingForFight), bevor trotzdem mit dem Kampf begonnen wird - eine
+    // Notbremse, damit ein einzelner hartnäckiger Fall (z.B. noch mitten im Landeanflug) die
+    // Automation nicht für immer blockiert.
+    private static readonly TimeSpan DismountForFightTimeout = TimeSpan.FromSeconds(8);
+
+    // Wie lange nach dem tatsächlichen Abmounten (Condition[Mounted] wird VOR dem Ende der
+    // sichtbaren Absteige-/Lande-Animation false) noch gewartet wird, bevor der Kampf beginnt -
+    // ohne diese Verzögerung lief RotationSolver/der Kampfbeginn teils noch mitten in der
+    // Landeanimation ins Leere.
+    private static readonly TimeSpan DismountSettleDelay = TimeSpan.FromSeconds(1);
+
     private const float PathTolerance = 10f;
     private const float SprintDisableDistance = 8f;
     private static readonly TimeSpan StepMaxDuration = TimeSpan.FromMinutes(10);
@@ -88,6 +116,8 @@ public sealed class HuntingLogAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private DateTime? mountedAt;
+    private DateTime? dismountedAt;
 
     // Siehe Stop()/ForceStop() - statt MITTEN im Kampf RotationSolver abzuschalten (Charakter bliebe
     // angeschlagen und wehrlos stehen), wird der eigentliche Stopp zurückgehalten, bis der aktuell
@@ -212,12 +242,28 @@ public sealed class HuntingLogAutomation
     public void Start()
     {
         IsActive = true;
-        state = State.Idle;
         currentTargetEntry = null;
         skippedIds.Clear();
         attemptCounts.Clear();
         stopRequested = false;
-        StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        mountedAt = null;
+        dismountedAt = null;
+        Plugin.ChocoboCompanionSupport.Reset();
+
+        // Erst den Chocobo-Begleiter beschwören/die Stance setzen (siehe UpdateSummoningChocobo),
+        // BEVOR überhaupt das erste Ziel angelaufen wird - nur, wenn das Feature aktiv und
+        // freigeschaltet ist, sonst direkt wie bisher.
+        if (Plugin.UseChocoboCompanion && Plugin.IsChocoboCompanionUnlocked())
+        {
+            state = State.SummoningChocobo;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T("Beschwöre Chocobo-Begleiter...", "Summoning Chocobo Companion...");
+        }
+        else
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
     }
 
     /// <summary>
@@ -229,7 +275,7 @@ public sealed class HuntingLogAutomation
     /// </summary>
     public void Stop()
     {
-        if (state == State.Fighting && Plugin.Condition[ConditionFlag.InCombat])
+        if ((state == State.Fighting || state == State.FinishingCombat) && Plugin.Condition[ConditionFlag.InCombat])
         {
             if (stopRequested)
                 return;
@@ -261,6 +307,30 @@ public sealed class HuntingLogAutomation
     }
 
     /// <summary>
+    /// Blockiert den eigentlichen Automation-Start, bis der Chocobo-Begleiter beschworen und die
+    /// gewünschte Stance gesetzt ist (Plugin.ChocoboCompanionSupport.Tick() übernimmt das eigentliche
+    /// Beschwören/Stance-Setzen, hier wird nur beobachtet, wann das erledigt ist) - gibt aber
+    /// spätestens nach ChocoboSummonWaitTimeout auf (z.B. falls keine Gysahl Greens vorhanden sind),
+    /// statt die Hunting-Log-Automation endlos zu blockieren.
+    /// </summary>
+    private void UpdateSummoningChocobo()
+    {
+        var settled = !Plugin.UseChocoboCompanion || !Plugin.IsChocoboCompanionUnlocked();
+        if (!settled)
+        {
+            settled = Plugin.IsChocoboCompanionSummoned()
+                ? Plugin.ChocoboCompanionSupport.HasAppliedStanceForCurrentSummon || !Plugin.IsChocoboStanceUnlocked(Plugin.ChocoboStance)
+                : Plugin.GetGysahlGreensCount() == 0;
+        }
+
+        if (settled || DateTime.UtcNow - stateEnteredAt > ChocoboSummonWaitTimeout)
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
+    }
+
+    /// <summary>
     /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Hunting-Log-
     /// Einträgen DER AKTUELLEN ZONE aufgerufen werden (siehe Plugin.GetHuntingLogEntries - bereits
     /// auf Klasse/aktiven Rang gefiltert).
@@ -269,6 +339,8 @@ public sealed class HuntingLogAutomation
     {
         if (!IsActive)
             return;
+
+        Plugin.ChocoboCompanionSupport.Tick();
 
         // Zurückgehaltener Stopp (siehe Stop()) - sobald wirklich kein Kampf mehr läuft (oder die
         // Notbremse StopAfterCombatTimeout greift, falls InCombat aus irgendeinem Grund hängen
@@ -283,6 +355,10 @@ public sealed class HuntingLogAutomation
         {
             switch (state)
             {
+                case State.SummoningChocobo:
+                    UpdateSummoningChocobo();
+                    break;
+
                 case State.Idle:
                     // Nicht mit dem nächsten Ziel weitermachen, während ein Stopp aussteht - nur
                     // noch abwarten, bis der oben geprüfte Kampf-Zustand den eigentlichen Stopp
@@ -307,8 +383,16 @@ public sealed class HuntingLogAutomation
                     UpdateApproachingMonster(huntingLogEntriesInZone);
                     break;
 
+                case State.DismountingForFight:
+                    UpdateDismountingForFight(huntingLogEntriesInZone);
+                    break;
+
                 case State.Fighting:
                     UpdateFighting(huntingLogEntriesInZone);
+                    break;
+
+                case State.FinishingCombat:
+                    UpdateFinishingCombat();
                     break;
             }
         }
@@ -392,6 +476,7 @@ public sealed class HuntingLogAutomation
         {
             state = State.Mounting;
             stateEnteredAt = DateTime.UtcNow;
+            mountedAt = null;
             StatusText = Loc.T($"Rufe Mount, dann: {entry.Name}...", $"Summoning mount, then: {entry.Name}...");
             return;
         }
@@ -402,16 +487,26 @@ public sealed class HuntingLogAutomation
     private void BeginPathfind()
     {
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
+        var canFly = Plugin.CanFly;
         var accepted = false;
+        var triedFlying = false;
 
         // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
         // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
         // sinnlos am Boden herum statt zu laufen.
-        if (mounted && Plugin.CanFly)
+        if (mounted && canFly)
+        {
+            triedFlying = true;
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
+        }
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, PathTolerance);
+
+        // Diagnose für den Nutzer-Report "läuft statt zu fliegen" - zeigt beim nächsten Auftreten
+        // genau, ob mounted/CanFly falsch waren oder der Flugversuch von vnavmesh abgelehnt wurde.
+        Plugin.Log.Info($"[HuntingLogAutomation] BeginPathfind({currentTargetEntry?.Name}): mounted={mounted}, canFly={canFly}, " +
+                         $"triedFlying={triedFlying}, accepted={accepted} ({(triedFlying && !accepted ? "Flugversuch abgelehnt, auf Boden zurückgefallen" : triedFlying ? "fliegend angenommen" : "gar nicht erst fliegend versucht")}).");
 
         if (!accepted)
         {
@@ -430,10 +525,19 @@ public sealed class HuntingLogAutomation
     {
         if (Plugin.Condition[ConditionFlag.Mounted])
         {
+            // Kurz abwarten, bevor der erste Laufauftrag losgeschickt wird - siehe
+            // MountSettleDelay-Kommentar (Plugin.CanFly kann direkt nach Condition[Mounted]==true
+            // noch kurz hinterherhinken).
+            mountedAt ??= DateTime.UtcNow;
+            if (DateTime.UtcNow - mountedAt.Value < MountSettleDelay)
+                return;
+
+            mountedAt = null;
             BeginPathfind();
             return;
         }
 
+        mountedAt = null;
         if (DateTime.UtcNow - stateEnteredAt > MountWaitTimeout)
             BeginPathfind();
     }
@@ -578,32 +682,16 @@ public sealed class HuntingLogAutomation
             // Beritten lassen sich die meisten Klassen-Aktionen (und damit RotationSolver) gar nicht
             // ausführen - das Absteigen passiert nicht von allein, nur weil man in Reichweite ist
             // (erst ein tatsächlicher Kampfbeginn würde es erzwingen, aber genau dafür braucht es ja
-            // erst die Aktionen).
+            // erst die Aktionen). NICHT sofort in den Kampf übergehen - erst in
+            // UpdateDismountingForFight wirklich BESTÄTIGEN, dass Condition[Mounted] auch tatsächlich
+            // false geworden ist (z.B. nach einem fliegenden Anflug braucht das einen Moment), sonst
+            // bleibt RotationSolver wirkungslos, weil der Charakter noch beritten ist.
             Plugin.TryDismount();
+            dismountedAt = null;
 
-            Plugin.SetTarget(monster);
-            currentPriorityNameId = currentTargetEntry.BNpcNameId;
-            var rsrPriorityOk = false;
-            try
-            {
-                if (rsrAddPriorityNameId.HasAction)
-                {
-                    rsrAddPriorityNameId.InvokeAction(currentTargetEntry.BNpcNameId!.Value);
-                    rsrPriorityOk = true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Plugin.Log.Error(ex, "Fehler beim Setzen der RotationSolver-Priorität.");
-            }
-
-            SetRotationSolverAutoMode(true);
-            Plugin.Log.Info($"[HuntingLogAutomation] ApproachingMonster({currentTargetEntry.Name}): in Reichweite (distance={distance:F1}), " +
-                             $"Ziel gesetzt={Plugin.IsCurrentTarget(monster)}, RotationSolver-Priorität gesetzt={rsrPriorityOk}, '/rotation Auto' gesendet.");
-
-            state = State.Fighting;
+            state = State.DismountingForFight;
             stateEnteredAt = DateTime.UtcNow;
-            StatusText = Loc.T($"Kämpfe: {FreshName(entries)}...", $"Fighting: {FreshName(entries)}...");
+            StatusText = Loc.T($"Steige ab: {FreshName(entries)}...", $"Dismounting: {FreshName(entries)}...");
             return;
         }
 
@@ -647,6 +735,100 @@ public sealed class HuntingLogAutomation
         }
     }
 
+    /// <summary>
+    /// Wartet NACH dem Anlaufen (siehe UpdateApproachingMonster), bis Condition[Mounted] auch
+    /// tatsächlich false geworden ist (plus eine kurze Absteige-/Lande-Settle-Zeit), bevor
+    /// RotationSolver-Priorität/Auto-Modus gesetzt und in den eigentlichen Kampf übergegangen wird -
+    /// ohne diese Bestätigung blieb RotationSolver nach einem fliegenden Anflug manchmal wirkungslos,
+    /// weil der Charakter noch beritten war (siehe Klassenkommentar-Nutzer-Report). Gibt spätestens
+    /// nach DismountForFightTimeout auf und kämpft trotzdem, statt für immer hängen zu bleiben.
+    /// </summary>
+    private void UpdateDismountingForFight(IReadOnlyList<CollectibleEntry> entries)
+    {
+        if (currentTargetEntry == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (!StillNeeded(entries, currentTargetEntry.Id))
+        {
+            // Schon erledigt (z.B. von jemand anderem mitgetötet), bevor überhaupt richtig gekämpft
+            // wurde - trotzdem über State.FinishingCombat, nicht direkt FinishCurrent(): durch das
+            // Anlaufen/Anvisieren kann der Charakter längst im Kampf stecken (Aggro), auch ohne dass
+            // RotationSolver hier je aktiv war.
+            state = State.FinishingCombat;
+            stateEnteredAt = DateTime.UtcNow;
+            return;
+        }
+
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            Plugin.TryDismount();
+            dismountedAt = null;
+
+            if (DateTime.UtcNow - stateEnteredAt > DismountForFightTimeout)
+                BeginFighting(entries);
+
+            return;
+        }
+
+        dismountedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - dismountedAt.Value < DismountSettleDelay)
+            return;
+
+        BeginFighting(entries);
+    }
+
+    /// <summary>
+    /// Setzt RotationSolver-Priorität/Auto-Modus und wechselt in State.Fighting - aufgerufen erst
+    /// NACHDEM das Abmounten bestätigt ist (siehe UpdateDismountingForFight). Sucht das Monster
+    /// bewusst noch einmal frisch (statt die Referenz aus UpdateApproachingMonster weiterzureichen) -
+    /// zwischen Ankunft und bestätigtem Abmounten kann eine kurze Zeit vergangen sein.
+    /// </summary>
+    private void BeginFighting(IReadOnlyList<CollectibleEntry> entries)
+    {
+        if (currentTargetEntry == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
+        var monster = Plugin.FindNearestLiveMonster(currentTargetEntry.BNpcNameId!.Value, playerPos, MonsterSearchRadius);
+        if (monster == null)
+        {
+            state = State.SearchingMonster;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T($"Suche Monster: {FreshName(entries)}...", $"Looking for monster: {FreshName(entries)}...");
+            return;
+        }
+
+        Plugin.SetTarget(monster);
+        currentPriorityNameId = currentTargetEntry.BNpcNameId;
+        var rsrPriorityOk = false;
+        try
+        {
+            if (rsrAddPriorityNameId.HasAction)
+            {
+                rsrAddPriorityNameId.InvokeAction(currentTargetEntry.BNpcNameId!.Value);
+                rsrPriorityOk = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error(ex, "Fehler beim Setzen der RotationSolver-Priorität.");
+        }
+
+        SetRotationSolverAutoMode(true);
+        Plugin.Log.Info($"[HuntingLogAutomation] BeginFighting({currentTargetEntry.Name}): beritten={Plugin.Condition[ConditionFlag.Mounted]}, " +
+                         $"Ziel gesetzt={Plugin.IsCurrentTarget(monster)}, RotationSolver-Priorität gesetzt={rsrPriorityOk}, '/rotation Auto' gesendet.");
+
+        state = State.Fighting;
+        stateEnteredAt = DateTime.UtcNow;
+        StatusText = Loc.T($"Kämpfe: {FreshName(entries)}...", $"Fighting: {FreshName(entries)}...");
+    }
+
     private void UpdateFighting(IReadOnlyList<CollectibleEntry> entries)
     {
         if (currentTargetEntry == null)
@@ -657,8 +839,12 @@ public sealed class HuntingLogAutomation
 
         if (!StillNeeded(entries, currentTargetEntry.Id))
         {
-            // Benötigte Anzahl erreicht.
-            FinishCurrent();
+            // Benötigte Anzahl erreicht - RotationSolver bewusst NICHT sofort abschalten, siehe
+            // UpdateFinishingCombat (erst alle gerade kämpfenden Gegner zu Ende bekämpfen, egal ob
+            // Hunting-Log-Ziel oder nicht, dann erst "/rotation Off" und weiter zum nächsten Ziel).
+            state = State.FinishingCombat;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T($"Beende laufenden Kampf: {currentTargetEntry.Name}...", $"Finishing current fight: {currentTargetEntry.Name}...");
             return;
         }
 
@@ -715,6 +901,28 @@ public sealed class HuntingLogAutomation
             Plugin.Log.Info($"[HuntingLogAutomation] Fighting({currentTargetEntry.Name}): Ziel={monster.Name}, HP={monster.CurrentHp}/{monster.MaxHp}, " +
                              $"aktuelles Spielziel={Plugin.IsCurrentTarget(monster)}, RotationSolver aktiv laut IPC={rsrActive}.");
         }
+    }
+
+    /// <summary>
+    /// Die benötigte Anzahl ist laut Hunting Log bereits erreicht (siehe UpdateFighting), aber der
+    /// Charakter steckt evtl. noch mitten im Kampf (z.B. weitere, nicht zum Hunting-Log-Ziel
+    /// zählende Gegner greifen noch an) - RotationSolver bleibt bewusst weiter aktiv, bis
+    /// Condition[InCombat] tatsächlich wieder false wird, statt mitten im Gefecht abzuschalten und
+    /// wehrlos loszufliegen (explizite Nutzeranforderung). Gibt spätestens nach
+    /// StopAfterCombatTimeout auf (gleiche Notbremse/Begründung wie beim zurückgehaltenen Stop()).
+    /// </summary>
+    private void UpdateFinishingCombat()
+    {
+        if (currentTargetEntry == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (Plugin.Condition[ConditionFlag.InCombat] && DateTime.UtcNow - stateEnteredAt < StopAfterCombatTimeout)
+            return;
+
+        FinishCurrent();
     }
 
     /// <summary>

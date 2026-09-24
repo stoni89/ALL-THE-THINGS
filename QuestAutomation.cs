@@ -19,11 +19,17 @@ public sealed class QuestAutomation
 {
     private enum State
     {
+        SummoningChocobo,
         Idle,
         WaitingForPickup,
         Running,
         TravelingHome,
     }
+
+    // Wie lange maximal auf das Beschwören + Setzen der Stance gewartet wird, bevor trotzdem mit der
+    // eigentlichen Automation begonnen wird (z.B. falls keine Gysahl Greens vorhanden sind) - siehe
+    // UpdateSummoningChocobo.
+    private static readonly TimeSpan ChocoboSummonWaitTimeout = TimeSpan.FromSeconds(10);
 
     // Wie lange nach dem Start einer Quest gewartet wird, bis Questionable sie tatsächlich
     // übernimmt (IsRunning == true) - reagiert es nicht, gilt die Quest als nicht unterstützt.
@@ -264,7 +270,6 @@ public sealed class QuestAutomation
     public void Start(uint homeTerritoryId)
     {
         IsActive = true;
-        state = State.Idle;
         currentQuestId = null;
         this.homeTerritoryId = homeTerritoryId;
         travelHomeFinishedAt = null;
@@ -272,7 +277,22 @@ public sealed class QuestAutomation
         runningWentFalseAt = null;
         skippedQuestIds.Clear();
         attemptCounts.Clear();
-        StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        Plugin.ChocoboCompanionSupport.Reset();
+
+        // Erst den Chocobo-Begleiter beschwören/die Stance setzen (siehe UpdateSummoningChocobo),
+        // BEVOR überhaupt die erste Quest gestartet wird - nur, wenn das Feature aktiv und
+        // freigeschaltet ist, sonst direkt wie bisher.
+        if (Plugin.UseChocoboCompanion && Plugin.IsChocoboCompanionUnlocked())
+        {
+            state = State.SummoningChocobo;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T("Beschwöre Chocobo-Begleiter...", "Summoning Chocobo Companion...");
+        }
+        else
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
     }
 
     /// <summary>
@@ -339,6 +359,30 @@ public sealed class QuestAutomation
     }
 
     /// <summary>
+    /// Blockiert den eigentlichen Automation-Start, bis der Chocobo-Begleiter beschworen und die
+    /// gewünschte Stance gesetzt ist (Plugin.ChocoboCompanionSupport.Tick() übernimmt das eigentliche
+    /// Beschwören/Stance-Setzen, hier wird nur beobachtet, wann das erledigt ist) - gibt aber
+    /// spätestens nach ChocoboSummonWaitTimeout auf (z.B. falls keine Gysahl Greens vorhanden sind),
+    /// statt die Quest-Automation endlos zu blockieren.
+    /// </summary>
+    private void UpdateSummoningChocobo()
+    {
+        var settled = !Plugin.UseChocoboCompanion || !Plugin.IsChocoboCompanionUnlocked();
+        if (!settled)
+        {
+            settled = Plugin.IsChocoboCompanionSummoned()
+                ? Plugin.ChocoboCompanionSupport.HasAppliedStanceForCurrentSummon || !Plugin.IsChocoboStanceUnlocked(Plugin.ChocoboStance)
+                : Plugin.GetGysahlGreensCount() == 0;
+        }
+
+        if (settled || DateTime.UtcNow - stateEnteredAt > ChocoboSummonWaitTimeout)
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
+    }
+
+    /// <summary>
     /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Quests DER
     /// STARTZONE (siehe Start) und der aktuell aufgelösten Zone des Spielers aufgerufen werden.
     /// Startet nach und nach jede Quest per Questionable-IPC und wartet jeweils, bis Questionable
@@ -351,10 +395,16 @@ public sealed class QuestAutomation
         if (!IsActive)
             return;
 
+        Plugin.ChocoboCompanionSupport.Tick();
+
         try
         {
             switch (state)
             {
+                case State.SummoningChocobo:
+                    UpdateSummoningChocobo();
+                    break;
+
                 case State.Idle:
                     // Split-Hauptstädte (Ul'dah etc.) zählen als EIN Zuhause, egal in welchem
                     // Bezirk man gerade steht (siehe Plugin.GetSplitCityTerritories) - konsistent
