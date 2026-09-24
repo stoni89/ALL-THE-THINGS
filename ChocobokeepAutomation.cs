@@ -99,6 +99,7 @@ public sealed class ChocobokeepAutomation
     // (siehe DismountSettleDelay) - null, solange noch beritten.
     private DateTime? dismountedAt;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
 
     public bool IsActive { get; private set; }
 
@@ -297,12 +298,13 @@ public sealed class ChocobokeepAutomation
     {
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
+        var flyingAccepted = false;
 
         // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
         // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
         // sinnlos am Boden herum statt zu laufen.
         if (mounted && Plugin.CanFly)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
+            accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, PathTolerance);
@@ -317,6 +319,7 @@ public sealed class ChocobokeepAutomation
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
         stuckDetector.Reset();
+        flightUpgrade.OnPathStarted(flyingAccepted);
         StatusText = Loc.T($"Laufe zu: {currentTargetEntry?.Name}...", $"Walking to: {currentTargetEntry?.Name}...");
     }
 
@@ -355,6 +358,14 @@ public sealed class ChocobokeepAutomation
             // absichtlich abgestiegen ist, um interagieren zu können.
             if (!hasIntentionallyDismounted)
                 Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
+            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))

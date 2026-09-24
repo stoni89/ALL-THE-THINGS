@@ -76,6 +76,11 @@ public sealed class Plugin : IDalamudPlugin
     public AetherCurrentAutomation AetherCurrentAutomation { get; init; }
     public SightseeingAutomation SightseeingAutomation { get; init; }
     public ChocobokeepAutomation ChocobokeepAutomation { get; init; }
+    public TripleTriadAutomation TripleTriadAutomation { get; init; }
+    public NoFlyAreaExit NoFlyAreaExit { get; init; }
+
+    /// <summary>Für Klassen ohne eigene Plugin-Referenz (z.B. TripleTriadAutomation), die IsOwned/GetCurrencyAmount brauchen.</summary>
+    public static Plugin Instance => instance;
 
     // Eine einzige, geteilte Instanz statt je einer pro Automation - es gibt nur EINEN Chocobo-
     // Begleiter/eine Gysahl-Greens-Abklingzeit im Spiel; mit getrennten Instanzen könnten
@@ -174,6 +179,8 @@ public sealed class Plugin : IDalamudPlugin
         AetherCurrentAutomation = new AetherCurrentAutomation();
         SightseeingAutomation = new SightseeingAutomation();
         ChocobokeepAutomation = new ChocobokeepAutomation();
+        TripleTriadAutomation = new TripleTriadAutomation();
+        NoFlyAreaExit = new NoFlyAreaExit();
 
         MainWindow = new MainWindow(this);
         WindowSystem.AddWindow(MainWindow);
@@ -306,7 +313,22 @@ public sealed class Plugin : IDalamudPlugin
     /// der Charakter gar nicht abheben kann - das Ergebnis war ein sinnloses Herumhüpfen am Boden
     /// statt eines sauberen Fußwegs.
     /// </summary>
-    public static unsafe bool CanFly => PlayerState.Instance()->CanFly;
+    /// PlayerState.CanFly allein reicht aber nicht: es gilt für die ganze Zone - in Flugverbots-
+    /// Bereichen INNERHALB einer Flug-Zone (z.B. "The Eight Sentinels" in Mor Dhona) bleibt es true,
+    /// obwohl man dort nicht abheben kann (Nutzer-Report: "komische Bewegungen"). Dafür zusätzlich
+    /// TerritoryInfo.FlyingDisabled (gilt für die aktuelle Position) - siehe auch FlightPathUpgrade,
+    /// das nach dem Verlassen so eines Bereichs auf einen Flugweg umplant.
+    public static unsafe bool CanFly
+    {
+        get
+        {
+            if (!PlayerState.Instance()->CanFly)
+                return false;
+
+            var territoryInfo = TerritoryInfo.Instance();
+            return territoryInfo == null || !territoryInfo->FlyingDisabled;
+        }
+    }
 
     /// <summary>
     /// Ob eine Aetheryte-RowId einen GROSSEN Aetheryten (row.IsAetheryte == true - eigener Kristall
@@ -2120,6 +2142,35 @@ public sealed class Plugin : IDalamudPlugin
         return result;
     }
 
+    /// <summary>
+    /// Für die Sightseeing-Automation (AFK-Modus): ob ein Punkt NUR wegen Wetter/Uhrzeit gerade nicht
+    /// erledigbar ist - alle dauerhaften Voraussetzungen (Log/Buch freigeschaltet, Fliegen, kein
+    /// Jumping Puzzle) sind erfüllt, er wird also irgendwann von selbst verfügbar. Punkte mit
+    /// dauerhaften Blockern ändern sich beim Warten nicht und zählen daher nicht als "noch zu tun".
+    /// </summary>
+    public static bool IsSightseeingOnlyTemporarilyUnavailable(CollectibleEntry entry)
+    {
+        if (entry.Type != CollectibleType.Sightseeing)
+            return false;
+
+        if (!IsSightseeingLogUnlocked() || !CanFly || IsSightseeingUnsupportedByAutomation(entry.Id))
+            return false;
+        if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
+            return false;
+        if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
+            return false;
+
+        return (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
+               || (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry));
+    }
+
+    /// <summary>Wann ein nur wegen Wetter/Uhrzeit gesperrter Punkt wieder verfügbar wird, als Text ("in 12 Min.") - leer, wenn unbekannt.</summary>
+    public static string GetSightseeingAvailableInText(CollectibleEntry entry) =>
+        GetRemaining(GetSightseeingAvailableAtUtc(entry)) is { } remaining ? FormatSightseeingAvailableIn(remaining) : string.Empty;
+
+    /// <summary>Restzeit bis ein Punkt verfügbar wird (für die Sortierung "bald verfügbar zuerst").</summary>
+    public static TimeSpan? GetSightseeingAvailableIn(CollectibleEntry entry) => GetRemaining(GetSightseeingAvailableAtUtc(entry));
+
     private static TimeSpan? GetRemaining(DateTime? targetUtc)
     {
         if (targetUtc == null)
@@ -2409,6 +2460,126 @@ public sealed class Plugin : IDalamudPlugin
 
     private static List<CollectibleEntry>? chocobokeepEntriesCache;
 
+    // Kategorie der live berechneten NPC-Gegner-Karten (siehe GetTripleTriadNpcEntries) - dieselbe
+    // wie bei den alten, zonenlosen Einträgen in triadcards.json, damit Filter/Gate-Texte einheitlich greifen.
+    internal const string TripleTriadNpcCategory = "Gegner (NPC)";
+    private const uint ItemActionTripleTriadCardId = 3357; // Data[0] = TripleTriadCard-RowId
+
+    private static List<CollectibleEntry>? tripleTriadNpcEntriesCache;
+
+    /// <summary>
+    /// Triple-Triad-Karten, die man durch einen Sieg gegen einen NPC-Gegner erhalten kann - live aus
+    /// den Spieldaten: Lumina "TripleTriad" (je Gegner die möglichen Belohnungskarten + Voraussetzungs-
+    /// Quest), der NPC dazu über ENpcBase.ENpcData, dessen Standort über das Sheet "Level". Je Gegner
+    /// und Karte ein Eintrag am Standort des NPCs, als "Preis" einfach "NPC Fight". Voraussetzung für
+    /// alle: die freigeschaltete Battle Hall (siehe ComputeGrandCompanyOrTribeGateReason).
+    /// </summary>
+    public static List<CollectibleEntry> GetTripleTriadNpcEntries()
+    {
+        if (tripleTriadNpcEntriesCache != null)
+            return tripleTriadNpcEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        try
+        {
+            var tripleTriadSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.TripleTriad>();
+            var npcBaseSheet = DataManager.GetExcelSheet<ENpcBase>();
+            var npcResidentSheet = DataManager.GetExcelSheet<ENpcResident>();
+            var levelSheet = DataManager.GetExcelSheet<Level>();
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            var cardSheet = DataManager.GetExcelSheet<TripleTriadCard>();
+            if (tripleTriadSheet == null || npcBaseSheet == null || npcResidentSheet == null || levelSheet == null || mapSheet == null || cardSheet == null)
+                return tripleTriadNpcEntriesCache = result;
+
+            // Gegner-Zeile -> NPC (ENpcBase.ENpcData enthält die TripleTriad-RowId direkt).
+            var opponentIds = tripleTriadSheet.Select(t => t.RowId).ToHashSet();
+            var npcByOpponent = new Dictionary<uint, uint>();
+            foreach (var npc in npcBaseSheet)
+            {
+                foreach (var data in npc.ENpcData)
+                {
+                    if (data.RowId != 0 && opponentIds.Contains(data.RowId))
+                        npcByOpponent.TryAdd(data.RowId, npc.RowId);
+                }
+            }
+
+            // NPC -> Standort (Level.Type 8 = Objekt ist ein ENpc).
+            var levelByNpc = new Dictionary<uint, Level>();
+            foreach (var level in levelSheet)
+            {
+                if (level.Type == 8 && level.Object.RowId != 0)
+                    levelByNpc.TryAdd(level.Object.RowId, level);
+            }
+
+            foreach (var opponent in tripleTriadSheet)
+            {
+                if (!npcByOpponent.TryGetValue(opponent.RowId, out var npcId)
+                    || !levelByNpc.TryGetValue(npcId, out var level)
+                    || !npcResidentSheet.TryGetRow(npcId, out var resident)
+                    || !mapSheet.TryGetRow(level.Map.RowId, out var map))
+                    continue;
+
+                var npcName = resident.Singular.ToString();
+                if (string.IsNullOrEmpty(npcName))
+                    continue;
+
+                // Lumina führt manche Namen klein ("Triple Triad master") - für die Anzeige groß beginnen.
+                var displayName = char.ToUpperInvariant(npcName[0]) + npcName[1..];
+
+                var mapCoords = Dalamud.Utility.MapUtil.WorldToMap(new Vector2(level.X, level.Z), (int)map.OffsetX, (int)map.OffsetY, (uint)map.SizeFactor);
+                // Voraussetzungs-Quests des Gegners - PreviousQuestJoin 2 = EINE davon genügt (z.B. die
+                // drei Stadt-Varianten derselben Hauptquest), sonst müssen alle erledigt sein.
+                var requiredQuests = opponent.PreviousQuest
+                    .Where(q => q.RowId != 0)
+                    .Select(q => q.ValueNullable?.Name.ToString().Trim())
+                    .Where(n => !string.IsNullOrEmpty(n))
+                    .Select(n => n!)
+                    .ToList();
+                var requiredQuestsAny = opponent.PreviousQuestJoin == 2;
+
+                foreach (var reward in opponent.ItemPossibleReward)
+                {
+                    if (reward.RowId == 0 || reward.ValueNullable is not { } rewardItem || rewardItem.ItemAction.ValueNullable is not { } action
+                        || action.Action.RowId != ItemActionTripleTriadCardId)
+                        continue;
+
+                    var cardId = (uint)action.Data[0];
+                    if (!cardSheet.TryGetRow(cardId, out var card))
+                        continue;
+
+                    result.Add(new CollectibleEntry
+                    {
+                        Id = cardId,
+                        Name = card.Name.ToString(),
+                        Type = CollectibleType.TripleTriadCard,
+                        Category = TripleTriadNpcCategory,
+                        TerritoryTypeId = level.Territory.RowId,
+                        MapId = map.RowId,
+                        Vendor = displayName,
+                        VendorMapX = mapCoords.X,
+                        VendorMapY = mapCoords.Y,
+                        // Statt eines Preises der Gegner-Name (ausdrücklicher Nutzerwunsch) - im Currency-Filter
+                        // fasst CompactOverlayWindow.GetAllCurrencies alle NPC-Kämpfe zu EINEM Eintrag zusammen.
+                        Currency = displayName,
+                        Source = Loc.T($"Sieg gegen {displayName}", $"Win against {displayName}"),
+                        RequiredQuests = requiredQuests.Count > 0 ? requiredQuests : null,
+                        RequiredQuestsAny = requiredQuestsAny,
+                        // Für TripleTriadAutomation: NPC in der Welt finden bzw. genau dorthin navigieren.
+                        EventNpcId = npcId,
+                        WorldPosition = new Vector3(level.X, level.Y, level.Z),
+                    });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der Triple-Triad-NPC-Karten.");
+        }
+
+        Log.Info($"[TripleTriad] {result.Count} NPC-Gegner-Karten ({result.Select(e => e.Vendor).Distinct().Count()} Gegner).");
+        return tripleTriadNpcEntriesCache = result;
+    }
+
     // Lumina "Achievement".Type für die zonengebundenen Errungenschaften (per Auswertung der
     // Spieldaten verifiziert): 8 = "Mapping the Realm" (Key = Map-RowId), 20 = "Freebird" (Key =
     // AetherCurrentCompFlgSet-RowId). "Free Market Friend" (geteilter FATE-Rang) hat keinen
@@ -2416,6 +2587,13 @@ public sealed class Plugin : IDalamudPlugin
     private const byte AchievementTypeMapExploration = 8;
     private const byte AchievementTypeAetherCurrents = 20;
     private const string FreeMarketFriendPrefix = "Free Market Friend: ";
+
+    // 14 = eine bestimmte Instanz abschließen (Key = InstanceContent-RowId), z.B. "You Call That a
+    // Labyrinth" / "Life Is a Syrcus". Die Zähler-Typen 1/9 werden nur über den Instanz-Namen in der
+    // Beschreibung zugeordnet - bewusst NICHT Typ 6 (Quest abschließen: gleichnamige Instanzen wie
+    // "Dragon Sound" führten zu falschen Treffern) und nicht Typ 0 (Legacy, nicht mehr erhältlich).
+    private const byte AchievementTypeDutyCompletion = 14;
+    private static readonly HashSet<byte> AchievementTypesMatchedByDutyName = new() { 1, 9 };
 
     private static List<CollectibleEntry>? achievementEntriesCache;
 
@@ -2455,6 +2633,43 @@ public sealed class Plugin : IDalamudPlugin
                     fieldZoneByName.TryAdd(NormalizeZoneName(placeName), territory);
             }
 
+            // Instanzen (Dungeons, Raids, Trials, Schatzkarten-Dungeons, Eureka, ...) aus dem Duty Finder -
+            // für Typ 14 über InstanceContent (ContentLinkType 1), für die Zähler über den Namen.
+            var dutySheet = DataManager.GetExcelSheet<ContentFinderCondition>();
+            var dutyByInstanceContent = new Dictionary<uint, ContentFinderCondition>();
+            var dutiesByName = new List<(string Name, ContentFinderCondition Duty)>();
+            if (dutySheet != null)
+            {
+                foreach (var duty in dutySheet)
+                {
+                    if (duty.TerritoryType.RowId == 0)
+                        continue;
+
+                    if (duty.ContentLinkType == 1 && duty.Content.RowId != 0)
+                        dutyByInstanceContent.TryAdd(duty.Content.RowId, duty);
+
+                    var dutyName = duty.Name.ToString();
+                    if (dutyName.Length > 4 && dutiesByName.All(d => !string.Equals(d.Name, dutyName, StringComparison.OrdinalIgnoreCase)))
+                        dutiesByName.Add((dutyName, duty));
+                }
+            }
+
+            // Längste Namen zuerst - "the Hidden Canals of Uznair" soll nicht zusätzlich als kürzerer
+            // Teilname zählen.
+            dutiesByName.Sort((a, b) => b.Name.Length.CompareTo(a.Name.Length));
+
+            // Genau EINE Instanz im Text (als ganzes Wort/Wortgruppe) - sonst null (mehrdeutig/keine).
+            ContentFinderCondition? FindSingleDutyInText(string text)
+            {
+                var found = dutiesByName
+                    .Where(d => System.Text.RegularExpressions.Regex.IsMatch(text,
+                        @"(?<![A-Za-z])" + System.Text.RegularExpressions.Regex.Escape(d.Name) + @"(?![A-Za-z])",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    .ToList();
+                found = found.Where(f => !found.Any(o => o.Name.Length > f.Name.Length && o.Name.Contains(f.Name, StringComparison.OrdinalIgnoreCase))).ToList();
+                return found.Count == 1 ? found[0].Duty : null;
+            }
+
             foreach (var achievement in achievementSheet)
             {
                 var name = achievement.Name.ToString();
@@ -2478,6 +2693,20 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     territoryId = zone.RowId;
                     mapId = zone.Map.RowId;
+                }
+                else if (achievement.Type == AchievementTypeDutyCompletion && dutyByInstanceContent.TryGetValue(achievement.Key.RowId, out var duty))
+                {
+                    // "Complete the Labyrinth of the Ancients" usw. - Key = InstanceContent-RowId, exakt.
+                    territoryId = duty.TerritoryType.RowId;
+                    mapId = duty.TerritoryType.ValueNullable?.Map.RowId ?? 0;
+                }
+                else if (AchievementTypesMatchedByDutyName.Contains(achievement.Type) && FindSingleDutyInText(achievement.Description.ToString()) is { } namedDuty)
+                {
+                    // Zähler, die nur in genau einer Instanz vorankommen ("Raid the Lost Canals of Uznair
+                    // 5 times", Diadem, Eureka, Blaumagier-Solo-Läufe, ...) - über den Instanz-Namen in
+                    // der Beschreibung zugeordnet.
+                    territoryId = namedDuty.TerritoryType.RowId;
+                    mapId = namedDuty.TerritoryType.ValueNullable?.Map.RowId ?? 0;
                 }
 
                 if (territoryId == 0)
@@ -3351,6 +3580,16 @@ public sealed class Plugin : IDalamudPlugin
             var tripleTriadQuestId = ResolveQuestIdByName(TripleTriadUnlockQuestName);
             if (tripleTriadQuestId == null || !QuestManager.IsQuestComplete((ushort)tripleTriadQuestId.Value))
             {
+                // NPC-Gegner-Karten: die Battle Hall (und damit Partien gegen andere NPCs) öffnet sich
+                // erst nach dem Tutorial-Sieg gegen den Triple Triad Master - der schließt genau diese
+                // Quest ab (der Master bietet danach "Enter the Battlehall" an, per Spieldaten verifiziert).
+                if (entry.Category == TripleTriadNpcCategory)
+                {
+                    return Loc.T(
+                        $"Battle Hall noch nicht freigeschaltet - benötigt einen Sieg gegen den Triple Triad Master im Gold Saucer (Quest \"{TripleTriadUnlockQuestName}\").",
+                        $"Battle Hall not unlocked yet - requires a win against the Triple Triad Master in the Gold Saucer (quest \"{TripleTriadUnlockQuestName}\").");
+                }
+
                 return Loc.T(
                     $"Triple Triad ist noch nicht freigeschaltet - benötigt die abgeschlossene Quest \"{TripleTriadUnlockQuestName}\".",
                     $"Triple Triad isn't unlocked yet - requires the completed quest \"{TripleTriadUnlockQuestName}\".");
@@ -3368,6 +3607,30 @@ public sealed class Plugin : IDalamudPlugin
                 return Loc.T(
                     $"Benötigt die abgeschlossene Quest \"{requiredVendorQuest}\".",
                     $"Requires the completed quest \"{requiredVendorQuest}\".");
+            }
+        }
+
+        // Mehrere Voraussetzungs-Quests (siehe CollectibleEntry.RequiredQuests).
+        if (entry.RequiredQuests is { Count: > 0 } requiredQuestList)
+        {
+            bool IsDone(string questName) =>
+                ResolveQuestIdByName(questName) is { } id && QuestManager.IsQuestComplete((ushort)id);
+
+            if (entry.RequiredQuestsAny)
+            {
+                if (!requiredQuestList.Any(IsDone))
+                {
+                    var options = string.Join("\" / \"", requiredQuestList);
+                    return Loc.T(
+                        $"Benötigt eine der abgeschlossenen Quests \"{options}\".",
+                        $"Requires one of the completed quests \"{options}\".");
+                }
+            }
+            else if (requiredQuestList.FirstOrDefault(q => !IsDone(q)) is { } missingQuest)
+            {
+                return Loc.T(
+                    $"Benötigt die abgeschlossene Quest \"{missingQuest}\".",
+                    $"Requires the completed quest \"{missingQuest}\".");
             }
         }
 
@@ -5062,13 +5325,19 @@ public sealed class Plugin : IDalamudPlugin
     /// UseItem - exakt derselbe Aufruf, den ein Rechtsklick -> "Benutzen" im Inventar-Fenster selbst
     /// auslöst, und damit unabhängig vom jeweiligen ItemAction-Typ zuverlässig.
     /// </summary>
-    public static unsafe bool TrySummonChocoboCompanion()
-    {
-        if (!IsChocoboCompanionUnlocked())
-            return false;
+    public static bool TrySummonChocoboCompanion() =>
+        IsChocoboCompanionUnlocked() && TryUseInventoryItem(GysahlGreensItemId);
 
+    /// <summary>
+    /// Benutzt ein Item aus dem normalen Inventar (die vier Taschen) - exakt wie Rechtsklick ->
+    /// "Benutzen" im Inventar-Fenster (AgentInventoryContext.UseItem, siehe TrySummonChocoboCompanion-
+    /// Kommentar, warum nicht ActionManager). Für Gysahl Greens und das Lernen gewonnener Triple-
+    /// Triad-Karten (siehe TripleTriadAutomation). false, wenn das Item nicht im Inventar liegt.
+    /// </summary>
+    public static unsafe bool TryUseInventoryItem(uint itemId)
+    {
         var inventoryManager = InventoryManager.Instance();
-        if (inventoryManager == null)
+        if (inventoryManager == null || itemId == 0)
             return false;
 
         foreach (var bag in ChocoboSummonSearchBags)
@@ -5080,19 +5349,118 @@ public sealed class Plugin : IDalamudPlugin
             for (var i = 0; i < container->Size; i++)
             {
                 var slot = container->GetInventorySlot(i);
-                if (slot == null || slot->ItemId != GysahlGreensItemId || slot->Quantity <= 0)
+                if (slot == null || slot->ItemId != itemId || slot->Quantity <= 0)
                     continue;
 
                 var agent = AgentInventoryContext.Instance();
                 if (agent == null)
                     return false;
 
-                agent->UseItem(GysahlGreensItemId, bag, (uint)slot->Slot, 0);
+                agent->UseItem(itemId, bag, (uint)slot->Slot, 0);
                 return true;
             }
         }
 
         return false;
+    }
+
+    /// <summary>Freischalt-Item eines Sammelobjekts (siehe ResolveUnlockItemId) - z.B. das Karten-Item einer Triple-Triad-Karte.</summary>
+    public static uint GetUnlockItemId(CollectibleEntry entry) => ResolveUnlockItemId(entry);
+
+    /// <summary>
+    /// Ob gerade ein Triple-Triad-Fenster offen ist (Anfrage, Deckwahl, Partie, Ergebnis) - für
+    /// TripleTriadAutomation, um "Saucy spielt noch" von "fertig" zu unterscheiden.
+    /// </summary>
+    public static bool IsTripleTriadUiOpen() =>
+        IsAnyAddonVisible("TripleTriadRequest", "TripleTriadSelDeck", "TripleTriad", "TripleTriadResult", "TripleTriadRoundResult");
+
+    /// <summary>
+    /// Bestätigt ein offenes Ja/Nein-Fenster (SelectYesno) mit "Ja" - z.B. beim Crystal Gate der
+    /// "Eight Sentinels" (siehe NoFlyAreaExit). true, wenn geklickt wurde.
+    /// </summary>
+    public static unsafe bool TryConfirmSelectYesno()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        addon->FireCallbackInt(0); // 0 = "Ja"/"Yes"
+        Log.Info("[NoFlyAreaExit] SelectYesno mit \"Ja\" bestätigt.");
+        return true;
+    }
+
+    /// <summary>
+    /// Wählt im offenen SelectString-Menü den ersten Eintrag, der den Text enthält (Groß-/Klein-
+    /// schreibung egal) - z.B. "Triple Triad Challenge" bei NPCs, die auch Quests/Gespräche anbieten.
+    /// </summary>
+    public static unsafe bool TrySelectStringContaining(string text)
+    {
+        var addon = (AddonSelectString*)GameGui.GetAddonByName("SelectString").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        for (var i = 0; i < addon->PopupMenu.EntryCount; i++)
+        {
+            var entryText = addon->PopupMenu.EntryNames[i].ToString();
+            if (!entryText.Contains(text, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            addon->AtkUnitBase.FireCallbackInt(i);
+            Log.Info($"[TripleTriadAutomation] SelectString: '{entryText}' (#{i}) gewählt.");
+            return true;
+        }
+
+        // NPCs mit mehreren Funktionen (Quest + Triple Triad) zeigen stattdessen ein Menü mit Icons.
+        var iconAddon = (AddonSelectIconString*)GameGui.GetAddonByName("SelectIconString").Address;
+        if (iconAddon == null || !iconAddon->AtkUnitBase.IsVisible)
+            return false;
+
+        for (var i = 0; i < iconAddon->PopupMenu.PopupMenu.EntryCount; i++)
+        {
+            var entryText = iconAddon->PopupMenu.PopupMenu.EntryNames[i].ToString();
+            if (!entryText.Contains(text, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            iconAddon->AtkUnitBase.FireCallbackInt(i);
+            Log.Info($"[TripleTriadAutomation] SelectIconString: '{entryText}' (#{i}) gewählt.");
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Ob gerade ein Quest-Annahme-Fenster (JournalAccept) offen ist.
+    /// </summary>
+    public static unsafe bool IsJournalAcceptOpen()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("JournalAccept").Address;
+        return addon != null && addon->IsVisible;
+    }
+
+    /// <summary>
+    /// Klickt im offenen Quest-Annahme-Fenster auf "Annehmen" (Button-Node 44, wie ECommons'
+    /// AddonMaster.JournalAccept) - z.B. für Triple-Triad-Gegner, die erst nach Annahme ihrer
+    /// Quest herausgefordert werden können (Mimidoa).
+    /// </summary>
+    public static unsafe bool TryAcceptJournalQuest()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("JournalAccept").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        var button = addon->GetComponentButtonById(44);
+        if (button == null || !button->IsEnabled || !button->AtkComponentBase.OwnerNode->AtkResNode.IsVisible())
+            return false;
+
+        var resNode = button->AtkComponentBase.OwnerNode->AtkResNode;
+        var evt = resNode.AtkEventManager.Event;
+        if (evt == null)
+            return false;
+
+        addon->ReceiveEvent(evt->State.EventType, (int)evt->Param, evt);
+        Log.Info("[TripleTriadAutomation] JournalAccept: Quest angenommen.");
+        return true;
     }
 
     /// <summary>
@@ -6382,6 +6750,11 @@ public sealed class Plugin : IDalamudPlugin
         QuestAutomation.Dispose();
         CombatPluginInstance.Dispose();
 
+        // Beim Entladen (z.B. Dev-Neuladen) mitten in der Triple-Triad-Automation: Saucy stoppen und
+        // dessen "Fenster automatisch öffnen"-Option wiederherstellen (siehe TripleTriadAutomation.Stop).
+        if (TripleTriadAutomation.IsActive)
+            TripleTriadAutomation.Stop();
+
         CommandManager.RemoveHandler(CommandName);
 
         PluginInterface.UiBuilder.Draw -= DrawUI;
@@ -6398,6 +6771,58 @@ public sealed class Plugin : IDalamudPlugin
 /// CheckStuck() pro Tick während pathIsRunning true ist) - siehe z.B. AetheryteAutomation.BeginPathfind/
 /// UpdateMoving für die Verdrahtung.
 /// </summary>
+/// <summary>
+/// Beritten zu Fuß losgelaufen, weil gerade nicht geflogen werden konnte (Flugverbots-Bereich wie
+/// "The Eight Sentinels", siehe Plugin.CanFly) - sobald der Bereich verlassen ist und noch ein
+/// weiter Weg bleibt, soll die Automation einmal fliegend neu planen, statt den ganzen Weg am Boden
+/// zurückzulegen. Jede Automation mit eigenem Laufweg hält eine Instanz: OnPathStarted(...) nach
+/// jedem angenommenen Laufauftrag, ShouldReplanFlying(...) pro Tick während der Weg läuft.
+/// </summary>
+public sealed class FlightPathUpgrade
+{
+    // Darunter lohnt das Neuplanen (Abheben/Aufsteigen) nicht mehr.
+    private const float MinRemainingDistance = 40f;
+
+    // Kurz warten, nachdem Fliegen möglich wurde (CanFly kann am Bereichsrand kurz flackern).
+    private static readonly TimeSpan SettleDelay = TimeSpan.FromSeconds(1);
+
+    // Höchstens so oft umplanen - lehnt vnavmesh den Flugweg ab (z.B. Ziel selbst liegt im
+    // Flugverbots-Bereich), würde sonst jede Sekunde neu geplant.
+    private static readonly TimeSpan AttemptCooldown = TimeSpan.FromSeconds(30);
+
+    private bool pathIsFlying = true;
+    private DateTime? canFlySince;
+    private DateTime lastAttemptAt = DateTime.MinValue;
+
+    /// <summary>Nach jedem angenommenen Laufauftrag - flying = ob er fliegend angenommen wurde.</summary>
+    public void OnPathStarted(bool flying)
+    {
+        pathIsFlying = flying;
+        canFlySince = null;
+    }
+
+    public bool ShouldReplanFlying(Vector3 playerPosition, Vector3 destination)
+    {
+        if (pathIsFlying || !Plugin.Condition[ConditionFlag.Mounted] || !Plugin.CanFly)
+        {
+            canFlySince = null;
+            return false;
+        }
+
+        if (Vector3.Distance(playerPosition, destination) < MinRemainingDistance || DateTime.UtcNow - lastAttemptAt < AttemptCooldown)
+            return false;
+
+        canFlySince ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - canFlySince.Value < SettleDelay)
+            return false;
+
+        lastAttemptAt = DateTime.UtcNow;
+        canFlySince = null;
+        Plugin.Log.Info("[FlightPathUpgrade] Flugverbots-Bereich verlassen - plane fliegend neu.");
+        return true;
+    }
+}
+
 public sealed class NavigationStuckDetector
 {
     private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(4);
