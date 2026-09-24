@@ -14,6 +14,8 @@ permissions:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    env:
+      PLUGIN_REPO_TOKEN: ${{ secrets.PLUGIN_REPO_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,6 +80,45 @@ jobs:
           # zwingend ein JSON-Array, auch bei nur einem Plugin. Ohne -AsArray rollt die Pipeline das
           # Array mit nur einem Element zu einem einzelnen Objekt auf.
           $repoEntry | ConvertTo-Json -Depth 5 -AsArray | Set-Content -Encoding utf8 repo.json
+
+          # Eintrag auch fuer das zentrale Repo (stoni89/DalamudPlugins) bereitlegen.
+          $repoEntry | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 plugin-entry.json
+        shell: pwsh
+
+      # Zentrales Plugin-Repository (eine URL fuer alle Plugins): nur den EIGENEN Eintrag (per
+      # InternalName) ersetzen/ergaenzen, die Eintraege der anderen Plugins bleiben unveraendert.
+      # Braucht das Secret PLUGIN_REPO_TOKEN (Fine-grained PAT mit "Contents: Read and write" auf
+      # stoni89/DalamudPlugins) - fehlt es, wird dieser Schritt nur uebersprungen.
+      - name: Update central plugin repository
+        if: ${{ env.PLUGIN_REPO_TOKEN != '' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $central = Join-Path $env:RUNNER_TEMP "central"
+          git clone "https://x-access-token:$($env:PLUGIN_REPO_TOKEN)@github.com/stoni89/DalamudPlugins.git" $central
+          $entry = Get-Content plugin-entry.json -Raw | ConvertFrom-Json
+
+          $existing = @()
+          if (Test-Path "$central/repo.json") {
+            # Klammern + ForEach: packt das JSON-Array in jeder PowerShell-Version sicher in Einzel-Eintraege aus.
+            $existing = @((Get-Content "$central/repo.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
+          }
+
+          $merged = @($existing | Where-Object { $_.InternalName -ne $entry.InternalName }) + $entry
+          $merged = @($merged | Sort-Object Name)
+          ConvertTo-Json -InputObject $merged -Depth 5 | Set-Content -Encoding utf8 "$central/repo.json"
+
+          Push-Location $central
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo.json
+          if (git status --porcelain) {
+            git commit -m "Update $($entry.InternalName) to v$($env:VERSION)"
+            git push
+          } else {
+            Write-Host "Central repo.json unchanged, nothing to commit."
+          }
+          Pop-Location
         shell: pwsh
 
       - name: Commit repo.json
@@ -85,7 +126,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add repo.json
-          $status = git status --porcelain
+          $status = git status --porcelain repo.json
           if ($status) {
             git commit -m "Update repo.json to v$($env:VERSION)"
             git push
