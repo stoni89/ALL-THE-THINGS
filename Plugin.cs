@@ -318,6 +318,29 @@ public sealed class Plugin : IDalamudPlugin
     /// obwohl man dort nicht abheben kann (Nutzer-Report: "komische Bewegungen"). Dafür zusätzlich
     /// TerritoryInfo.FlyingDisabled (gilt für die aktuelle Position) - siehe auch FlightPathUpgrade,
     /// das nach dem Verlassen so eines Bereichs auf einen Flugweg umplant.
+    /// <summary>
+    /// Nur "Fliegen freigeschaltet" (PlayerState.CanFly), OHNE die Positionsprüfung aus CanFly - für
+    /// die Sightseeing-Voraussetzung. In Städten/Flugverbots-Bereichen wäre CanFly sonst false und
+    /// alle Punkte dort fälschlich "Bedingung nicht erfüllt" (Automation-Knopf ausgegraut).
+    /// </summary>
+    public static unsafe bool IsFlyingUnlocked => PlayerState.Instance()->CanFly;
+
+    /// <summary>
+    /// Sightseeing-Voraussetzung "Fliegen freigeschaltet" für einen Punkt: PlayerState.CanFly ist
+    /// in Städten (TerritoryIntendedUse 0) immer false, weil dort niemand fliegen kann - dort ist
+    /// Fliegen auch nicht nötig, die Voraussetzung gilt daher als erfüllt.
+    /// </summary>
+    public static bool IsSightseeingFlyingRequirementMet(CollectibleEntry entry)
+    {
+        if (IsFlyingUnlocked)
+            return true;
+
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        return territorySheet != null
+               && territorySheet.TryGetRow(entry.TerritoryTypeId, out var territory)
+               && territory.TerritoryIntendedUse.RowId == 0;
+    }
+
     public static unsafe bool CanFly
     {
         get
@@ -1748,6 +1771,111 @@ public sealed class Plugin : IDalamudPlugin
         [2162709] = new Vector3(213.07825f, 117.651245f, -222.44019f), // Summerford Farms (Middle La Noscea)
     };
 
+    // Ein Schritt eines Jumping Puzzles: in gerader Linie (vnavmesh Path.MoveTo, ohne Wegsuche) zu
+    // Target - bei Jump = true wird dabei direkt am Anfang gesprungen (Absprung = aktuelle Position,
+    // also das Ziel des vorherigen Schritts bzw. der Startpunkt). RunUp = Sprung mit Anlauf: am
+    // Absprungpunkt (Ziel des vorherigen Schritts) wird NICHT angehalten, sondern vom Punkt davor
+    // durchgelaufen und beim Überqueren abgesprungen.
+    // SprintBefore = vor diesem Schritt Sprint benutzen (bei Abklingzeit am Absprungpunkt warten).
+    // Exact = Target ohne Abweichung treffen (enge vnavmesh-Wegpunkt-Toleranz; als Absprungpunkt eines
+    // Anlaufs wird genau beim Überqueren abgesprungen).
+    // CancelSprintBefore = vor diesem Schritt einen noch aktiven Sprint entfernen.
+    public readonly record struct SightseeingPuzzleStep(Vector3 Target, bool Jump, bool RunUp = false, bool SprintBefore = false, bool Exact = false, bool CancelSprintBefore = false);
+
+    // ExactStand = genaue Position der Sightseeing-Kugel, falls sie nicht exakt der Landepunkt des
+    // letzten Schritts ist - dorthin wird nach der Landung noch genau gelaufen.
+    // DismountAtStart = beritten (fliegend, sonst reitend) genau bis zum Startpunkt, erst dort absteigen
+    // (liegt er in der Luft: senkrecht nach unten landen) und von dort aus die Schritte ablaufen.
+    public sealed record SightseeingJumpingPuzzle(Vector3 Start, SightseeingPuzzleStep[] Steps, Vector3? ExactStand = null, bool DismountAtStart = false);
+
+    // Von Hand hinterlegte Jumping Puzzles (Key = Adventure-RowId): Die Automation steuert zuerst
+    // normal den Startpunkt an, steigt ab, läuft genau darauf und arbeitet dann die Schritte der
+    // Reihe nach ab. Nach dem letzten Schritt folgt das normale Emote/Freischalten an der Stelle, an
+    // der der Charakter dann steht. Fällt der Charakter herunter, beginnt das Puzzle vom Startpunkt neu.
+    private static readonly Dictionary<uint, SightseeingJumpingPuzzle> SightseeingJumpingPuzzles = new()
+    {
+        [2162697] = new( // Apkallu Falls (Gridania)
+            new Vector3(-42.988815f, 10.863263f, -229.44397f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(-41.904015f, 11.792581f, -228.58421f), Jump: true),
+                new SightseeingPuzzleStep(new Vector3(-40.541237f, 14.323913f, -226.428f), Jump: true),
+                new SightseeingPuzzleStep(new Vector3(-39.444984f, 15.450834f, -225.18867f), Jump: false),
+                new SightseeingPuzzleStep(new Vector3(-38.183716f, 17.37831f, -224.43114f), Jump: true),
+                new SightseeingPuzzleStep(new Vector3(-31.467901f, 20.728025f, -222.71025f), Jump: false),
+                new SightseeingPuzzleStep(new Vector3(-27.137672f, 20.6441f, -231.32637f), Jump: false),
+                new SightseeingPuzzleStep(new Vector3(-19.493988f, 21.485334f, -230.3096f), Jump: false),
+                new SightseeingPuzzleStep(new Vector3(-19.841375f, 19.849356f, -233.34421f), Jump: false, SprintBefore: true), // auf Punkt 7 Sprint, dann Anlauf
+                new SightseeingPuzzleStep(new Vector3(-20.96915f, 16.238455f, -240.18513f), Jump: true, RunUp: true), // mit Anlauf über Punkt 8
+            },
+            ExactStand: new Vector3(-21.040531f, 16.238455f, -240.50746f)), // Sightseeing-Kugel - nach der Landung genau hierhin
+        [2162725] = new( // The Lancers' Guild (Gridania)
+            new Vector3(173.8963f, 17.499987f, -268.02325f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(171.26968f, 18.623f, -266.38104f), Jump: true),              // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(170.97382f, 18.623f, -264.71155f), Jump: false),              // Punkt 3 - Anlauf ab Punkt 2
+                new SightseeingPuzzleStep(new Vector3(170.76247f, 18.623f, -264.73038f), Jump: false, RunUp: true), // Punkt 4 - auf Punkt 3 nicht anhalten
+                new SightseeingPuzzleStep(new Vector3(166.31177f, 18.1f, -264.707f), Jump: true, RunUp: true),      // Punkt 5 - bei Punkt 4 abspringen
+                new SightseeingPuzzleStep(new Vector3(164.9289f, 18.099998f, -264.70456f), Jump: false),            // Punkt 6 - Anlauf ab Punkt 5
+                new SightseeingPuzzleStep(new Vector3(160.96414f, 18.1f, -264.70605f), Jump: true, RunUp: true),    // Punkt 7 - bei Punkt 6 abspringen
+                new SightseeingPuzzleStep(new Vector3(159.43863f, 18.099998f, -264.7028f), Jump: false, SprintBefore: true), // Punkt 8 - auf Punkt 7 Sprint, dann Anlauf
+                new SightseeingPuzzleStep(new Vector3(153.02248f, 17.821384f, -264.7026f), Jump: true, RunUp: true), // Punkt 9 (Sightseeing-Punkt) - bei Punkt 8 abspringen
+            }),
+        [2162696] = new( // The Leatherworkers' Guild (Gridania)
+            new Vector3(82.04379f, 9.999974f, -172.27545f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(83.50681f, 10.9113455f, -171.19609f), Jump: true),  // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(82.570786f, 10.9f, -169.67464f), Jump: false),     // Punkt 3
+                new SightseeingPuzzleStep(new Vector3(81.71872f, 12.7f, -168.0916f), Jump: true),        // Punkt 4
+                new SightseeingPuzzleStep(new Vector3(81.43062f, 12.7f, -167.5926f), Jump: false),       // Punkt 5 (Sightseeing-Punkt)
+            }),
+        [2162704] = new( // The Ruins of Sil'dih (Central Thanalan) - kein Sprung, nur genauer Fußweg
+            new Vector3(-283.50278f, -12.651595f, 74.74288f), // in der Luft - dort absteigen
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(-275.7539f, -14.272285f, 74.517914f), Jump: false, Exact: true), // Punkt 2 (Sightseeing-Punkt)
+            },
+            DismountAtStart: true),
+        [2162726] = new( // The Bannock (Central Shroud) - kein Sprung, nur genauer Fußweg
+            new Vector3(96.94209f, 2.7136912f, -73.20404f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(96.68277f, 2.7444344f, -76.00062f), Jump: false, Exact: true), // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(97.89942f, 3.56555f, -75.178215f), Jump: false, Exact: true),  // Punkt 3 (Sightseeing-Punkt)
+            },
+            DismountAtStart: true), // erst genau am Startpunkt absteigen
+        [2162724] = new( // The Carline Canopy (Gridania)
+            new Vector3(144.2908f, -13.261837f, 160.06638f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(145.5004f, -11.55687f, 162.28738f), Jump: true),                       // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(148.23187f, -8.264013f, 167.01671f), Jump: false, Exact: true),        // Punkt 3 - genau, sonst kein Anlauf möglich
+                new SightseeingPuzzleStep(new Vector3(148.50673f, -8.263825f, 166.36598f), Jump: false, Exact: true, CancelSprintBefore: true), // Punkt 4 - auf Punkt 3 Sprint entfernen, Anlauf, genau hier abspringen
+                new SightseeingPuzzleStep(new Vector3(150.31108f, -9.416907f, 161.36722f), Jump: true, RunUp: true),        // Punkt 5 - bei Punkt 4 abspringen
+                new SightseeingPuzzleStep(new Vector3(150.24185f, -9.401789f, 161.39577f), Jump: false, SprintBefore: true, Exact: true), // Punkt 6 - auf Punkt 5 Sprint, dann genau hierhin
+                new SightseeingPuzzleStep(new Vector3(150.25928f, -9.405594f, 160.7533f), Jump: false, Exact: true),        // Punkt 7 - Anlauf ab Punkt 6, genau hier abspringen
+                new SightseeingPuzzleStep(new Vector3(150.56349f, -9.47222f, 154.79427f), Jump: true, RunUp: true),         // Punkt 8 (Sightseeing-Punkt) - bei Punkt 7 abspringen
+            }),
+    };
+
+    /// <summary>Siehe SightseeingJumpingPuzzles-Kommentar.</summary>
+    public static bool TryGetSightseeingJumpingPuzzle(uint adventureId, out SightseeingJumpingPuzzle puzzle) =>
+        SightseeingJumpingPuzzles.TryGetValue(adventureId, out puzzle!);
+
+    private const uint JumpGeneralActionId = 2;
+
+    /// <summary>Springt (wie die Leertaste) - Allgemeine Aktion "Springen".</summary>
+    public static unsafe bool TryJump()
+    {
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return false;
+
+        return actionManager->UseAction(ActionType.GeneralAction, JumpGeneralActionId);
+    }
+
     /// <summary>Siehe SightseeingExactStandPositions-Kommentar.</summary>
     public static bool TryGetSightseeingExactStandPosition(uint adventureId, out Vector3 position)
     {
@@ -2153,7 +2281,7 @@ public sealed class Plugin : IDalamudPlugin
         if (entry.Type != CollectibleType.Sightseeing)
             return false;
 
-        if (!IsSightseeingLogUnlocked() || !CanFly || IsSightseeingUnsupportedByAutomation(entry.Id))
+        if (!IsSightseeingLogUnlocked() || !IsSightseeingFlyingRequirementMet(entry) || IsSightseeingUnsupportedByAutomation(entry.Id))
             return false;
         if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
             return false;
@@ -2206,7 +2334,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         if (!IsSightseeingLogUnlocked())
             return false;
-        if (!CanFly)
+        if (!IsSightseeingFlyingRequirementMet(entry))
             return false;
         if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
             return false;
@@ -2223,7 +2351,7 @@ public sealed class Plugin : IDalamudPlugin
     /// CompactOverlayWindow), statt nur des generischen Labels.
     /// </summary>
     public static bool IsSightseeingBlockedByFlying(CollectibleEntry entry) =>
-        entry.Type == CollectibleType.Sightseeing && IsSightseeingLogUnlocked() && !CanFly;
+        entry.Type == CollectibleType.Sightseeing && IsSightseeingLogUnlocked() && !IsSightseeingFlyingRequirementMet(entry);
 
     /// <summary>
     /// " - <Dauer>"-Zusatz fürs inline "(Bedingung nicht erfüllt)"-Label im Overlay (siehe
@@ -2638,6 +2766,7 @@ public sealed class Plugin : IDalamudPlugin
             var dutySheet = DataManager.GetExcelSheet<ContentFinderCondition>();
             var dutyByInstanceContent = new Dictionary<uint, ContentFinderCondition>();
             var dutiesByName = new List<(string Name, ContentFinderCondition Duty)>();
+            var seenDutyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (dutySheet != null)
             {
                 foreach (var duty in dutySheet)
@@ -2649,7 +2778,7 @@ public sealed class Plugin : IDalamudPlugin
                         dutyByInstanceContent.TryAdd(duty.Content.RowId, duty);
 
                     var dutyName = duty.Name.ToString();
-                    if (dutyName.Length > 4 && dutiesByName.All(d => !string.Equals(d.Name, dutyName, StringComparison.OrdinalIgnoreCase)))
+                    if (dutyName.Length > 4 && seenDutyNames.Add(dutyName))
                         dutiesByName.Add((dutyName, duty));
                 }
             }
@@ -2658,13 +2787,30 @@ public sealed class Plugin : IDalamudPlugin
             // Teilname zählen.
             dutiesByName.Sort((a, b) => b.Name.Length.CompareTo(a.Name.Length));
 
+            // Name als ganzes Wort/Wortgruppe im Text? Bewusst einfache Textsuche statt Regex - pro
+            // Errungenschaft wird gegen ~900 Instanznamen geprüft, eine je Name neu gebaute Regex
+            // machte das Plugin-Laden spürbar langsam.
+            static bool ContainsAsWholeWords(string text, string name)
+            {
+                var index = 0;
+                while ((index = text.IndexOf(name, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+                {
+                    var end = index + name.Length;
+                    var boundaryBefore = index == 0 || !char.IsAsciiLetter(text[index - 1]);
+                    var boundaryAfter = end >= text.Length || !char.IsAsciiLetter(text[end]);
+                    if (boundaryBefore && boundaryAfter)
+                        return true;
+                    index++;
+                }
+
+                return false;
+            }
+
             // Genau EINE Instanz im Text (als ganzes Wort/Wortgruppe) - sonst null (mehrdeutig/keine).
             ContentFinderCondition? FindSingleDutyInText(string text)
             {
                 var found = dutiesByName
-                    .Where(d => System.Text.RegularExpressions.Regex.IsMatch(text,
-                        @"(?<![A-Za-z])" + System.Text.RegularExpressions.Regex.Escape(d.Name) + @"(?![A-Za-z])",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    .Where(d => ContainsAsWholeWords(text, d.Name))
                     .ToList();
                 found = found.Where(f => !found.Any(o => o.Name.Length > f.Name.Length && o.Name.Contains(f.Name, StringComparison.OrdinalIgnoreCase))).ToList();
                 return found.Count == 1 ? found[0].Duty : null;
@@ -3666,7 +3812,7 @@ public sealed class Plugin : IDalamudPlugin
             // Fliegen funktionieren - direkt nach der Log-Prüfung, noch vor allem Weiteren (auch vor
             // Jumping-Puzzle-Unterstützung, siehe Priorität 1 unten). CanFly berücksichtigt dabei auch
             // Zonen, in denen Fliegen erst durch genug gesammelte Ätherströmungen freigeschaltet wird.
-            if (!CanFly)
+            if (!IsSightseeingFlyingRequirementMet(entry))
             {
                 return Loc.T(
                     "Fliegen nicht freigeschaltet.",
@@ -5200,6 +5346,43 @@ public sealed class Plugin : IDalamudPlugin
         actionManager->UseAction(ActionType.GeneralAction, SprintGeneralActionId);
     }
 
+    private const uint SprintStatusId = 50;
+
+    /// <summary>
+    /// Sprint auf ausdrückliche Anweisung (z.B. Jumping-Puzzle-Schritt mit SprintBefore) -
+    /// unabhängig von Configuration.UseSprintOnCooldown. true, sobald Sprint benutzt wurde oder schon
+    /// aktiv ist; false, solange er noch abklingt (Aufrufer wartet dann).
+    /// </summary>
+    public static unsafe bool TryUseSprintNow()
+    {
+        if (ObjectTable.LocalPlayer?.StatusList.Any(s => s.StatusId == SprintStatusId) == true)
+            return true;
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null || !actionManager->IsActionOffCooldown(ActionType.GeneralAction, SprintGeneralActionId))
+            return false;
+
+        return actionManager->UseAction(ActionType.GeneralAction, SprintGeneralActionId);
+    }
+
+    /// <summary>Entfernt einen noch aktiven Sprint (wie Rechtsklick auf den Buff). true, wenn Sprint (jetzt) nicht mehr aktiv ist.</summary>
+    public static unsafe bool TryCancelSprint()
+    {
+        if (ObjectTable.LocalPlayer?.StatusList.Any(s => s.StatusId == SprintStatusId) != true)
+            return true;
+
+        // Nicht jeden Frame erneut anfragen, bis der Server das Entfernen bestätigt hat.
+        if (DateTime.UtcNow - lastSprintCancelAt > TimeSpan.FromSeconds(0.5))
+        {
+            lastSprintCancelAt = DateTime.UtcNow;
+            StatusManager.ExecuteStatusOff(SprintStatusId);
+        }
+
+        return false;
+    }
+
+    private static DateTime lastSprintCancelAt = DateTime.MinValue;
+
     // General Action "Dismount" - feste Spiel-ID (verifiziert per GeneralAction-Sheet-Dump beim
     // Mount-Roulette-Feature), kein Excel-Sheet-Lookup nötig.
     private const uint DismountGeneralActionId = 23;
@@ -5378,6 +5561,18 @@ public sealed class Plugin : IDalamudPlugin
     /// Bestätigt ein offenes Ja/Nein-Fenster (SelectYesno) mit "Ja" - z.B. beim Crystal Gate der
     /// "Eight Sentinels" (siehe NoFlyAreaExit). true, wenn geklickt wurde.
     /// </summary>
+    /// <summary>Lehnt ein offenes Ja/Nein-Fenster ab (z.B. Triple-Triad-Revanche) - true, wenn eins offen war.</summary>
+    public static unsafe bool TryDeclineSelectYesno()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        addon->FireCallbackInt(1); // 1 = "Nein"/"No"
+        Log.Info("[TripleTriadAutomation] SelectYesno mit \"Nein\" abgelehnt.");
+        return true;
+    }
+
     public static unsafe bool TryConfirmSelectYesno()
     {
         var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
@@ -5651,11 +5846,11 @@ public sealed class Plugin : IDalamudPlugin
                             });
                         }
                     }
-                    catch (Exception ex)
+                    catch (Exception)
                     {
                         // Einzelne leere/reservierte Slots können beim Auslesen werfen (siehe
-                        // EnrichFrameKitVendors) - nur diesen Slot überspringen.
-                        Log.Debug(ex, $"[MoogleTrove] Slot in SpecialShop {shop.RowId} übersprungen.");
+                        // EnrichFrameKitVendors) - nur diesen Slot überspringen. Bewusst ohne Log (über
+                        // 1.500 Stacktraces pro Laden haben das Log geflutet).
                     }
                 }
             }
@@ -5948,21 +6143,11 @@ public sealed class Plugin : IDalamudPlugin
     // echte Jumping Puzzles - ein Versuch, das per simuliertem Tastendruck (IKeyState) zu
     // automatisieren, ist an einer bewussten Dalamud-Einschränkung gescheitert ("Dalamud does not
     // support pressing keys, only preventing them"); vnavmesh selbst kann so eine echte Sprung-Lücke
-    // ohnehin nicht queren (kein Navmesh dort). Bleibt daher dauerhaft manuell.
+    // ohnehin nicht queren (kein Navmesh dort). Inzwischen per Sprung-Aktion + geradem vnavmesh-
+    // Path.MoveTo lösbar, sobald die Koordinaten von Hand hinterlegt sind (siehe
+    // SightseeingJumpingPuzzles) - solche Punkte dann hier austragen.
     private static readonly Dictionary<uint, (string De, string En)> SightseeingUnsupportedByAutomation = new()
     {
-        [2162724] = ( // The Carline Canopy
-            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
-            "Not supported by the automation (jumping puzzle) - please visit it manually."),
-        [2162696] = ( // The Leatherworkers' Guild
-            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
-            "Not supported by the automation (jumping puzzle) - please visit it manually."),
-        [2162697] = ( // Apkallu Falls
-            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
-            "Not supported by the automation (jumping puzzle) - please visit it manually."),
-        [2162725] = ( // The Lancers' Guild
-            "Wird von der Automation nicht unterstützt (Jumping Puzzle) - bitte manuell aufsuchen.",
-            "Not supported by the automation (jumping puzzle) - please visit it manually."),
     };
 
     /// <summary>
@@ -6107,10 +6292,20 @@ public sealed class Plugin : IDalamudPlugin
         if (string.IsNullOrEmpty(mountName))
             return false;
 
-        Log.Info($"[MountDebug] Sende '/mount \"{mountName}\"' über SendGameChatCommand (mountId={resolvedMountId}).");
-
+        // Direkt über die Spiel-Aktion (ActionType.Mount + RowId) statt über den Text-Befehl
+        // "/mount <Name>" - eindeutig und unabhängig von Client-Sprache/Schreibweise des Namens (der
+        // Text-Befehl konnte dadurch ein anderes als das eingestellte Mount rufen). Nur falls die
+        // Aktion abgelehnt wird, als Rückfall der Text-Befehl.
         try
         {
+            var actionManager = ActionManager.Instance();
+            if (actionManager != null && actionManager->UseAction(ActionType.Mount, resolvedMountId))
+            {
+                Log.Info($"[MountDebug] Mount-Aktion benutzt (mountId={resolvedMountId}, {mountName}).");
+                return true;
+            }
+
+            Log.Info($"[MountDebug] Mount-Aktion abgelehnt - sende '/mount \"{mountName}\"' (mountId={resolvedMountId}).");
             SendGameChatCommand($"/mount \"{mountName}\"");
         }
         catch (Exception ex)
