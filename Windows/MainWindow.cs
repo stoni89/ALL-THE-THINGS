@@ -47,6 +47,10 @@ public class MainWindow : Window
     // Breite dadurch nicht kleiner wird als vorher.
     private const float ContentRightMargin = 26f;
 
+    // Die Scrollbar der Tab-Inhalte sitzt am rechten Rand des Inhaltsbereichs - um so viel näher an
+    // den Fensterrand gerückt (der Inhaltsbereich wird dafür entsprechend breiter).
+    private const float ScrollbarShiftRight = 12f;
+
     // Kopfzeilen-Bandhöhe und Titel-Skalierung je Zustand (siehe DrawCustomHeader) - eingeklappt
     // bewusst kleiner, damit die Titelleiste dann wirklich kompakt wirkt, statt (wie zuvor) immer
     // gleich hoch zu bleiben und nur das Fenster darunter wegzuschneiden.
@@ -459,7 +463,7 @@ public class MainWindow : Window
 
                 // Mit Scrollbar: erscheint nur, wenn der Inhalt (z.B. lange Blacklist) nach unten
                 // über den sichtbaren Bereich hinausgeht.
-                ImGui.BeginChild("##OptionsContent", new Vector2(-ContentRightMargin, 0f), false);
+                ImGui.BeginChild("##OptionsContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
@@ -468,7 +472,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Blacklist)
             {
-                ImGui.BeginChild("##BlacklistContent", new Vector2(-ContentRightMargin, 0f), false);
+                ImGui.BeginChild("##BlacklistContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawBlacklistPage();
@@ -477,7 +481,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Statistics)
             {
-                ImGui.BeginChild("##StatisticsContent", new Vector2(-ContentRightMargin, 0f), false);
+                ImGui.BeginChild("##StatisticsContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawStatisticsPage();
@@ -486,7 +490,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Dependencies)
             {
-                ImGui.BeginChild("##DependenciesContent", new Vector2(-ContentRightMargin, 0f), false);
+                ImGui.BeginChild("##DependenciesContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawDependenciesPage();
@@ -495,7 +499,7 @@ public class MainWindow : Window
             }
             else
             {
-                ImGui.BeginChild("##AboutContent", new Vector2(-ContentRightMargin, 0f), false);
+                ImGui.BeginChild("##AboutContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawAboutPage();
