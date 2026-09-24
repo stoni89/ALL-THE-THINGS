@@ -202,6 +202,7 @@ public sealed class AetheryteAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
     private DateTime? interactObjectNotFoundSince;
     private DateTime? districtTravelFinishedAt;
     private readonly HashSet<uint> skippedIds = new();
@@ -586,10 +587,11 @@ public sealed class AetheryteAutomation
     {
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
+        var flyingAccepted = false;
 
         if (mounted && Plugin.CanFly)
         {
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, currentArrivalTolerance);
+            accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, currentArrivalTolerance);
             Plugin.Log.Info($"[AetheryteAutomation] BeginPathfind({currentTargetName}): pathfindAndMoveCloseTo(fly=true, tolerance={currentArrivalTolerance}) accepted={accepted}");
         }
 
@@ -609,6 +611,7 @@ public sealed class AetheryteAutomation
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
         stuckDetector.Reset();
+        flightUpgrade.OnPathStarted(flyingAccepted);
         StatusText = Loc.T($"Laufe zu: {currentTargetName}...", $"Walking to: {currentTargetName}...");
     }
 
@@ -762,6 +765,14 @@ public sealed class AetheryteAutomation
             // obwohl er absichtlich abgestiegen ist, um interagieren zu können.
             if (!hasIntentionallyDismounted)
                 Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
+            if (flightUpgrade.ShouldReplanFlying(movingPlayerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand/Kante, vnavmeshs lokale Steuerung kommt nicht
             // weiter) - NICHT dasselbe wie "Distanz zum Ziel nimmt nicht ab" (siehe Kommentar unten,

@@ -79,6 +79,7 @@ public sealed class GoToAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
     private DateTime? districtTravelFinishedAt;
 
     public GoToAutomation()
@@ -153,6 +154,13 @@ public sealed class GoToAutomation
 
     public bool IsNavigatingTo(CollectibleEntry entry) => currentEntryType == entry.Type && currentEntryId == entry.Id;
 
+    // Zuletzt per GoTo angeforderter Eintrag - für NoFlyAreaExit, das einen laufenden Auftrag nach dem
+    // Verlassen eines Flugverbots-Bereichs mit demselben Ziel neu startet.
+    private CollectibleEntry? lastRequestedEntry;
+
+    /// <summary>Der gerade laufende Auftrag (null, wenn keiner läuft).</summary>
+    public CollectibleEntry? ActiveEntry => currentEntryId != null ? lastRequestedEntry : null;
+
     /// <summary>
     /// Startet den Laufauftrag zu diesem Eintrag - bricht dafür zuerst einen eventuell schon
     /// laufenden Auftrag zu einem ANDEREN Eintrag ab (immer nur einer gleichzeitig).
@@ -164,6 +172,7 @@ public sealed class GoToAutomation
 
         Cancel();
 
+        lastRequestedEntry = entry;
         pendingEntry = entry;
         currentEntryId = entry.Id;
         currentEntryType = entry.Type;
@@ -304,12 +313,13 @@ public sealed class GoToAutomation
     {
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
+        var flyingAccepted = false;
 
         // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
         // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
         // sinnlos am Boden herum statt zu laufen.
         if (mounted && Plugin.CanFly)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
+            accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, PathTolerance);
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, PathTolerance);
@@ -325,6 +335,7 @@ public sealed class GoToAutomation
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
         stuckDetector.Reset();
+        flightUpgrade.OnPathStarted(flyingAccepted);
     }
 
     private void UpdateMounting()
@@ -412,6 +423,14 @@ public sealed class GoToAutomation
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
             // erreicht ist, erneut aufsitzen.
             Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
+            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))

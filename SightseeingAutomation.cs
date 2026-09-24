@@ -120,6 +120,7 @@ public sealed class SightseeingAutomation
     private bool hasSeenPathRunning;
     private DateTime lastRemountAttempt = DateTime.MinValue;
     private readonly NavigationStuckDetector stuckDetector = new();
+    private readonly FlightPathUpgrade flightUpgrade = new(); // siehe Plugin.FlightPathUpgrade (Flugverbots-Bereiche)
     private bool hasSentEmote;
     private bool didFinalApproach;
     private DateTime? interWaypointPauseStartedAt;
@@ -256,9 +257,18 @@ public sealed class SightseeingAutomation
     /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Sightseeing-
     /// Einträgen DER AKTUELLEN ZONE aufgerufen werden.
     /// </summary>
-    public void Update(IReadOnlyList<CollectibleEntry> sightseeingInZone)
+    /// <param name="pendingInZone">
+    /// Punkte, die nur wegen Wetter/Uhrzeit gerade nicht erledigbar sind (siehe
+    /// Plugin.IsSightseeingOnlyTemporarilyUnavailable) - solange davon welche übrig sind, wartet die
+    /// Automation im Leerlauf darauf, statt sich zu beenden (AFK-Modus, ausdrücklicher Nutzerwunsch).
+    /// </param>
+    public void Update(IReadOnlyList<CollectibleEntry> sightseeingInZone, IReadOnlyList<CollectibleEntry> pendingInZone)
     {
         if (!IsActive)
+            return;
+
+        // Nach einem Fehler kurz pausieren, dann einfach weitermachen (nie selbst abbrechen).
+        if (DateTime.UtcNow < pausedUntil)
             return;
 
         try
@@ -266,7 +276,7 @@ public sealed class SightseeingAutomation
             switch (state)
             {
                 case State.Idle:
-                    TryStartNext(sightseeingInZone);
+                    TryStartNext(sightseeingInZone, pendingInZone);
                     break;
 
                 case State.WalkingToLocalAethernet:
@@ -300,25 +310,80 @@ public sealed class SightseeingAutomation
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "Fehler bei der Sightseeing-Automation - wird gestoppt.");
-            StatusText = Loc.T("Fehler bei vnavmesh - Automation gestoppt.", "Error talking to vnavmesh - automation stopped.");
-            Stop();
+            // Nicht mehr stoppen (AFK-Modus) - aktuellen Punkt aufgeben, kurz pausieren, dann weiter.
+            Plugin.Log.Error(ex, "Fehler bei der Sightseeing-Automation - pausiere kurz und mache dann weiter.");
+            StatusText = Loc.T("Fehler bei vnavmesh - neuer Versuch in Kürze...", "Error talking to vnavmesh - retrying shortly...");
+            StopPath();
+            currentTargetEntry = null;
+            state = State.Idle;
+            pausedUntil = DateTime.UtcNow + ErrorPauseDuration;
         }
     }
 
+    // Siehe Update - Pause nach einem Fehler, und wann übersprungene Punkte erneut versucht werden.
+    private static readonly TimeSpan ErrorPauseDuration = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan SkippedRetryDelay = TimeSpan.FromSeconds(60);
+    private DateTime pausedUntil = DateTime.MinValue;
+    private DateTime? retrySkippedAt;
+
     private static bool StillNeeded(IReadOnlyList<CollectibleEntry> entries, uint id) => entries.Any(e => e.Id == id);
 
-    private void TryStartNext(IReadOnlyList<CollectibleEntry> entries)
+    private void TryStartNext(IReadOnlyList<CollectibleEntry> entries, IReadOnlyList<CollectibleEntry> pendingInZone)
     {
-        var candidates = entries.Where(e => e.WorldPosition.HasValue && !skippedIds.Contains(e.Id)).ToList();
+        var available = entries.Where(e => e.WorldPosition.HasValue).ToList();
+        var candidates = available.Where(e => !skippedIds.Contains(e.Id)).ToList();
         if (candidates.Count == 0)
         {
-            StatusText = Loc.T(
-                "Keine Sightseeing-Punkte mit bekannter Position mehr in dieser Zone.",
-                "No sightseeing points with a known position left in this zone.");
-            Stop();
+            // Simulation (Testmodus) läuft wie bisher einmal durch und endet dann.
+            var pending = pendingInZone.Where(e => e.WorldPosition.HasValue).ToList();
+            if (Plugin.Instance.Configuration.SimulateSightseeingAutomation || (available.Count == 0 && pending.Count == 0))
+            {
+                // In der Zone ist gar kein Punkt mehr zu erledigen (auch später nicht) - erst jetzt beenden.
+                StatusText = Loc.T(
+                    "Keine Sightseeing-Punkte mehr in dieser Zone zu erledigen.",
+                    "No sightseeing points left to complete in this zone.");
+                Stop();
+                return;
+            }
+
+            // Übersprungene, aber gerade verfügbare Punkte nach einer Pause erneut versuchen (AFK-Modus -
+            // ein einzelner Fehlschlag soll nicht dauerhaft liegen bleiben).
+            if (available.Count > 0)
+            {
+                retrySkippedAt ??= DateTime.UtcNow + SkippedRetryDelay;
+                if (DateTime.UtcNow >= retrySkippedAt.Value)
+                {
+                    Plugin.Log.Info($"[SightseeingAutomation] Versuche {available.Count} übersprungene Punkte erneut.");
+                    retrySkippedAt = null;
+                    skippedIds.Clear();
+                    attemptCounts.Clear();
+                    return;
+                }
+            }
+
+            // Leerlauf: auf den Punkt warten, der als nächstes (Wetter/Uhrzeit) verfügbar wird.
+            var soonest = pending
+                .OrderBy(e => Plugin.GetSightseeingAvailableIn(e) ?? TimeSpan.MaxValue)
+                .FirstOrDefault();
+            if (soonest != null)
+            {
+                var availableIn = Plugin.GetSightseeingAvailableInText(soonest);
+                StatusText = string.IsNullOrEmpty(availableIn)
+                    ? Loc.T($"Warte auf Wetter/Uhrzeit: {soonest.Name}...", $"Waiting for weather/time: {soonest.Name}...")
+                    : Loc.T($"Warte auf Wetter/Uhrzeit: {soonest.Name} (in {availableIn})...", $"Waiting for weather/time: {soonest.Name} (in {availableIn})...");
+            }
+            else
+            {
+                var retryIn = retrySkippedAt.HasValue ? Math.Max(0, (int)(retrySkippedAt.Value - DateTime.UtcNow).TotalSeconds) : 0;
+                StatusText = Loc.T(
+                    $"Warte - übersprungene Punkte werden in {retryIn}s erneut versucht...",
+                    $"Waiting - skipped points will be retried in {retryIn}s...");
+            }
+
             return;
         }
+
+        retrySkippedAt = null;
 
         var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
         var next = candidates.OrderBy(e => Vector3.Distance(playerPos, e.WorldPosition!.Value)).First();
@@ -676,11 +741,17 @@ public sealed class SightseeingAutomation
         // Freischalten (siehe TryRequestWalkOutPath) mountet bewusst ab.
         var mounted = Plugin.Condition[ConditionFlag.Mounted];
         var accepted = false;
+        var flyingAccepted = false;
         if (currentLegAllowsFlying && mounted && Plugin.CanFly)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
+            accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ArrivalTolerance);
+
+        // Teilstücke, die bewusst NICHT geflogen werden (currentLegAllowsFlying = false), nie auf
+        // Fliegen umplanen - gilt für FlightPathUpgrade wie ein bereits fliegender Weg.
+        if (accepted)
+            flightUpgrade.OnPathStarted(flyingAccepted || !currentLegAllowsFlying);
 
         return accepted;
     }
@@ -722,6 +793,14 @@ public sealed class SightseeingAutomation
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
             // erreicht ist, erneut aufsitzen.
             Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
+
+            // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
+            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            {
+                StopPath();
+                BeginPathfind();
+                return;
+            }
 
             // Steckengeblieben (z.B. gegen eine Wand) - Pfad neu anfordern statt untätig zu warten.
             if (stuckDetector.CheckStuck(playerPos))
