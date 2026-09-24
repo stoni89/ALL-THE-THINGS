@@ -179,7 +179,7 @@ public static class ModernUi
     // Deutlich knapper als CardMargin (14, für links/rechts nötig, damit der Kartenhintergrund mit
     // dem eingerückten Inhalt UND der GroupLabel-Überschrift darüber fluchtet) - nur oben/unten gab
     // es keinen Grund für denselben großzügigen Wert, das ließ jede Karte unnötig hoch wirken.
-    private const float CardVerticalPadding = 10f;
+    public const float CardVerticalPadding = 10f;
 
     // Abstand NACH einer Karte (bis zur nächsten Überschrift/Karte) - bewusst eigener, größerer Wert
     // statt CardVerticalPadding wiederzuverwenden: CardVerticalPadding bestimmt zusätzlich die

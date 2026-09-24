@@ -387,7 +387,7 @@ public sealed class ChocobokeepAutomation
             return;
         }
 
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
             SkipCurrent(Loc.T("Laufweg nie gestartet", "Movement never started"));
     }
 

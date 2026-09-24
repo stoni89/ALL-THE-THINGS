@@ -519,7 +519,7 @@ public sealed class SightseeingAutomation
         // Angekommen (oder nie richtig losgelaufen, siehe PathStartGracePeriod) - jetzt den
         // Aethernetz-Sprung probieren. Ist man doch noch zu weit vom Kristall weg, lehnt Lifestream
         // selbst ab und TryTravelToDistrict fällt auf den bezahlten Teleport zurück.
-        if (hasSeenPathRunning || DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (hasSeenPathRunning || Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
             TryTravelToDistrict(currentTargetEntry);
     }
 
@@ -820,7 +820,7 @@ public sealed class SightseeingAutomation
             return;
         }
 
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
             SkipCurrent(Loc.T("Laufweg nie gestartet", "Movement never started"));
     }
 
@@ -995,14 +995,14 @@ public sealed class SightseeingAutomation
         // Noch nie sichtbar losgelaufen - z.B. weil der Charakter gerade erst nach dem Abmounten
         // fällt/landet und vnavmesh den Laufweg deshalb zunächst ablehnt. Innerhalb der Anlaufzeit in
         // kurzen Abständen erneut versuchen, statt sofort aufzugeben.
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
         {
             state = State.WaitingForUnlock;
             stateEnteredAt = DateTime.UtcNow;
             return;
         }
 
-        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval)
+        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval && !Plugin.IsVnavPathfindInProgress())
         {
             lastPathRetryAt = DateTime.UtcNow;
             pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ExactPositionTolerance);
@@ -1121,13 +1121,13 @@ public sealed class SightseeingAutomation
         // (erhöhten) Punkt gerade erst landet/fällt und vnavmesh den Laufweg deshalb zunächst
         // ablehnt. Innerhalb der Anlaufzeit (PathStartGracePeriod) in kurzen Abständen erneut
         // versuchen, statt sofort aufzugeben und (fälschlich) direkt zum nächsten Punkt weiterzuziehen.
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
         {
             FinishCurrent();
             return;
         }
 
-        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval)
+        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval && !Plugin.IsVnavPathfindInProgress())
             TryRequestWalkOutPath();
     }
 

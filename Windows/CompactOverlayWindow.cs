@@ -284,13 +284,19 @@ public class CompactOverlayWindow : Window
             // nur in genau dieser einen Zone, nicht stadtweit wie Aetheryten/Quest-NPCs.
             .Concat(plugin.GetHuntingLogEntries(currentTerritoryId))
             .Where(e => siblingTerritories.Contains(e.TerritoryTypeId))
+            // Blacklist (siehe Plugin.IsBlacklisted) ganz vorne - ALLES Weitere (Anzeige UND alle
+            // Automationen, die ihre Listen hieraus ableiten) sieht diese Einträge gar nicht erst.
+            .Where(e => !Plugin.IsBlacklisted(e))
             // Bei deaktiviertem "Alle Gegenstände anzeigen" (Configuration.ShowAllItems, siehe
             // MainWindow-Einstellungen) Einträge ausblenden, die nur durch eine noch nicht erreichte
             // Errungenschaft/einen noch nicht freigeschalteten Rang ODER (siehe
             // ComputeGrandCompanyOrTribeGateReason) ein gerade nicht laufendes Saisonevent erreichbar
             // sind (siehe Plugin.AchievementOrRankGatedItems) - bei aktiviertem Schalter bleiben sie
             // sichtbar, aber mit der "Bedingung nicht erfüllt"-Markierung (siehe weiter unten).
-            .Where(e => config.ShowAllItems || !Plugin.IsAchievementOrRankGated(e))
+            // Hunting-Log-Ziele höherer, noch nicht erreichter Rang-Stufen (siehe
+            // CollectibleEntry.HuntingLogRequiredRank) bleiben IMMER sichtbar (mit Markierung) -
+            // ausdrücklicher Nutzerwunsch, als Vorschau auf das, was noch kommt.
+            .Where(e => config.ShowAllItems || e.Type == CollectibleType.HuntingLog || !Plugin.IsAchievementOrRankGated(e))
             .ToList();
 
         var afterTypeFilter = allForZone
@@ -343,7 +349,7 @@ public class CompactOverlayWindow : Window
         // Bewusst NICHT stadtweit wie Aetheryten/Quests - Hunting-Log-Monster gibt es nur in genau
         // dieser einen Zone (siehe Plugin.GetHuntingLogEntries), kein Bezirkswechsel nötig/möglich.
         var missingHuntingLogInZone = allForZone
-            .Where(e => e.Type == CollectibleType.HuntingLog)
+            .Where(e => e.Type == CollectibleType.HuntingLog && !Plugin.IsAchievementOrRankGated(e)) // Kills zählen erst ab erreichter Rang-Stufe
             .ToList();
         plugin.HuntingLogAutomation.Update(missingHuntingLogInZone);
 
@@ -372,6 +378,7 @@ public class CompactOverlayWindow : Window
         // Fliegen kann vnavmesh die Punkte ohnehin nicht zuverlässig erreichen.
         var missingSightseeingInZone = plugin.GetLiveZoneEntries(effectiveTerritoryId)
             .Where(e => e.Type == CollectibleType.Sightseeing && siblingTerritories.Contains(e.TerritoryTypeId))
+            .Where(e => !Plugin.IsBlacklisted(e)) // nicht aus allForZone abgeleitet, daher hier eigens
             .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id) && !Plugin.IsSightseeingBlockedByFlying(e))
             .Where(e => config.SimulateSightseeingAutomation || (!plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e)))
             .ToList();
@@ -707,7 +714,8 @@ public class CompactOverlayWindow : Window
 
             // Nur sichtbar, wenn "Alle Gegenstände anzeigen" aktiviert ist (siehe Filter weiter oben
             // in DrawContent) - bei deaktiviertem Schalter tauchen diese Einträge gar nicht erst in
-            // der Liste auf, dieser Hinweis wäre dann redundant.
+            // der Liste auf, dieser Hinweis wäre dann redundant. Ausnahme: Hunting-Log-Ziele höherer
+            // Rang-Stufen, die immer angezeigt werden (siehe Filter in DrawContent).
             if (Plugin.IsAchievementOrRankGated(entry))
             {
                 ImGui.SameLine();
@@ -715,10 +723,10 @@ public class CompactOverlayWindow : Window
                 if (Plugin.IsSightseeingBlockedByFlying(entry))
                 {
                     // Explizite Nutzeranforderung: das Sightseeing-Feature soll nur mit
-                    // freigeschaltetem Fliegen funktionieren - eigener, spezifischer Hinweistext
-                    // statt des generischen Labels, hat Vorrang vor der Jumping-Puzzle-Sonderbehandlung
-                    // unten (siehe Plugin.ComputeGrandCompanyOrTribeGateReason-Reihenfolge).
-                    OutlineText(Loc.T("(Bedingung nicht erfüllt (Fliegen nicht freigeschaltet))", "(condition not met (flying not unlocked))"), UnsupportedColor);
+                    // freigeschaltetem Fliegen funktionieren - generisches Label, der Grund steht im
+                    // Tooltip. Hat Vorrang vor der Jumping-Puzzle-Sonderbehandlung unten (siehe
+                    // Plugin.ComputeGrandCompanyOrTribeGateReason-Reihenfolge).
+                    OutlineText(Loc.T("(Bedingung nicht erfüllt)", "(condition not met)"), UnsupportedColor);
                     if (ImGui.IsItemHovered())
                         ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
                 }
@@ -835,9 +843,20 @@ public class CompactOverlayWindow : Window
     /// </summary>
     private void DrawCurrencyWallet(List<CollectibleEntry> entries)
     {
-        var currencies = entries
-            .Where(e => e.CurrencyItemId != 0)
-            .GroupBy(e => e.CurrencyItemId)
+        // Alle Kosten eines Eintrags, nicht nur die erste Währung - sonst fehlten zusätzlich
+        // verlangte Währungen (CollectibleEntry.AdditionalCurrencies, z.B. "Uolon Horn Token" neben den
+        // Irregular Tomestones beim Itinerant Moogle) komplett in dieser Liste.
+        var allCosts = entries
+            .SelectMany(e => new[]
+                {
+                    new CollectibleCurrency { Currency = e.Currency, CurrencyIconId = e.CurrencyIconId, CurrencyItemId = e.CurrencyItemId, CurrencyAmount = e.CurrencyAmount },
+                }
+                .Concat(e.AdditionalCurrencies ?? Enumerable.Empty<CollectibleCurrency>()))
+            .Where(c => c.CurrencyItemId != 0)
+            .ToList();
+
+        var currencies = allCosts
+            .GroupBy(c => c.CurrencyItemId)
             .Select(g => g.First())
             .ToList();
 
@@ -881,7 +900,7 @@ public class CompactOverlayWindow : Window
         foreach (var sample in currencies)
         {
             var amount = showCurrencyCostMode
-                ? (uint)entries.Where(e => e.CurrencyItemId == sample.CurrencyItemId).Sum(e => (long)e.CurrencyAmount)
+                ? (uint)allCosts.Where(c => c.CurrencyItemId == sample.CurrencyItemId).Sum(c => (long)c.CurrencyAmount)
                 : plugin.GetCurrencyAmount(sample.CurrencyItemId);
             var label = GetCurrencyLabel(sample.Currency);
             var text = $"{amount.ToString("N0", CultureInfo.InvariantCulture)} {label}";
@@ -1117,6 +1136,23 @@ public class CompactOverlayWindow : Window
     /// Instanz-Inhalt befindet (siehe Plugin.IsInInstancedContent) - dort funktionieren vnavmesh/
     /// die angesteuerten Fremdplugins ohnehin nicht sinnvoll.
     /// </summary>
+    private static string OtherAutomationActiveTooltip => Loc.T(
+        "Es läuft bereits eine andere Automation - erst diese stoppen.",
+        "Another automation is already running - stop it first.");
+
+    /// <summary>
+    /// Ob gerade eine ANDERE als die übergebene Automation läuft - es darf immer nur eine
+    /// gleichzeitig laufen (sie steuern alle dieselben Fremdplugins/dieselbe Bewegung an), daher
+    /// werden die Start-Knöpfe aller übrigen solange ausgegraut.
+    /// </summary>
+    private bool IsOtherAutomationActive(object self) =>
+        (plugin.QuestAutomation.IsActive && !ReferenceEquals(self, plugin.QuestAutomation))
+        || (plugin.AetheryteAutomation.IsActive && !ReferenceEquals(self, plugin.AetheryteAutomation))
+        || (plugin.HuntingLogAutomation.IsActive && !ReferenceEquals(self, plugin.HuntingLogAutomation))
+        || (plugin.AetherCurrentAutomation.IsActive && !ReferenceEquals(self, plugin.AetherCurrentAutomation))
+        || (plugin.SightseeingAutomation.IsActive && !ReferenceEquals(self, plugin.SightseeingAutomation))
+        || (plugin.ChocobokeepAutomation.IsActive && !ReferenceEquals(self, plugin.ChocobokeepAutomation));
+
     private static string InstancedContentTooltip => Loc.T(
         "In Instanz-Inhalten (Dungeon, Trial, Raid, ...) nicht verfügbar.",
         "Not available in instanced content (dungeon, trial, raid, ...).");
@@ -1146,7 +1182,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts sinnvoll zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!hasActionableQuests || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableQuests || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Quest]);
         if (isDisabled)
@@ -1162,6 +1199,8 @@ public class CompactOverlayWindow : Window
                 ? MissingPluginTooltip
                 : inInstancedContent
                     ? InstancedContentTooltip
+                    : otherAutomationActive
+                        ? OtherAutomationActiveTooltip
                     : isDisabled
                         ? Loc.T("Keine von Questionable unterstützten Quests in dieser Zone.", "No quests supported by Questionable in this zone.")
                         : automation.IsActive
@@ -1214,7 +1253,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!hasActionableAetherytes || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableAetherytes || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Aetheryte]);
         if (isDisabled)
@@ -1230,6 +1270,8 @@ public class CompactOverlayWindow : Window
                 ? MissingPluginTooltip
                 : inInstancedContent
                     ? InstancedContentTooltip
+                    : otherAutomationActive
+                        ? OtherAutomationActiveTooltip
                     : isDisabled
                         ? Loc.T("Keine fehlenden Aetheryten/Kristalle in dieser Zone.", "No missing aetherytes/crystals in this zone.")
                         : automation.IsActive
@@ -1260,9 +1302,12 @@ public class CompactOverlayWindow : Window
     /// Knopf, der die Hunting-Log-Kill-Automation (siehe HuntingLogAutomation.cs) für die aktuell
     /// fehlenden Ziele (aktive Klasse/aktiver Rang) dieser Zone an-/ausschaltet. Braucht zum Laufen
     /// zwingend vnavmesh - fehlt es, wird das per Tooltip erklärt statt der Knopf einfach nichts zu
-    /// tun. RotationSolver Reborn wird zum Kämpfen nur per Chat-Befehl/Best-Effort-IPC angesteuert
-    /// (siehe HuntingLogAutomation.IsRotationSolverAvailable), ist also kein hartes Gate mehr.
+    /// tun. Gekämpft wird mit dem gewählten Kampf-Plugin (siehe CombatPluginBridge) - das ist über
+    /// MainWindow.HasMissingRequiredDependency (Gruppe "mindestens eines") abgesichert.
     /// </summary>
+    private static string CombatPluginNameForTooltip =>
+        CombatPluginBridge.GetEffective() is { } kind ? CombatPluginBridge.DisplayName(kind) : "RotationSolver Reborn / Wrath Combo";
+
     private void DrawHuntingLogAutomationButton(bool hasActionableHuntingLog)
     {
         var automation = plugin.HuntingLogAutomation;
@@ -1283,7 +1328,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!hasActionableHuntingLog || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableHuntingLog || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.HuntingLog]);
         if (isDisabled)
@@ -1299,6 +1345,8 @@ public class CompactOverlayWindow : Window
                 ? MissingPluginTooltip
                 : inInstancedContent
                     ? InstancedContentTooltip
+                    : otherAutomationActive
+                        ? OtherAutomationActiveTooltip
                     : isDisabled
                         ? Loc.T(
                             "Keine Hunting-Log-Ziele mit bekannter Position in dieser Zone.",
@@ -1308,8 +1356,8 @@ public class CompactOverlayWindow : Window
                             "Stoppt die Automation - ein laufender Kampf wird noch zu Ende gebracht, statt den Charakter wehrlos stehen zu lassen.",
                             "Stops the automation - an ongoing fight is finished first instead of leaving the character defenseless.")
                         : Loc.T(
-                            "Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit RotationSolver Reborn.",
-                            "Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with RotationSolver Reborn."));
+                            $"Läuft mit vnavmesh nacheinander alle fehlenden Hunting-Log-Ziele ab und tötet sie mit {CombatPluginNameForTooltip}.",
+                            $"Uses vnavmesh to walk to all missing hunting log targets, one by one, and kills them with {CombatPluginNameForTooltip}."));
         }
 
         if (!clicked)
@@ -1354,7 +1402,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!hasActionableAetherCurrents || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableAetherCurrents || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.AetherCurrent]);
         if (isDisabled)
@@ -1370,6 +1419,8 @@ public class CompactOverlayWindow : Window
                 ? MissingPluginTooltip
                 : inInstancedContent
                     ? InstancedContentTooltip
+                    : otherAutomationActive
+                        ? OtherAutomationActiveTooltip
                     : isDisabled
                         ? Loc.T(
                             "Keine Ätherströmungen mit bekannter Position in dieser Zone.",
@@ -1427,7 +1478,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!logUnlocked || !hasActionableSightseeing || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!logUnlocked || !hasActionableSightseeing || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Sightseeing]);
         if (isDisabled)
@@ -1445,6 +1497,8 @@ public class CompactOverlayWindow : Window
                     ? MissingPluginTooltip
                     : inInstancedContent
                         ? InstancedContentTooltip
+                        : otherAutomationActive
+                            ? OtherAutomationActiveTooltip
                         : isDisabled
                             ? Loc.T(
                                 "Aktuell kein Sightseeing-Punkt in dieser Zone erreichbar (keine bekannte Position, oder Wetter/Uhrzeit passt gerade nicht).",
@@ -1498,7 +1552,8 @@ public class CompactOverlayWindow : Window
         // bleiben, auch falls die Liste inzwischen (kurz) leer aussieht. Fehlt ein Plugin, gibt es
         // aber unabhängig davon nichts zu starten, also trotzdem ausgrauen.
         var inInstancedContent = Plugin.IsInInstancedContent();
-        var isDisabled = !automation.IsActive && (!hasActionableChocobokeeps || hasMissingPlugin || inInstancedContent);
+        var otherAutomationActive = IsOtherAutomationActive(automation);
+        var isDisabled = !automation.IsActive && (!hasActionableChocobokeeps || hasMissingPlugin || inInstancedContent || otherAutomationActive);
 
         PushAutomationButtonColors(automation.IsActive, TypeColors[CollectibleType.Chocobokeep]);
         if (isDisabled)
@@ -1514,6 +1569,8 @@ public class CompactOverlayWindow : Window
                 ? MissingPluginTooltip
                 : inInstancedContent
                     ? InstancedContentTooltip
+                    : otherAutomationActive
+                        ? OtherAutomationActiveTooltip
                     : isDisabled
                         ? Loc.T(
                             "Keine noch nicht besuchten Chocobokeeps in dieser Zone.",
@@ -1547,30 +1604,33 @@ public class CompactOverlayWindow : Window
         var affordable = plugin.CanAfford(entry);
         var allaganToolsEnabled = plugin.Configuration.EnableAllaganToolsIntegration
                                    && Plugin.IsAllaganToolsAvailable()
-                                   && AllaganToolsEligibleTypes.Contains(entry.Type);
+                                   && AllaganToolsEligibleTypes.Contains(entry.Type)
+                                   // Rahmen/Frisuren tragen nicht den Item-Namen - ohne auflösbares
+                                   // Freischalt-Item (z.B. Rahmen per Errungenschaft) fände Allagan Tools nichts.
+                                   && (entry.Type is not (CollectibleType.FrameKit or CollectibleType.Hairstyle) || Plugin.HasUnlockItem(entry));
 
         // Sowohl Kartenkoordinaten-Einträge (Händler/Aetheryten/Quest-NPCs) als auch Hunting-Log-
         // Monster mit bekannter Weltposition (siehe WorldPosition) bekommen denselben klickbaren
         // "Auf Karte anzeigen"-Namen - siehe Plugin.OpenEntryMap, das beide Positionsarten
         // einheitlich behandelt. Das "Hinlaufen"-Icon selbst sitzt nicht mehr hier, sondern ganz
         // vorne in der Zeile (siehe DrawGoToColumn).
+        var allaganToolsHint = Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)");
+        var blacklistHint = Loc.T("STRG + SHIFT + Klick: Auf die Blacklist setzen (ausblenden)", "CTRL + SHIFT + click: add to the blacklist (hide)");
+
         if (!entry.HasGoToTarget)
         {
             OutlineText(entry.Name, isNotYetPossible ? NotYetPossibleColor : affordable ? AffordableColor : NormalColor);
 
-            // Ohne Kartenziel normalerweise gar nicht interaktiv - außer für SHIFT + Linksklick
-            // (Allagan Tools, siehe Plugin.OpenAllaganToolsItemInfo), falls aktiviert.
-            if (allaganToolsEnabled)
+            // Ohne Kartenziel sonst nicht interaktiv - außer für SHIFT + Klick (Allagan Tools, falls
+            // aktiviert) und STRG + SHIFT + Klick (Blacklist, immer).
+            if (ImGui.IsItemHovered())
             {
-                if (ImGui.IsItemHovered())
-                {
-                    ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-                    ImGui.SetTooltip(Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)"));
-                }
-
-                if (ImGui.IsItemClicked() && ImGui.GetIO().KeyShift)
-                    Plugin.OpenAllaganToolsItemInfo(entry.Name);
+                ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+                ImGui.SetTooltip(allaganToolsEnabled ? $"{allaganToolsHint}\n{blacklistHint}" : blacklistHint);
             }
+
+            if (ImGui.IsItemClicked())
+                HandleModifierClick(entry, allaganToolsEnabled);
 
             return;
         }
@@ -1583,17 +1643,35 @@ public class CompactOverlayWindow : Window
                 ? Loc.T("Auf Karte anzeigen", "Show on map")
                 : Loc.T($"Bei {entry.Vendor} - Auf Karte anzeigen", $"From {entry.Vendor} - show on map");
             ImGui.SetTooltip(allaganToolsEnabled
-                ? $"{mapTooltip}\n{Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)")}"
-                : mapTooltip);
+                ? $"{mapTooltip}\n{allaganToolsHint}\n{blacklistHint}"
+                : $"{mapTooltip}\n{blacklistHint}");
         }
 
-        if (ImGui.IsItemClicked())
+        if (ImGui.IsItemClicked() && !HandleModifierClick(entry, allaganToolsEnabled))
+            Plugin.OpenEntryMap(entry);
+    }
+
+    /// <summary>
+    /// STRG + SHIFT + Klick: auf die Blacklist (siehe Plugin.AddToBlacklist) - hat Vorrang vor
+    /// SHIFT + Klick (Allagan Tools), da beide SHIFT enthalten. true, wenn der Klick damit behandelt
+    /// ist (kein normaler Klick mehr, z.B. "Auf Karte anzeigen").
+    /// </summary>
+    private static bool HandleModifierClick(CollectibleEntry entry, bool allaganToolsEnabled)
+    {
+        var io = ImGui.GetIO();
+        if (io.KeyCtrl && io.KeyShift)
         {
-            if (allaganToolsEnabled && ImGui.GetIO().KeyShift)
-                Plugin.OpenAllaganToolsItemInfo(entry.Name);
-            else
-                Plugin.OpenEntryMap(entry);
+            Plugin.AddToBlacklist(entry);
+            return true;
         }
+
+        if (io.KeyShift && allaganToolsEnabled)
+        {
+            Plugin.OpenAllaganToolsItemInfo(entry);
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1793,7 +1871,7 @@ public class CompactOverlayWindow : Window
     private static readonly Vector4 NotYetPossibleColor = new(0.5f, 0.5f, 0.5f, 1f);
     private static readonly Vector4 GoToActiveColor = new(1f, 0.65f, 0.2f, 1f);
 
-    private static readonly Dictionary<CollectibleType, Vector4> TypeColors = new()
+    internal static readonly Dictionary<CollectibleType, Vector4> TypeColors = new() // internal: auch für die Blacklist-Seite im Hauptmenü
     {
         [CollectibleType.Mount] = new(0.85f, 0.45f, 0.05f, 1f),
         [CollectibleType.Minion] = new(0.75f, 0.6f, 1f, 1f),
@@ -1816,9 +1894,9 @@ public class CompactOverlayWindow : Window
     // Typen, deren Name tatsächlich einem echten Item-Sheet-Eintrag entspricht, den Allagan Tools'
     // "/moreinfo"-Befehl (siehe Plugin.OpenAllaganToolsItemInfo) per Namenssuche finden kann - für
     // SHIFT + Linksklick (siehe DrawClickableName/DrawCurrencyRequirement). Quest/Sightseeing/
-    // Aetheryte/HuntingLog/AetherCurrent/Chocobokeep sind keine Items, und FrameKit/Hairstyle tragen
-    // nur den Namen des Rahmens/der Frisur, nicht des freischaltenden Items - für all diese würde
-    // die Namenssuche ohnehin nur "nicht gefunden" liefern.
+    // Aetheryte/HuntingLog/AetherCurrent/Chocobokeep sind keine Items. FrameKit/Hairstyle tragen zwar
+    // nur den Namen des Rahmens/der Frisur, werden aber über Plugin.ResolveUnlockItemId auf das
+    // freischaltende Item (Framer's Kit bzw. "Modern Aesthetics"-Buch) aufgelöst (siehe DrawClickableName).
     private static readonly HashSet<CollectibleType> AllaganToolsEligibleTypes = new()
     {
         CollectibleType.Mount,
@@ -1829,6 +1907,8 @@ public class CompactOverlayWindow : Window
         CollectibleType.Facewear,
         CollectibleType.FashionAccessory,
         CollectibleType.TripleTriadCard,
+        CollectibleType.FrameKit,
+        CollectibleType.Hairstyle,
     };
 
     private static readonly Vector2[] ShadowOffsets =

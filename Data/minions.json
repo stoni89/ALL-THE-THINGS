@@ -20,16 +20,17 @@
         "Name":  "Laudouble",
         "Type":  "Minion",
         "Category":  "Errungenschaft",
-        "TerritoryTypeId":  0,
-        "MapId":  0,
-        "Vendor":  "",
-        "VendorMapX":  0,
-        "VendorMapY":  0,
+        "TerritoryTypeId":  148,
+        "MapId":  4,
+        "Vendor":  "Kornago Merchant",
+        "VendorMapX":  21.9,
+        "VendorMapY":  22.7,
         "Currency":  "",
         "CurrencyIconId":  0,
         "CurrencyItemId":  0,
         "CurrencyAmount":  0,
-        "Source":  "Kornago Merchant - Bentbranch Meadows (Requires Achievement \"Crucible Reforged II\")"
+        "Source":  "Kornago Merchant - Bentbranch Meadows",
+        "RequiredAchievement":  "Crucible Reforged II"
     },
     {
         "Id":  592,

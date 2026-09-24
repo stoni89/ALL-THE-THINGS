@@ -19,6 +19,7 @@ public class MainWindow : Window
     private enum RailPage
     {
         Settings,
+        Blacklist,
         Statistics,
         Dependencies,
         About,
@@ -390,6 +391,9 @@ public class MainWindow : Window
             if (ModernUi.RailButton(FontAwesomeIcon.SlidersH, railPage == RailPage.Settings, Loc.T("Einstellungen", "Settings")))
                 railPage = RailPage.Settings;
             ImGui.Spacing();
+            if (ModernUi.RailButton(FontAwesomeIcon.Ban, railPage == RailPage.Blacklist, Loc.T("Blacklist", "Blacklist")))
+                railPage = RailPage.Blacklist;
+            ImGui.Spacing();
             if (ModernUi.RailButton(FontAwesomeIcon.ChartBar, railPage == RailPage.Statistics, Loc.T("Statistik", "Statistics")))
                 railPage = RailPage.Statistics;
             ImGui.Spacing();
@@ -446,6 +450,15 @@ public class MainWindow : Window
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
+                ImGui.Unindent(4f);
+                ImGui.EndChild();
+            }
+            else if (railPage == RailPage.Blacklist)
+            {
+                ImGui.BeginChild("##BlacklistContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.Spacing();
+                ImGui.Indent(4f);
+                DrawBlacklistPage();
                 ImGui.Unindent(4f);
                 ImGui.EndChild();
             }
@@ -599,7 +612,8 @@ public class MainWindow : Window
         var drawList = ImGui.GetWindowDrawList();
         var textColor = ImGui.GetColorU32(ImGuiCol.Text);
 
-        const float gap = 8f;
+        // Ohne Text (reiner Icon-Knopf, siehe DrawDependencyCard) kein Abstand, sonst säße das Icon nicht mittig.
+        var gap = string.IsNullOrEmpty(text) ? 0f : 8f;
         string iconGlyph;
         Vector2 iconSize;
         using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
@@ -625,7 +639,7 @@ public class MainWindow : Window
         using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
             iconWidth = ImGui.CalcTextSize(icon.ToIconString()).X;
         var textSize = ImGui.CalcTextSize(text);
-        const float gap = 8f;
+        var gap = string.IsNullOrEmpty(text) ? 0f : 8f;
         return new Vector2(iconWidth + gap + textSize.X + padding.X * 2f, textSize.Y + padding.Y * 2f);
     }
 
@@ -905,6 +919,12 @@ public class MainWindow : Window
 
         ModernUi.GroupLabel(Loc.T("Automation", "Automation"));
         ModernUi.BeginCard();
+        DrawCombatPluginPicker(config);
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         DrawAetheryteMountPicker(config);
 
         ImGui.Spacing();
@@ -913,6 +933,72 @@ public class MainWindow : Window
 
         DrawChocoboCompanionSettings(config);
         ModernUi.EndCard();
+    }
+
+    /// <summary>
+    /// Auswahl des Kampf-Plugins (siehe Configuration.CombatPlugin/CombatPluginBridge) - nur
+    /// tatsächlich installierte Plugins sind wählbar. Ist nur eines installiert, steht es fest
+    /// eingetragen (Auswahl ausgegraut), ist keines installiert, verweist der Tooltip auf die
+    /// Plugins-Seite.
+    /// </summary>
+    private static void DrawCombatPluginPicker(Configuration config)
+    {
+        Plugin.EnsureCombatPluginDefault();
+        var installed = CombatPluginBridge.GetInstalled();
+        var effective = CombatPluginBridge.GetEffective();
+
+        ModernUi.LabelRow(Loc.T("Kampf-Plugin", "Combat plugin"), 280f, Loc.T(
+            "Welches Plugin bei der Hunting-Log-Automation (und kampfpflichtigen Quest-Schritten) den Kampf übernimmt.",
+            "Which plugin handles combat during the hunting log automation (and combat-required quest steps)."));
+
+        var pickerEnabled = installed.Count > 1;
+        if (!pickerEnabled)
+            ImGui.BeginDisabled();
+
+        var currentLabel = effective is { } current
+            ? CombatPluginBridge.DisplayName(current)
+            : Loc.T("Keines installiert", "None installed");
+        if (ImGui.BeginCombo("##CombatPlugin", currentLabel))
+        {
+            foreach (var kind in Enum.GetValues<CombatPluginKind>())
+            {
+                var isInstalled = installed.Contains(kind);
+                if (!isInstalled)
+                    ImGui.BeginDisabled();
+
+                if (ImGui.Selectable(CombatPluginBridge.DisplayName(kind), effective == kind) && isInstalled && config.CombatPlugin != kind)
+                {
+                    // Das bisher genutzte Plugin nicht einfach weiterlaufen lassen (siehe CombatPluginBridge.SetCombatMode(false)).
+                    Plugin.CombatPlugin.SetCombatMode(false);
+                    config.CombatPlugin = kind;
+                    config.Save();
+                }
+
+                if (!isInstalled)
+                {
+                    ImGui.EndDisabled();
+                    if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                        ImGui.SetTooltip(Loc.T("Nicht installiert - siehe Plugins-Seite.", "Not installed - see the Plugins page."));
+                }
+            }
+
+            ImGui.EndCombo();
+        }
+
+        if (!pickerEnabled)
+        {
+            ImGui.EndDisabled();
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            {
+                ImGui.SetTooltip(installed.Count == 0
+                    ? Loc.T(
+                        "Kein Kampf-Plugin installiert (RotationSolver Reborn oder Wrath Combo) - siehe Plugins-Seite.",
+                        "No combat plugin installed (RotationSolver Reborn or Wrath Combo) - see the Plugins page.")
+                    : Loc.T(
+                        $"Nur {currentLabel} ist installiert und wird automatisch genutzt.",
+                        $"Only {currentLabel} is installed and is used automatically."));
+            }
+        }
     }
 
     /// <summary>
@@ -1376,32 +1462,41 @@ public class MainWindow : Window
         }
     }
 
-    private static readonly (string InternalName, string DisplayName, string DescriptionDe, string DescriptionEn, bool Required)[] Dependencies =
+    // Group: Plugins derselben Gruppe sind gegeneinander austauschbar - "Required" ist dann schon
+    // erfüllt, sobald EINES davon installiert ist (siehe IsDependencySatisfied), z.B. die beiden
+    // Kampf-Plugins (siehe CombatPluginBridge).
+    private const string CombatDependencyGroup = "Combat";
+
+    private static readonly (string InternalName, string DisplayName, string DescriptionDe, string DescriptionEn, bool Required, string? Group)[] Dependencies =
     {
+        (CombatPluginBridge.RotationSolverInternalName, "RotationSolver Reborn",
+            "Kampf-Plugin: übernimmt den Kampf bei der Hunting-Log-Kill-Automation und bei kampfpflichtigen Schritten während der Quest-Automation. Alternativ zu Wrath Combo - eines der beiden wird benötigt.",
+            "Combat plugin: drives combat for the hunting log kill automation and for combat-required steps during the quest automation. Alternative to Wrath Combo - one of the two is required.",
+            true, CombatDependencyGroup),
+        (CombatPluginBridge.WrathComboInternalName, "Wrath Combo",
+            "Kampf-Plugin: übernimmt den Kampf bei der Hunting-Log-Kill-Automation und bei kampfpflichtigen Schritten während der Quest-Automation. Alternativ zu RotationSolver Reborn - eines der beiden wird benötigt.",
+            "Combat plugin: drives combat for the hunting log kill automation and for combat-required steps during the quest automation. Alternative to RotationSolver Reborn - one of the two is required.",
+            true, CombatDependencyGroup),
         ("vnavmesh", "vnavmesh",
             "Für das Laufen bei allen Automationen (Aetheryte, Quest, Hunting Log, \"Hinlaufen\").",
             "For pathfinding/walking in every automation (aetheryte, quest, hunting log, \"go to\").",
-            true),
+            true, null),
         ("Questionable", "Questionable",
             "Lässt die Quest-Automation Quests automatisch annehmen und abschließen.",
             "Drives the quest automation to accept and complete quests automatically.",
-            true),
+            true, null),
         ("Lifestream", "Lifestream",
             "Für Reisen zwischen Bezirken einer geteilten Hauptstadt während der Automation.",
             "For traveling between districts of a split capital city during automation.",
-            true),
-        ("RotationSolver", "RotationSolver Reborn",
-            "Übernimmt den Kampf bei der Hunting-Log-Kill-Automation und bei kampfpflichtigen Schritten während der Quest-Automation.",
-            "Drives combat for the hunting log kill automation and for combat-required steps during the quest automation.",
-            true),
+            true, null),
         ("TextAdvance", "TextAdvance",
             "Klickt automatisch durch Dialoge/Cutscenes während der Quest-Automation.",
             "Automatically clicks through dialogue/cutscenes during the quest automation.",
-            true),
+            true, null),
         ("InventoryTools", "Allagan Tools",
-            "Optional - für \"SHIFT + Linksklick\" auf Items/Währungen im Overlay, siehe die Einstellung \"Allagan-Tools-Integration aktivieren\" unter Allgemein > QoL.",
-            "Optional - for \"SHIFT + left-click\" on items/currencies in the overlay, see the \"Enable Allagan Tools integration\" setting under General > QoL.",
-            false),
+            "Aktiviert die Allagan-Tools-Integration für dieses Plugin.",
+            "Enable Allagan Tools Integration for this Plugin.",
+            false, null),
     };
 
     /// <summary>
@@ -1413,7 +1508,16 @@ public class MainWindow : Window
     /// nicht pro Knopf einzeln nachvollzogen werden muss, welches Plugin wofür gebraucht wird.
     /// </summary>
     internal static bool HasMissingRequiredDependency() =>
-        Dependencies.Any(d => d.Required && !Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded));
+        Dependencies.Any(d => d.Required && !IsDependencySatisfied(d.InternalName, d.Group));
+
+    private static bool IsPluginLoaded(string internalName) =>
+        Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == internalName && p.IsLoaded);
+
+    /// <summary>Installiert - oder (bei einer Gruppe, siehe CombatDependencyGroup) ein anderes Plugin derselben Gruppe.</summary>
+    private static bool IsDependencySatisfied(string internalName, string? group) =>
+        group == null
+            ? IsPluginLoaded(internalName)
+            : Dependencies.Any(d => d.Group == group && IsPluginLoaded(d.InternalName));
 
     // Nur die Typen, die als globale (zonenunabhängige) Liste über CollectionData.GetAllEntries
     // verfügbar sind - Quest/Aetheryte/HuntingLog/Sightseeing werden nur pro Zone live berechnet
@@ -1438,6 +1542,149 @@ public class MainWindow : Window
         ImGui.PopStyleColor();
     }
 
+    // Nur für die Blacklist-Seite (siehe DrawBlacklistPage) - Sitzungszustand, nicht gespeichert.
+    private string blacklistSearch = string.Empty;
+    private readonly HashSet<CollectibleType> blacklistHiddenTypes = new();
+
+    /// <summary>
+    /// Verwaltung der Blacklist (siehe Configuration.Blacklist/Plugin.IsBlacklisted): Einträge werden
+    /// im Overlay per STRG + SHIFT + Klick hinzugefügt und lassen sich hier jederzeit wieder
+    /// entfernen - mit Suchfeld und Typen-Filter (wie im Overlay).
+    /// </summary>
+    private void DrawBlacklistPage()
+    {
+        var config = plugin.Configuration;
+
+        ImGui.SetWindowFontScale(1.25f);
+        ImGui.TextUnformatted(Loc.T("Blacklist", "Blacklist"));
+        ImGui.SetWindowFontScale(1f);
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextWrapped(Loc.T(
+            "Mit STRG + SHIFT + Klick auf einen Eintrag im Overlay wird er hier eingetragen und komplett ausgeblendet - er erscheint nicht mehr im Overlay und wird von keiner Automation angelaufen.",
+            "CTRL + SHIFT + click an entry in the overlay to add it here and hide it completely - it no longer shows up in the overlay and isn't targeted by any automation."));
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        // Suchfeld + Typen-Filter in einer Zeile.
+        var filterLabel = Loc.T("Typen filtern", "Filter types");
+        var filterButtonWidth = ImGui.CalcTextSize(filterLabel).X + ImGui.GetStyle().FramePadding.X * 2f;
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X - filterButtonWidth - ImGui.GetStyle().ItemSpacing.X);
+        ImGui.InputTextWithHint("##BlacklistSearch", Loc.T("Blacklist durchsuchen...", "Search blacklist..."), ref blacklistSearch, 100);
+        ImGui.SameLine();
+        if (ImGui.Button(filterLabel + "##BlacklistTypeFilter"))
+            ImGui.OpenPopup("BlacklistTypeFilterPopup");
+
+        if (ImGui.BeginPopup("BlacklistTypeFilterPopup"))
+        {
+            foreach (var type in config.TypeOrder)
+            {
+                var enabled = !blacklistHiddenTypes.Contains(type);
+                if (ImGui.Checkbox($"{Loc.TypeName(type)}##BlacklistTypeFilterEntry", ref enabled))
+                {
+                    if (enabled)
+                        blacklistHiddenTypes.Remove(type);
+                    else
+                        blacklistHiddenTypes.Add(type);
+                }
+            }
+
+            ImGui.EndPopup();
+        }
+
+        var filtered = config.Blacklist
+            .Where(b => !blacklistHiddenTypes.Contains(b.Type))
+            .Where(b => string.IsNullOrWhiteSpace(blacklistSearch) || b.Name.Contains(blacklistSearch, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(b => config.TypeOrder.IndexOf(b.Type))
+            .ThenBy(b => b.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextUnformatted(Loc.T($"{filtered.Count} von {config.Blacklist.Count} Einträgen", $"{filtered.Count} of {config.Blacklist.Count} entries"));
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+
+        if (config.Blacklist.Count == 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+            ImGui.TextWrapped(Loc.T("Die Blacklist ist leer.", "The blacklist is empty."));
+            ImGui.PopStyleColor();
+            return;
+        }
+
+        BlacklistedEntry? toRemove = null;
+        ImGui.BeginChild("##BlacklistList", new Vector2(0f, 0f), false);
+        if (ImGui.BeginTable("##BlacklistTable", 3, ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+        {
+            // Aktions-Spalte etwas breiter als der Knopf selbst - bei exakt Knopfbreite schob das
+            // Zellen-Padding ihn über den Rand, wodurch er rechts abgeschnitten aussah.
+            var removeButtonSize = new Vector2(ImGui.GetFrameHeight() + 6f, ImGui.GetFrameHeight());
+            ImGui.TableSetupColumn(Loc.T("Typ", "Type"), ImGuiTableColumnFlags.WidthFixed, 150f);
+            ImGui.TableSetupColumn(Loc.T("Name", "Name"), ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn(string.Empty, ImGuiTableColumnFlags.WidthFixed, removeButtonSize.X + ImGui.GetStyle().CellPadding.X * 2f);
+            // Eigene, dezente Kopfzeile statt ImGui.TableHeadersRow (dessen farbiger Balken passte nicht
+            // zum restlichen Design): kleine Großbuchstaben in TextMuted, darunter eine feine Linie.
+            ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
+            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, 0u);
+            foreach (var (column, header) in new[] { (0, Loc.T("TYP", "TYPE")), (1, Loc.T("NAME", "NAME")) })
+            {
+                ImGui.TableSetColumnIndex(column);
+                ImGui.Dummy(new Vector2(0f, 2f));
+                ImGui.SetWindowFontScale(0.85f);
+                ImGui.TextColored(ModernUi.TextMuted, header);
+                ImGui.SetWindowFontScale(1f);
+            }
+
+            // Linie über die volle Tabellenbreite direkt unter der Kopfzeile.
+            ImGui.TableSetColumnIndex(2);
+            var headerBottomY = ImGui.GetItemRectMax().Y + 4f;
+            var tableMinX = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMin().X;
+            var tableMaxX = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
+            // Eigenes Clip-Rechteck (ohne Schnitt mit dem aktuellen) - sonst würde die Linie auf die
+            // gerade aktive Tabellenspalte beschnitten und nur ganz rechts sichtbar.
+            var headerDrawList = ImGui.GetWindowDrawList();
+            headerDrawList.PushClipRect(new Vector2(tableMinX, headerBottomY - 1f), new Vector2(tableMaxX, headerBottomY + 1f), false);
+            headerDrawList.AddLine(new Vector2(tableMinX, headerBottomY), new Vector2(tableMaxX, headerBottomY), ImGui.GetColorU32(ImGuiCol.Separator));
+            headerDrawList.PopClipRect();
+            ImGui.Dummy(new Vector2(0f, 6f));
+
+            foreach (var item in filtered)
+            {
+                ImGui.TableNextRow();
+
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextColored(CompactOverlayWindow.TypeColors.GetValueOrDefault(item.Type, ModernUi.TextMuted), Loc.TypeName(item.Type));
+
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                ImGui.TextUnformatted(item.Name);
+
+                ImGui.TableNextColumn();
+                // Dezenter Knopf: ohne Hintergrund, erst beim Überfahren rot hinterlegt - Icon per
+                // IconTextButton exakt mittig (ohne Text kein Abstand, siehe dort).
+                ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0f, 0f, 0f, 0f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.85f, 0.3f, 0.35f, 0.45f));
+                ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.85f, 0.3f, 0.35f, 0.7f));
+                ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+                var clicked = IconTextButton($"BlacklistRemove{item.Type}{item.Id}", FontAwesomeIcon.TrashAlt, string.Empty, removeButtonSize);
+                ImGui.PopStyleColor(4);
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(Loc.T("Von der Blacklist entfernen (wieder anzeigen)", "Remove from the blacklist (show again)"));
+                if (clicked)
+                    toRemove = item;
+            }
+
+            ImGui.EndTable();
+        }
+        ImGui.EndChild();
+
+        // Erst nach der Schleife entfernen - nicht während über dieselbe Liste iteriert wird.
+        if (toRemove != null)
+            Plugin.RemoveFromBlacklist(toRemove.Type, toRemove.Id);
+    }
+
     private void DrawStatisticsPage()
     {
         ImGui.SetWindowFontScale(1.25f);
@@ -1456,7 +1703,13 @@ public class MainWindow : Window
         // kompakten Overlay nie auf (siehe HasGoToTarget/siblingTerritories-Filter dort), zählen
         // hier also absichtlich nicht mit, sonst würde die Statistik Dinge "mitrechnen", die das
         // Plugin selbst gar nirgends anzeigt.
-        var entries = CollectionData.GetAllEntries().Where(e => e.TerritoryTypeId != 0).ToList();
+        // Je Sammelobjekt nur einmal zählen - dasselbe Objekt kann mehrfach in der Liste stehen (z.B.
+        // bei mehreren Händlern oder den drei Itinerant Moogles, siehe Plugin.GetItinerantMoogleEntries).
+        var entries = CollectionData.GetAllEntries()
+            .Where(e => e.TerritoryTypeId != 0)
+            .GroupBy(e => (e.Type, e.Id))
+            .Select(g => g.First())
+            .ToList();
         var totalCount = 0;
         var totalOwned = 0;
 
@@ -1499,10 +1752,15 @@ public class MainWindow : Window
 
     private static void DrawDependenciesPage()
     {
-        var installed = Dependencies
-            .Select(d => Plugin.PluginInterface.InstalledPlugins.Any(p => p.InternalName == d.InternalName && p.IsLoaded))
-            .ToArray();
-        var missingRequired = Dependencies.Where((d, i) => d.Required && !installed[i]).Count();
+        var installed = Dependencies.Select(d => IsPluginLoaded(d.InternalName)).ToArray();
+
+        // Eine Gruppe (siehe CombatDependencyGroup) zählt als EIN fehlendes Plugin, und nur, wenn
+        // keines ihrer Plugins installiert ist.
+        var missingRequired = Dependencies
+            .Where(d => d.Required && !IsDependencySatisfied(d.InternalName, d.Group))
+            .Select(d => d.Group ?? d.InternalName)
+            .Distinct()
+            .Count();
 
         ImGui.SetWindowFontScale(1.25f);
         ImGui.TextUnformatted(Loc.T("Plugins", "Plugins"));
@@ -1521,32 +1779,111 @@ public class MainWindow : Window
         ImGui.Separator();
         ImGui.Dummy(new Vector2(0f, 10f));
 
+        var drawnGroups = new HashSet<string>();
         for (var i = 0; i < Dependencies.Length; i++)
         {
             var dep = Dependencies[i];
-            DrawDependencyCard(dep.InternalName, dep.DisplayName, Loc.T(dep.DescriptionDe, dep.DescriptionEn), dep.Required, installed[i]);
+            if (dep.Group == null)
+            {
+                DrawDependencyCard(dep.InternalName, dep.DisplayName, Loc.T(dep.DescriptionDe, dep.DescriptionEn), dep.Required, installed[i]);
+                ImGui.Spacing();
+                continue;
+            }
+
+            // Eine Gruppe austauschbarer Plugins (siehe CombatDependencyGroup) als EINE Zeile:
+            // Überschrift mit "EINES BENÖTIGT"-Badge, darunter alle Plugins der Gruppe als gleich
+            // große, einzeilige Karten nebeneinander - beim ersten Plugin der Gruppe komplett gezeichnet, die
+            // übrigen werden danach übersprungen.
+            if (!drawnGroups.Add(dep.Group))
+                continue;
+
+            var groupIndices = Enumerable.Range(0, Dependencies.Length).Where(j => Dependencies[j].Group == dep.Group).ToList();
+            var groupSatisfied = groupIndices.Any(j => installed[j]);
+
+            ImGui.Indent(ModernUi.CardMargin);
+            ImGui.AlignTextToFramePadding();
+            ImGui.PushStyleColor(ImGuiCol.Text, groupSatisfied ? ModernUi.TextMuted : new Vector4(0.95f, 0.35f, 0.4f, 1f));
+            ImGui.TextUnformatted(Loc.T("Kampf-Plugin", "Combat plugin"));
+            ImGui.PopStyleColor();
+            ImGui.SameLine();
+            DrawBadge(Loc.T("EINES BENÖTIGT", "ONE REQUIRED"), true);
+            ImGui.Unindent(ModernUi.CardMargin);
+
+            // Tabelle nur für die Aufteilung in gleich breite Spalten - Zellabstand 0, den Abstand
+            // zwischen den Karten ergibt sich aus tileOuterWidth/DependencyTileGap.
+            var rowWidth = ImGui.GetContentRegionAvail().X;
+            var tileOuterWidth = (rowWidth - DependencyTileGap * (groupIndices.Count - 1)) / groupIndices.Count;
+            ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, new Vector2(0f, 0f));
+            if (ImGui.BeginTable($"##DependencyGroup{dep.Group}", groupIndices.Count, ImGuiTableFlags.SizingStretchSame))
+            {
+                for (var column = 0; column < groupIndices.Count; column++)
+                {
+                    ImGui.TableNextColumn();
+
+                    // EndCard zeichnet den Kartenhintergrund CardVerticalPadding über dem Inhalt - in einer
+                    // Tabellenzelle würde dieser Streifen sonst an der Zelloberkante abgeschnitten.
+                    ImGui.SetCursorPosY(ImGui.GetCursorPosY() + ModernUi.CardVerticalPadding);
+                    var j = groupIndices[column];
+                    var member = Dependencies[j];
+                    var satisfiedByOther = !installed[j] && groupSatisfied;
+
+                    // Gleich breite Karten mit festem Abstand dazwischen, unabhängig davon, wo die
+                    // Tabellenspalte selbst beginnt (Spalten sind rowWidth/n breit, die Karten etwas schmaler).
+                    var offsetX = column * (tileOuterWidth + DependencyTileGap) - column * rowWidth / groupIndices.Count;
+                    // Per Indent statt SetCursorPosX - BeginCard rückt selbst per Indent ein, was eine
+                    // vorher gesetzte Cursor-X-Position wieder verwerfen würde.
+                    if (offsetX != 0f)
+                        ImGui.Indent(offsetX);
+
+                    DrawDependencyCard(member.InternalName, member.DisplayName, Loc.T(member.DescriptionDe, member.DescriptionEn), member.Required, installed[j],
+                        tileOuterWidth, showBadge: false, satisfiedByOther);
+
+                    if (offsetX != 0f)
+                        ImGui.Unindent(offsetX);
+                }
+
+                ImGui.EndTable();
+            }
+            ImGui.PopStyleVar();
             ImGui.Spacing();
         }
     }
 
+    // Horizontaler Abstand zwischen zwei Karten derselben Zeile (siehe DrawDependenciesPage).
+    private const float DependencyTileGap = 12f;
+
     /// <summary>
-    /// Eine einzelne Abhängigkeit als abgerundete Karte: kreisförmiges Status-Icon links, Name +
-    /// "BENÖTIGT"/"OPTIONAL"-Badge und Beschreibung in der Mitte, Installiert-Haken bzw.
-    /// "Installieren"-Knopf rechtsbündig.
+    /// Eine einzelne Abhängigkeit als abgerundete, einzeilige Karte: kreisförmiges Status-Icon links,
+    /// Name + "BENÖTIGT"/"OPTIONAL"-Badge in der Mitte (Beschreibung als "?"-Tooltip wie in den
+    /// Einstellungen), Installiert-Haken bzw. "Installieren"-Knopf rechtsbündig. Alle Karten sind
+    /// dadurch exakt gleich hoch - auch die schmaleren, nebeneinander stehenden Karten einer Gruppe
+    /// (siehe CombatDependencyGroup/DrawDependenciesPage).
     /// </summary>
-    private static void DrawDependencyCard(string internalName, string displayName, string description, bool required, bool isInstalled)
+    /// <param name="outerWidth">Feste Außenbreite (für mehrere Karten in einer Zeile), sonst die volle verfügbare Breite.</param>
+    /// <param name="showBadge">false für Gruppen-Karten - dort steht das Badge bereits an der Gruppenüberschrift.</param>
+    /// <param name="satisfiedByOther">Nicht installiert, aber ein anderes Plugin der Gruppe ist es - dann neutral statt rot.</param>
+    private static void DrawDependencyCard(string internalName, string displayName, string description, bool required, bool isInstalled,
+        float? outerWidth = null, bool showBadge = true, bool satisfiedByOther = false)
     {
         ModernUi.BeginCard();
 
         const float iconDiameter = 36f;
+        const float rowHeight = iconDiameter;
         var rowStart = ImGui.GetCursorScreenPos();
         // CardMargin abziehen, genau wie bei LabelRow/ToggleRow: EndCard() legt außen noch einmal
         // denselben Rand um den Karteninhalt, ohne den Abzug würde die Karte um CardMargin breiter
-        // werden als der restliche Inhalt (z.B. die Trennlinie über den Karten).
-        var availWidth = ImGui.GetContentRegionAvail().X - ModernUi.CardMargin;
+        // werden als der restliche Inhalt (z.B. die Trennlinie über den Karten). Bei fester
+        // Außenbreite beide Ränder (links ist hier bereits per BeginCard eingerückt).
+        var availWidth = outerWidth.HasValue
+            ? outerWidth.Value - ModernUi.CardMargin * 2f
+            : ImGui.GetContentRegionAvail().X - ModernUi.CardMargin;
         var drawList = ImGui.GetWindowDrawList();
 
-        var iconColor = isInstalled ? new Vector4(0.3f, 0.75f, 0.45f, 1f) : new Vector4(0.85f, 0.3f, 0.35f, 1f);
+        var iconColor = isInstalled
+            ? new Vector4(0.3f, 0.75f, 0.45f, 1f)
+            : satisfiedByOther
+                ? new Vector4(0.45f, 0.45f, 0.5f, 1f)
+                : new Vector4(0.85f, 0.3f, 0.35f, 1f);
         var iconCenter = rowStart + new Vector2(iconDiameter * 0.5f, iconDiameter * 0.5f);
         drawList.AddCircleFilled(iconCenter, iconDiameter * 0.5f, ImGui.ColorConvertFloat4ToU32(iconColor), 24);
         using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
@@ -1556,54 +1893,70 @@ public class MainWindow : Window
             drawList.AddText(iconCenter - glyphSize * 0.5f, ImGui.ColorConvertFloat4ToU32(Vector4.One), glyph);
         }
 
+        var badgeText = required ? Loc.T("BENÖTIGT", "REQUIRED") : Loc.T("OPTIONAL", "OPTIONAL");
+        var badgeWidth = showBadge ? ImGui.CalcTextSize(badgeText).X + BadgePaddingX * 2f + ImGui.GetStyle().ItemSpacing.X : 0f;
+        var nameWidth = ImGui.CalcTextSize(displayName).X;
+
         // Rechtsbündiger Status/Knopf - Größe zuerst berechnen, mit demselben Schriftkontext wie
         // beim tatsächlichen Zeichnen weiter unten (Haken-Icon unter IconFontHandle, der restliche
         // Text/Knopf in der Standardschrift), damit die Ausrichtung exakt an den rechten Rand passt.
+        // Reicht die Breite (schmale Gruppen-Karten bei kleinem Fenster) nicht für den vollen Text,
+        // nur das Icon zeigen - die Karte bleibt so trotzdem einzeilig und gleich hoch.
         var installedLabel = Loc.T("Installiert", "Installed");
         var installLabel = Loc.T("Installieren", "Install");
+        var nameStartOffset = iconDiameter + 12f;
+        var helpIconReserve = 26f;
 
-        float statusWidth;
-        if (isInstalled)
+        float MeasureStatus(bool compact)
         {
-            float checkIconWidth;
-            using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-                checkIconWidth = ImGui.CalcTextSize(FontAwesomeIcon.Check.ToIconString()).X;
-            statusWidth = checkIconWidth + ImGui.GetStyle().ItemSpacing.X + ImGui.CalcTextSize(installedLabel).X;
+            if (isInstalled)
+            {
+                float checkIconWidth;
+                using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                    checkIconWidth = ImGui.CalcTextSize(FontAwesomeIcon.Check.ToIconString()).X;
+                return compact ? checkIconWidth : checkIconWidth + ImGui.GetStyle().ItemSpacing.X + ImGui.CalcTextSize(installedLabel).X;
+            }
+
+            return MeasureIconTextButtonSize(FontAwesomeIcon.Download, compact ? string.Empty : installLabel, ImGui.GetStyle().FramePadding).X;
         }
-        else
-        {
-            statusWidth = MeasureIconTextButtonSize(FontAwesomeIcon.Download, installLabel, ImGui.GetStyle().FramePadding).X;
-        }
+
+        var compactStatus = nameStartOffset + nameWidth + badgeWidth + helpIconReserve + MeasureStatus(false) > availWidth;
+        var statusWidth = MeasureStatus(compactStatus);
         var statusHeight = isInstalled ? ImGui.GetTextLineHeight() : ImGui.GetFrameHeight();
 
-        ImGui.SetCursorScreenPos(rowStart + new Vector2(iconDiameter + 12f, 0f));
-        ImGui.PushTextWrapPos(rowStart.X + availWidth - statusWidth - 20f);
-        ImGui.BeginGroup();
-
+        // Name + Badge in einer Zeile, vertikal mittig zum Icon-Kreis. Die Beschreibung steht - wie bei
+        // den Einstellungen - nur im "?"-Tooltip dahinter (siehe ModernUi.HelpIconIfHovered).
+        var badgeHeight = ImGui.GetTextLineHeight() + BadgePaddingY * 2f;
+        var nameRowY = rowStart.Y + (iconDiameter - badgeHeight) * 0.5f;
+        ImGui.SetCursorScreenPos(new Vector2(rowStart.X + nameStartOffset, nameRowY + BadgePaddingY));
         ImGui.TextUnformatted(displayName);
-        ImGui.SameLine();
-        DrawBadge(required ? Loc.T("BENÖTIGT", "REQUIRED") : Loc.T("OPTIONAL", "OPTIONAL"), required);
+        var nameTopY = ImGui.GetItemRectMin().Y;
+        var labelEnd = ImGui.GetItemRectMax();
+        if (showBadge)
+        {
+            ImGui.SameLine();
+            ImGui.SetCursorScreenPos(new Vector2(ImGui.GetCursorScreenPos().X, nameRowY));
+            DrawBadge(badgeText, required);
+            labelEnd = ImGui.GetItemRectMax();
+        }
 
-        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
-        ImGui.TextWrapped(description);
-        ImGui.PopStyleColor();
+        ModernUi.HelpIconIfHovered(rowStart, new Vector2(availWidth, rowHeight), labelEnd, nameTopY, description);
 
-        ImGui.EndGroup();
-        ImGui.PopTextWrapPos();
-
-        // Vertikal mittig über die GESAMTE Zeilenhöhe (Icon-Kreis ODER Name+Beschreibung-Block,
-        // je nachdem was höher ist) statt nur gegen den Icon-Kreis - sonst hinge der Status bei
-        // mehrzeiligen Beschreibungen zu weit oben statt mittig in der Karte.
-        var nameBlockHeight = ImGui.GetItemRectSize().Y;
-        var rowHeight = MathF.Max(iconDiameter, nameBlockHeight);
         var statusY = rowStart.Y + (rowHeight - statusHeight) * 0.5f;
-        ImGui.SetCursorScreenPos(new Vector2(rowStart.X + availWidth - statusWidth, MathF.Max(rowStart.Y, statusY)));
+        ImGui.SetCursorScreenPos(new Vector2(rowStart.X + availWidth - statusWidth, statusY));
         if (isInstalled)
         {
             using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
                 ImGui.TextColored(new Vector4(0.45f, 0.9f, 0.45f, 1f), FontAwesomeIcon.Check.ToIconString());
-            ImGui.SameLine();
-            ImGui.TextUnformatted(installedLabel);
+            if (!compactStatus)
+            {
+                ImGui.SameLine();
+                ImGui.TextUnformatted(installedLabel);
+            }
+            else if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip(installedLabel);
+            }
         }
         else
         {
@@ -1611,26 +1964,33 @@ public class MainWindow : Window
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.32f, 0.53f, 0.98f, 1f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.2f, 0.38f, 0.8f, 1f));
             var installButtonSize = new Vector2(statusWidth, ImGui.GetFrameHeight());
-            if (IconTextButton($"install_{internalName}", FontAwesomeIcon.Download, installLabel, installButtonSize))
+            if (IconTextButton($"install_{internalName}", FontAwesomeIcon.Download, compactStatus ? string.Empty : installLabel, installButtonSize))
                 Plugin.PluginInterface.OpenPluginInstallerTo(PluginInstallerOpenKind.AllPlugins, displayName);
             ImGui.PopStyleColor(3);
+            if (compactStatus && ImGui.IsItemHovered())
+                ImGui.SetTooltip(installLabel);
         }
 
         // Unsichtbarer Punkt ganz rechts, damit die Karte IMMER exakt bis availWidth reicht -
         // ohne das würde die Kartenbreite vom tatsächlich gerenderten Inhalt abhängen (Installiert-
         // Text vs. Installieren-Knopf sind unterschiedlich breit), wodurch die Karten je nach
-        // Installationsstatus unterschiedlich breit wirkten.
+        // Installationsstatus unterschiedlich breit wirkten. Zugleich volle Zeilenhöhe (der
+        // Icon-Kreis ist nur auf die Draw-List gezeichnet und zählt sonst nicht zur Kartengröße).
         ImGui.SetCursorScreenPos(new Vector2(rowStart.X + availWidth, rowStart.Y));
-        ImGui.Dummy(Vector2.Zero);
+        ImGui.Dummy(new Vector2(0f, rowHeight));
 
         ModernUi.EndCard();
     }
+
+    // Vertikales Innenpolster von DrawBadge - auch für das vertikale Ausrichten daneben stehenden Texts (siehe DrawDependencyCard).
+    private const float BadgePaddingY = 3f;
+    private const float BadgePaddingX = 8f;
 
     /// <summary>Kleine abgerundete Pille mit Rahmen für "BENÖTIGT"/"OPTIONAL" neben einem Namen.</summary>
     private static void DrawBadge(string text, bool emphasized)
     {
         var textSize = ImGui.CalcTextSize(text);
-        var padding = new Vector2(8f, 3f);
+        var padding = new Vector2(BadgePaddingX, BadgePaddingY);
         var size = textSize + padding * 2f;
         var pos = ImGui.GetCursorScreenPos();
         var drawList = ImGui.GetWindowDrawList();

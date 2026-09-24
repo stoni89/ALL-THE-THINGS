@@ -86,16 +86,87 @@ public sealed class Plugin : IDalamudPlugin
     /// <summary>Siehe ChocoboCompanionSupportInstance-Kommentar - für QuestAutomation/HuntingLogAutomation, die keine Plugin-Instanz halten.</summary>
     public static ChocoboCompanionSupport ChocoboCompanionSupport => instance.ChocoboCompanionSupportInstance;
 
+    // Siehe CombatPluginBridge - eine geteilte Instanz (hält u.a. die Wrath-Combo-Lease).
+    public CombatPluginBridge CombatPluginInstance { get; init; }
+
+    public static CombatPluginBridge CombatPlugin => instance.CombatPluginInstance;
+
+    /// <summary>Siehe Configuration.CombatPlugin.</summary>
+    public static CombatPluginKind? ConfiguredCombatPlugin => instance.Configuration.CombatPlugin;
+
+    // Schneller Nachschlage-Index über Configuration.Blacklist (wird im Overlay pro Frame für jeden
+    // Eintrag abgefragt) - bei jeder Änderung über AddToBlacklist/RemoveFromBlacklist neu aufgebaut.
+    private static HashSet<(CollectibleType Type, uint Id)>? blacklistIndex;
+
+    private static HashSet<(CollectibleType Type, uint Id)> BlacklistIndex =>
+        blacklistIndex ??= instance.Configuration.Blacklist.Select(b => (b.Type, b.Id)).ToHashSet();
+
+    /// <summary>
+    /// Ob der Eintrag auf der Blacklist steht (siehe Configuration.Blacklist) - dann weder im Overlay
+    /// angezeigt noch von einer Automation erfasst (siehe CompactOverlayWindow.DrawContent).
+    /// </summary>
+    public static bool IsBlacklisted(CollectibleEntry entry) => BlacklistIndex.Contains((entry.Type, entry.Id));
+
+    // "(1/3)"-Fortschritt am Ende von Hunting-Log-Namen - gehört nicht in den gespeicherten Namen.
+    private static readonly System.Text.RegularExpressions.Regex ProgressSuffixPattern = new(@"\s*\(\d+/\d+\)$");
+
+    public static void AddToBlacklist(CollectibleEntry entry)
+    {
+        if (IsBlacklisted(entry))
+            return;
+
+        instance.Configuration.Blacklist.Add(new BlacklistedEntry
+        {
+            Type = entry.Type,
+            Id = entry.Id,
+            Name = ProgressSuffixPattern.Replace(entry.Name, string.Empty),
+        });
+        instance.Configuration.Save();
+        blacklistIndex = null;
+    }
+
+    public static void RemoveFromBlacklist(CollectibleType type, uint id)
+    {
+        if (instance.Configuration.Blacklist.RemoveAll(b => b.Type == type && b.Id == id) == 0)
+            return;
+
+        instance.Configuration.Save();
+        blacklistIndex = null;
+    }
+
+    /// <summary>
+    /// Trägt das installierte Kampf-Plugin als Auswahl ein, solange keines (oder ein nicht mehr
+    /// installiertes) gewählt ist - siehe Configuration.CombatPlugin. Speichert nur bei einer
+    /// tatsächlichen Änderung, darf also jeden Frame aufgerufen werden (Einstellungsseite).
+    /// </summary>
+    public static void EnsureCombatPluginDefault()
+    {
+        var config = instance.Configuration;
+        var installed = CombatPluginBridge.GetInstalled();
+        if (installed.Count == 0 || (config.CombatPlugin.HasValue && installed.Contains(config.CombatPlugin.Value)))
+            return;
+
+        config.CombatPlugin = installed[0];
+        config.Save();
+    }
+
     public Plugin()
     {
         instance = this;
+
+        // Welcher Build gerade tatsächlich geladen ist (Dev-Plugin-Reload greift nicht in jedem
+        // parallel laufenden Spielclient) - einfacher Abgleich mit dem Zeitstempel der DLL.
+        Log.Info($"[TheExplorersCodex] Geladen - Build {System.IO.File.GetLastWriteTime(PluginInterface.AssemblyLocation.FullName):yyyy-MM-dd HH:mm:ss}.");
 
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.SanitizeTypeOrder();
 
         navigationFlagToPointQuery = PluginInterface.GetIpcSubscriber<Vector3?>("vnavmesh.Query.Mesh.FlagToPoint");
+        vnavPathfindInProgress = PluginInterface.GetIpcSubscriber<bool>("vnavmesh.SimpleMove.PathfindInProgress");
 
         ChocoboCompanionSupportInstance = new ChocoboCompanionSupport();
+        CombatPluginInstance = new CombatPluginBridge();
+        EnsureCombatPluginDefault();
         QuestAutomation = new QuestAutomation();
         AetheryteAutomation = new AetheryteAutomation();
         GoToAutomation = new GoToAutomation();
@@ -672,7 +743,8 @@ public sealed class Plugin : IDalamudPlugin
     /// Gil-Händler (GilShopItem) werden absichtlich NICHT abgedeckt (siehe Kommentar unten) -
     /// betrifft vermutlich nur einen kleinen Teil der Kit-Item-Rahmen.
     /// </summary>
-    private readonly record struct FrameKitShopMatch(uint ShopId, uint CurrencyAmount, uint CurrencyItemId, uint CurrencyIconId, string CurrencyText);
+    // RequiredAchievement: nur bei kostenlosen Errungenschafts-Belohnungen (siehe EnrichFrameKitVendors), sonst null.
+    private readonly record struct FrameKitShopMatch(uint ShopId, uint CurrencyAmount, uint CurrencyItemId, uint CurrencyIconId, string CurrencyText, string? RequiredAchievement = null);
 
     private static void EnrichFrameKitVendors(List<CollectibleEntry> entries)
     {
@@ -747,7 +819,17 @@ public sealed class Plugin : IDalamudPlugin
                             }
 
                             if (costAmount == 0)
+                            {
+                                // Kostenlose "Achievement Rewards"-Slots (z.B. Kornago Merchant: "Crucible
+                                // Framer's Kit" für "Freeing the Beast") - statt eines Preises zählt dort nur
+                                // die Errungenschaft (siehe CollectibleEntry.RequiredAchievement).
+                                var achievementName = slot.AchievementUnlock.RowId != 0 ? slot.AchievementUnlock.ValueNullable?.Name.ToString() : null;
+                                if (string.IsNullOrEmpty(achievementName))
+                                    continue;
+
+                                itemRowIdToShopMatch[itemRowId] = new FrameKitShopMatch(shop.RowId, 0, 0, 0, string.Empty, achievementName);
                                 continue;
+                            }
 
                             itemRowIdToShopMatch[itemRowId] = new FrameKitShopMatch(shop.RowId, costAmount, costItemId, costIconId, $"{costAmount:N0} {costName}");
                         }
@@ -966,7 +1048,8 @@ public sealed class Plugin : IDalamudPlugin
                     entry.CurrencyIconId = match.CurrencyIconId;
                     entry.CurrencyItemId = match.CurrencyItemId;
                     entry.CurrencyAmount = match.CurrencyAmount;
-                    entry.Source = $"{vendorName} - {match.CurrencyText}";
+                    entry.RequiredAchievement ??= match.RequiredAchievement;
+                    entry.Source = string.IsNullOrEmpty(match.CurrencyText) ? vendorName : $"{vendorName} - {match.CurrencyText}";
                     enrichedCount++;
                 }
                 catch (Exception ex)
@@ -1217,10 +1300,15 @@ public sealed class Plugin : IDalamudPlugin
             if (!itemName.StartsWith("Modern Aesthetics", StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            // Nur der eigentliche Frisurname ("Loosened Locks" statt "Modern Aesthetics - Loosened
+            // Locks") - die Zeile im Overlay wäre sonst zu lang, der Typ steht ohnehin schon dabei.
+            var dash = itemName.IndexOf(" - ", StringComparison.Ordinal);
+            var hairstyleName = dash >= 0 ? itemName[(dash + 3)..].Trim() : itemName;
+
             result.Add(new CollectibleEntry
             {
                 Id = row.RowId,
-                Name = itemName,
+                Name = hairstyleName,
                 Type = CollectibleType.Hairstyle,
                 Category = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
                 Source = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
@@ -1237,23 +1325,37 @@ public sealed class Plugin : IDalamudPlugin
     // Von Hand nachgetragene Händler für "Modern Aesthetics"-Bücher, die NICHT für Gil, sondern über
     // einen Sonderwährungs-Tauschhändler (SpecialShop) verkauft werden - EnrichHairstyleVendors
     // deckt bewusst nur reine Gil-Händler ab (siehe dessen Kommentar), solche Fälle blieben sonst
-    // ohne Fundort. Schlüssel ist der Buchname (nicht die CharaMakeCustomize-RowId) - dasselbe Buch
+    // ohne Fundort. Schlüssel ist der Frisurname ohne "Modern Aesthetics - "-Präfix (siehe
+    // GetHairstyleEntries, nicht die CharaMakeCustomize-RowId) - dasselbe Buch
     // taucht im Sheet einmal PRO Rasse/Geschlecht auf (mehrere RowIds, ein Name), hier reicht ein
     // einziger Eintrag für alle.
-    private static readonly Dictionary<string, (string Vendor, uint TerritoryId, uint MapId, float X, float Y, string CurrencyText, uint CurrencyIconId, uint CurrencyItemId, uint CurrencyAmount)> HairstyleSpecialVendorOverrides = new()
+    private static readonly Dictionary<string, (string Vendor, uint TerritoryId, uint MapId, float X, float Y, string CurrencyText, uint CurrencyIconId, uint CurrencyItemId, uint CurrencyAmount, string? RequiredQuest)> HairstyleSpecialVendorOverrides = new()
     {
         // Ose Wyd (Il Mheg) - Pilgrim's-Traverse-Tauschhändler, siehe Plugin.cs-Git-Historie.
-        ["Modern Aesthetics - Simple and Clean"] = ("Ose Wyd", 816, 494, 29.9f, 5.9f, "99 Luminous Oil", 22654, 47342, 99),
+        ["Simple and Clean"] = ("Ose Wyd", 816, 494, 29.9f, 5.9f, "99 Luminous Oil", 22654, 47342, 99, null),
+
+        // Kornago Merchant (Central Shroud, Bentbranch Meadows) - Beastmaster-Tauschhändler, laut
+        // SpecialShop-Daten erst nach der Quest "Gobsmacked" kaufbar (später als die übrigen
+        // Faded-Remnant-Waren, siehe CurrencyRequiredQuest).
+        ["Loosened Locks"] = ("Kornago Merchant", 148, 4, 21.9f, 22.7f, "500 Faded Remnants of Resilience", 20217, 51734, 500, "Gobsmacked"),
     };
 
     private static void EnrichHairstyleSpecialCurrencyVendors(List<CollectibleEntry> entries)
     {
+        // Dasselbe Buch steht einmal PRO Rasse/Geschlecht in der Liste (siehe Kommentar an
+        // HairstyleSpecialVendorOverrides) - nur der ERSTE Eintrag je Name bekommt den Händler
+        // (wie bei EnrichHairstyleVendors), sonst stünde das Buch im Overlay bis zu 10x in der
+        // Händlerzone. Freischaltung gilt ohnehin je Buch (gleiche UnlockLink), nicht je Zeile.
+        var enrichedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in entries)
         {
             if (entry.Type != CollectibleType.Hairstyle || entry.TerritoryTypeId != 0)
                 continue;
 
             if (!HairstyleSpecialVendorOverrides.TryGetValue(entry.Name, out var vendor))
+                continue;
+
+            if (!enrichedNames.Add(entry.Name))
                 continue;
 
             entry.Vendor = vendor.Vendor;
@@ -1265,6 +1367,7 @@ public sealed class Plugin : IDalamudPlugin
             entry.CurrencyIconId = vendor.CurrencyIconId;
             entry.CurrencyItemId = vendor.CurrencyItemId;
             entry.CurrencyAmount = vendor.CurrencyAmount;
+            entry.RequiredQuest ??= vendor.RequiredQuest;
             entry.Source = $"{vendor.Vendor} - {vendor.CurrencyText}";
         }
     }
@@ -2453,10 +2556,33 @@ public sealed class Plugin : IDalamudPlugin
             new DateTime(2026, 10, 13, 14, 59, 0, DateTimeKind.Utc)),
     };
 
+    // Offizielle Zeitfenster von Events, die (wie Kollaborationen) nicht über GameMain.ActiveFestivals
+    // laufen - Schlüssel ist CollectibleEntry.EventName. Bei jedem neuen Durchlauf ergänzen (Quelle:
+    // offizielle Lodestone-Ankündigung). Ohne passendes Fenster gilt das Event als NICHT laufend.
+    private const string MoogleTreasureTroveEventName = "Moogle Treasure Trove";
+
+    private static readonly (string EventName, DateTime StartUtc, DateTime EndUtc)[] KnownEventWindows =
+    {
+        // "Moogle Treasure Trove: The First Hunt for Astronomy" - Mi. 09.09.2026 01:00 bis Mo.
+        // 19.10.2026 07:59 (PDT/UTC-7), Quelle: Lodestone (mogmog-collection/202609).
+        (MoogleTreasureTroveEventName,
+            new DateTime(2026, 9, 9, 8, 0, 0, DateTimeKind.Utc),
+            new DateTime(2026, 10, 19, 14, 59, 0, DateTimeKind.Utc)),
+    };
+
     public static bool IsSeasonalEventEntryCurrentlyActive(CollectibleEntry entry)
     {
         if (entry.Category != "Saisonevent")
             return true;
+
+        // Events ohne auslesbaren Festival-Status (siehe CollectibleEntry.EventName) - über das von
+        // Hand hinterlegte, offizielle Zeitfenster (KnownEventWindows).
+        if (!string.IsNullOrEmpty(entry.EventName))
+        {
+            var nowUtc = DateTime.UtcNow;
+            return KnownEventWindows.Any(w => string.Equals(w.EventName, entry.EventName, StringComparison.OrdinalIgnoreCase)
+                                              && nowUtc >= w.StartUtc && nowUtc <= w.EndUtc);
+        }
 
         // Cross-Game-Kollaborationen (Yo-kai Watch, Final Fantasy XV/XI/XVI, Dragon Quest X,
         // Fall Guys/MGF, ...) laufen NICHT über das normale Festival-System
@@ -3037,8 +3163,93 @@ public sealed class Plugin : IDalamudPlugin
     /// live auslesbare Ruf-Rang-API - die gelten daher weiterhin als "erfüllt unbekannt/wahrscheinlich
     /// noch nicht" und bleiben statisch markiert, solange sie in AchievementOrRankGatedItems stehen.
     /// </summary>
+    /// <summary>
+    /// Währungen, die nur bei einem Händler ausgegeben werden können, dessen Sortiment erst nach
+    /// einer bestimmten Quest kaufbar ist - gilt damit für JEDEN Eintrag mit dieser Währung (auch
+    /// künftig ergänzte), ohne jeden einzeln pflegen zu müssen. Einzelne Einträge mit einer anderen
+    /// (späteren) Quest überschreiben das per CollectibleEntry.RequiredQuest. Item-RowIds/Quests per
+    /// Auswertung der SpecialShop-Daten des "Kornago Merchant" (Bentbranch Meadows) verifiziert.
+    /// </summary>
+    private static readonly Dictionary<uint, string> CurrencyRequiredQuest = new()
+    {
+        [51734] = "Into the Crucible",     // Faded Remnant of Resilience
+        [51735] = "A Beastmaster's Path",  // Bright Remnant of Resilience
+    };
+
+    // Schaltet das Triple-Triad-Kartenspiel frei (Quest 65973, per Spieldaten verifiziert) - siehe
+    // ComputeGrandCompanyOrTribeGateReason.
+    private const string TripleTriadUnlockQuestName = "Triple Triad Trial";
+
+    private static string? GetCurrencyRequiredQuest(CollectibleEntry entry)
+    {
+        if (CurrencyRequiredQuest.TryGetValue(entry.CurrencyItemId, out var quest))
+            return quest;
+
+        if (entry.AdditionalCurrencies != null)
+        {
+            foreach (var additional in entry.AdditionalCurrencies)
+            {
+                if (CurrencyRequiredQuest.TryGetValue(additional.CurrencyItemId, out quest))
+                    return quest;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsAchievementCompleteByName(string achievementName)
+    {
+        var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+        var achievementId = ResolveAchievementIdByName(achievementName);
+        return achievementId != null && achievementSheet != null
+            && achievementSheet.TryGetRow(achievementId.Value, out var row) && UnlockState.IsAchievementComplete(row);
+    }
+
     private static string? ComputeGrandCompanyOrTribeGateReason(CollectibleEntry entry)
     {
+        // Triple Triad selbst wird erst mit der Quest "Triple Triad Trial" freigeschaltet - vorher ist
+        // KEINE Karte nutzbar, egal wo/wie erhältlich. Hat daher Vorrang vor allen anderen
+        // Voraussetzungen der Karte.
+        if (entry.Type == CollectibleType.TripleTriadCard)
+        {
+            var tripleTriadQuestId = ResolveQuestIdByName(TripleTriadUnlockQuestName);
+            if (tripleTriadQuestId == null || !QuestManager.IsQuestComplete((ushort)tripleTriadQuestId.Value))
+            {
+                return Loc.T(
+                    $"Triple Triad ist noch nicht freigeschaltet - benötigt die abgeschlossene Quest \"{TripleTriadUnlockQuestName}\".",
+                    $"Triple Triad isn't unlocked yet - requires the completed quest \"{TripleTriadUnlockQuestName}\".");
+            }
+        }
+
+        // Händler-Voraussetzungen (siehe CollectibleEntry.RequiredQuest/RequiredAchievement und
+        // CurrencyRequiredQuest) - live geprüft, damit die Markierung sofort verschwindet.
+        var requiredVendorQuest = entry.RequiredQuest ?? GetCurrencyRequiredQuest(entry);
+        if (!string.IsNullOrEmpty(requiredVendorQuest))
+        {
+            var vendorQuestId = ResolveQuestIdByName(requiredVendorQuest);
+            if (vendorQuestId == null || !QuestManager.IsQuestComplete((ushort)vendorQuestId.Value))
+            {
+                return Loc.T(
+                    $"Benötigt die abgeschlossene Quest \"{requiredVendorQuest}\".",
+                    $"Requires the completed quest \"{requiredVendorQuest}\".");
+            }
+        }
+
+        if (!string.IsNullOrEmpty(entry.RequiredAchievement) && !IsAchievementCompleteByName(entry.RequiredAchievement))
+        {
+            return Loc.T(
+                $"Benötigt die Errungenschaft \"{entry.RequiredAchievement}\".",
+                $"Requires the achievement \"{entry.RequiredAchievement}\".");
+        }
+
+        // Hunting-Log-Ziel einer höheren, noch nicht erreichten Rang-Stufe (siehe GetHuntingLogEntries).
+        if (entry.Type == CollectibleType.HuntingLog && entry.HuntingLogRequiredRank is { } requiredHuntingRank)
+        {
+            return Loc.T(
+                $"Bedingung nicht erfüllt (Hunting-Log-Rang {requiredHuntingRank} noch nicht erreicht).",
+                $"Condition not met (hunting log rank {requiredHuntingRank} not reached yet).");
+        }
+
         // Das Sightseeing Log selbst wird über die Quest "A Sight to Behold" freigeschaltet, NICHT
         // durchs Fliegen (das war vorher fälschlich über IsTypeCurrentlyPossible/CanFly verknüpft) -
         // ohne freigeschaltetes Log lässt sich kein einziger Sightseeing-Eintrag abschließen. Live
@@ -3059,8 +3270,8 @@ public sealed class Plugin : IDalamudPlugin
             if (!CanFly)
             {
                 return Loc.T(
-                    "Bedingung nicht erfüllt (Fliegen nicht freigeschaltet).",
-                    "Condition not met (flying not unlocked).");
+                    "Fliegen nicht freigeschaltet.",
+                    "Flying not unlocked.");
             }
 
             // Priorität 1 (siehe Nutzeranfrage): erst die ersten 20 A-Realm-Reborn-Punkte, DANN erst
@@ -3183,10 +3394,25 @@ public sealed class Plugin : IDalamudPlugin
         // Einträgen bereits als Klartext im Source-Feld (z.B. "The Rising (2026)").
         if (entry.Category == "Saisonevent" && !IsSeasonalEventEntryCurrentlyActive(entry))
         {
+            if (!string.IsNullOrEmpty(entry.EventName))
+            {
+                return Loc.T(
+                    $"Nur während des Events {entry.EventName} erhältlich, das gerade nicht läuft.",
+                    $"Only available during the event {entry.EventName}, which isn't currently running.");
+            }
+
             return Loc.T(
                 $"Nur während eines Events erhältlich ({entry.Source}), das gerade nicht läuft.",
                 $"Only available during an event ({entry.Source}), which isn't currently running.");
         }
+
+        // Die folgenden Prüfungen (Große Kompanie, Stammesrang) sind von Hand pro Typ + NAME gepflegt
+        // und gelten nur beim jeweiligen Kompanie-/Stammeshändler - dieselbe Ware beim Itinerant
+        // Moogle (EventName gesetzt, siehe GetItinerantMoogleEntries) ist dort ohne Rang kaufbar
+        // (Nutzer-Report: z.B. Stammes-Waren im "Previous"-Reiter fälschlich als "Rang fehlt"
+        // markiert). Deren eigene Voraussetzungen (Event-Zeitfenster, Quest) sind oben schon geprüft.
+        if (!string.IsNullOrEmpty(entry.EventName))
+            return null;
 
         // Quartiermeister-Waren (Bardings/Hatchling-Minions/Orchestrion-Rollen) sind an die JEWEILS
         // EIGENE Kompanie gebunden (siehe GrandCompanySpecificItems-Kommentar).
@@ -3256,12 +3482,25 @@ public sealed class Plugin : IDalamudPlugin
                 "Requirement (achievement/rank) not yet met.");
         }
 
-        // Übrig bleiben die echten Stammes-Objekte (Vanu Vanu, Vath, Moogles, ...) - deren Ruf-Rang
-        // lässt sich hier (noch) nicht live auslesen, daher bleibt nur die Textanzeige, keine
-        // echte Erfüllt/Nicht-erfüllt-Prüfung.
+        // Übrig bleiben die echten Stammes-Objekte (Vanu Vanu, Vath, Moogles, Kojin, ...) - live gegen
+        // den Ruf-Rang DES STAMMES geprüft (PlayerState.GetBeastTribeRank, siehe ResolveBeastTribe),
+        // nicht gegen den Händler: früher stand dort der Händlername (z.B. "Shikitahe" statt "Kojin")
+        // und die Markierung blieb auch bei längst erreichtem Rang dauerhaft stehen (Nutzer-Report).
         if (AchievementOrRankGatedItems.Contains((entry.Type, entry.Name)))
         {
             var tribeRankMatch = CurrencyRankPattern.Match(entry.Currency ?? string.Empty);
+            if (tribeRankMatch.Success && ResolveBeastTribe(entry) is { } tribe && byte.TryParse(tribeRankMatch.Groups[1].Value, out var requiredTribeRank))
+            {
+                // Manche Datendatei-Angaben liegen über dem Höchstrang des Stammes - dann zählt der Höchstrang.
+                var effectiveRequiredRank = Math.Min(requiredTribeRank, tribe.MaxRank);
+                if (GetBeastTribeRank(tribe.TribeId) >= effectiveRequiredRank)
+                    return null;
+
+                return Loc.T(
+                    $"Benötigt {tribe.Name}-Stammesrang {requiredTribeRank}.",
+                    $"Requires {tribe.Name} tribe rank {requiredTribeRank}.");
+            }
+
             if (tribeRankMatch.Success)
             {
                 var rank = tribeRankMatch.Groups[1].Value;
@@ -3281,6 +3520,58 @@ public sealed class Plugin : IDalamudPlugin
 
     public static bool IsAchievementOrRankGated(CollectibleEntry entry) =>
         ComputeGrandCompanyOrTribeGateReason(entry) != null;
+
+    // Stammeshändler, die mit GIL statt der stammeseigenen Währung verkaufen - dort lässt sich der
+    // Stamm nicht über die Währung (siehe ResolveBeastTribe) bestimmen. Wert = Lumina-BeastTribe-RowId.
+    private static readonly Dictionary<string, uint> BeastTribeByGilVendor = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Luna Vanu"] = 6,         // Vanu Vanu
+        ["Vath Stickpeddler"] = 7, // Vath
+        ["Mogmul Mogbelly"] = 8,   // Moogles
+    };
+
+    private static Dictionary<uint, (uint TribeId, string Name, byte MaxRank)>? beastTribeByCurrencyCache;
+    private static Dictionary<uint, (uint TribeId, string Name, byte MaxRank)>? beastTribeByIdCache;
+
+    /// <summary>
+    /// Zu welchem Stamm ein Stammeshändler-Eintrag gehört - primär über die Währung (Lumina
+    /// "BeastTribe".CurrencyItem, z.B. "Kojin Sango" -> Kojin), für die Gil-Händler über
+    /// BeastTribeByGilVendor. null, wenn nicht zuordenbar.
+    /// </summary>
+    private static (uint TribeId, string Name, byte MaxRank)? ResolveBeastTribe(CollectibleEntry entry)
+    {
+        if (beastTribeByCurrencyCache == null)
+        {
+            beastTribeByCurrencyCache = new();
+            beastTribeByIdCache = new();
+            var sheet = DataManager.GetExcelSheet<BeastTribe>();
+            if (sheet != null)
+            {
+                foreach (var row in sheet)
+                {
+                    var name = row.Name.ToString();
+                    if (row.RowId == 0 || string.IsNullOrEmpty(name))
+                        continue;
+
+                    // Lumina führt einige Namen klein ("moogles", "pixies", ...) - für die Anzeige groß.
+                    var info = (row.RowId, char.ToUpperInvariant(name[0]) + name[1..], row.MaxRank);
+                    beastTribeByIdCache[row.RowId] = info;
+                    if (row.CurrencyItem.RowId != 0)
+                        beastTribeByCurrencyCache.TryAdd(row.CurrencyItem.RowId, info);
+                }
+            }
+        }
+
+        if (beastTribeByCurrencyCache.TryGetValue(entry.CurrencyItemId, out var byCurrency))
+            return byCurrency;
+
+        if (BeastTribeByGilVendor.TryGetValue(entry.Vendor ?? string.Empty, out var tribeId) && beastTribeByIdCache!.TryGetValue(tribeId, out var byVendor))
+            return byVendor;
+
+        return null;
+    }
+
+    private static unsafe byte GetBeastTribeRank(uint tribeId) => PlayerState.Instance()->GetBeastTribeRank((byte)tribeId);
 
     /// <summary>
     /// Erklärt, WAS genau bei einem als gated erkannten Eintrag fehlt (z.B. "Benötigt Kobold-Rang
@@ -4373,6 +4664,98 @@ public sealed class Plugin : IDalamudPlugin
         return nearest;
     }
 
+    // Siehe HasPathStartGraceElapsed.
+    private static ICallGateSubscriber<bool>? vnavPathfindInProgress;
+    private static DateTime lastVnavPathfindInProgressAt = DateTime.MinValue;
+    private static readonly TimeSpan VnavPathfindMaxDuration = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Ob vnavmesh einen per SimpleMove.PathfindAndMoveCloseTo angenommenen Auftrag gerade noch
+    /// berechnet - währenddessen ist Path.IsRunning noch false. Merkt sich den Zeitpunkt für
+    /// HasPathStartGraceElapsed.
+    /// </summary>
+    public static bool IsVnavPathfindInProgress()
+    {
+        try
+        {
+            var computing = vnavPathfindInProgress is { HasFunction: true } && vnavPathfindInProgress.InvokeFunc();
+            if (computing)
+                lastVnavPathfindInProgressAt = DateTime.UtcNow;
+
+            return computing;
+        }
+        catch
+        {
+            return false; // vnavmesh fehlt oder eine Version ohne diesen Endpunkt
+        }
+    }
+
+    /// <summary>
+    /// Für die "Laufweg nie gestartet"-Prüfung aller Automationen (jeweils PathStartGracePeriod):
+    /// true, sobald seit startedAt (Betreten des Lauf-Zustands) die Gnadenfrist verstrichen ist,
+    /// OHNE die Zeit mitzuzählen, in der vnavmesh den Weg noch berechnet hat - lange (v.a.
+    /// fliegende) Wege brauchen dafür deutlich länger als die üblichen 5s und wurden sonst
+    /// fälschlich übersprungen, obwohl vnavmesh sie angenommen hatte. Spätestens nach
+    /// VnavPathfindMaxDuration zählt auch eine noch laufende Berechnung als "nie gestartet".
+    /// </summary>
+    public static bool HasPathStartGraceElapsed(DateTime startedAt, TimeSpan gracePeriod)
+    {
+        var now = DateTime.UtcNow;
+        if (IsVnavPathfindInProgress() && now - startedAt < VnavPathfindMaxDuration)
+            return false;
+
+        var graceStart = lastVnavPathfindInProgressAt > startedAt ? lastVnavPathfindInProgressAt : startedAt;
+        return now - graceStart > gracePeriod;
+    }
+
+    private const byte CombatantBattleNpcSubKind = 5;
+
+    /// <summary>
+    /// Sucht den nächstgelegenen lebenden Gegner, der gerade den eigenen Charakter anvisiert (also
+    /// angreift) - für HuntingLogAutomation: RotationSolver läuft dort im Manual-Modus und greift
+    /// nur das aktuelle Ziel an, Beifang-Gegner, die sich selbst angehängt haben, müssen deshalb
+    /// selbst anvisiert werden, statt wehrlos stehen zu bleiben.
+    /// </summary>
+    public static Dalamud.Game.ClientState.Objects.Types.IBattleNpc? FindNearestAttacker(Vector3 nearPosition)
+    {
+        var player = ObjectTable.LocalPlayer;
+        if (player == null)
+            return null;
+
+        Dalamud.Game.ClientState.Objects.Types.IBattleNpc? nearest = null;
+        var bestDistance = float.MaxValue;
+
+        foreach (var obj in ObjectTable)
+        {
+            if (obj is not Dalamud.Game.ClientState.Objects.Types.IBattleNpc battleNpc)
+                continue;
+
+            // SubKind 5 = kämpfender Gegner (BattleNpcSubKind "Enemy"/"Combatant" - der Name unterscheidet
+            // sich je nach Dalamud-Version, der Zahlenwert nicht).
+            if (battleNpc.SubKind != CombatantBattleNpcSubKind || !battleNpc.IsTargetable || battleNpc.CurrentHp == 0)
+                continue;
+
+            // Greift entweder uns selbst an oder etwas, das uns gehört (z.B. den Chocobo-Begleiter,
+            // siehe ChocoboCompanionSupport) - beides hält uns im Kampf.
+            var target = battleNpc.TargetObject;
+            if (target == null || (target.GameObjectId != player.GameObjectId && target.OwnerId != player.EntityId))
+                continue;
+
+            var distance = Vector3.Distance(battleNpc.Position, nearPosition);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                nearest = battleNpc;
+            }
+        }
+
+        return nearest;
+    }
+
+    /// <summary>Ob das aktuelle Spielziel noch ein lebender Gegner ist (false auch ohne Ziel).</summary>
+    public static bool HasLiveTarget() =>
+        TargetManager.Target is Dalamud.Game.ClientState.Objects.Types.IBattleChara { CurrentHp: > 0 };
+
     // General Action "Sprint" - feste Spiel-ID, kein Excel-Sheet-Lookup nötig (ändert sich nicht
     // zwischen Spiel-Patches).
     private const uint SprintGeneralActionId = 4;
@@ -4414,16 +4797,17 @@ public sealed class Plugin : IDalamudPlugin
     /// nicht von selbst, wenn man nicht auch tatsächlich in einen Kampf verwickelt wird (bloßes
     /// Anvisieren reicht dafür nicht).
     /// </summary>
-    public static unsafe void TryDismount()
+    /// <returns>Ob das Spiel den Absteige-Aufruf angenommen hat (false auch, wenn gar nicht beritten).</returns>
+    public static unsafe bool TryDismount()
     {
         if (!Condition[ConditionFlag.Mounted])
-            return;
+            return false;
 
         var actionManager = ActionManager.Instance();
         if (actionManager == null)
-            return;
+            return false;
 
-        actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
+        return actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
     }
 
     /// <summary>Siehe Configuration.UseChocoboCompanion/ChocoboCompanionSupport.</summary>
@@ -4619,6 +5003,271 @@ public sealed class Plugin : IDalamudPlugin
             OpenAllaganToolsItemInfo(itemId.ToString());
     }
 
+    /// <summary>
+    /// Für ein Sammelobjekt (SHIFT + Linksklick im Overlay) - Allagan Tools kennt nur ITEMS, der
+    /// Anzeigename eines Sammelobjekts ist aber oft nicht der Name des freischaltenden Items
+    /// ("Maelstrom Command" statt "Maelstrom Command Orchestrion Roll", Mount "Uolon" statt "Uolon
+    /// Horn"). Daher wird - wo möglich - die Item-ID des freischaltenden Items übergeben (siehe
+    /// ResolveUnlockItemId), sonst wie bisher der Name.
+    /// </summary>
+    public static void OpenAllaganToolsItemInfo(CollectibleEntry entry)
+    {
+        var itemId = ResolveUnlockItemId(entry);
+        if (itemId != 0)
+            OpenAllaganToolsItemInfo(itemId);
+        else
+            OpenAllaganToolsItemInfo(entry.Name);
+    }
+
+    // Die beiden Reiter "Newest"/"Previous" beim Itinerant Moogle (Moogle Treasure Trove) - im Spiel
+    // eigene SpecialShops, deren Inhalt Square Enix mit jedem Event-Patch austauscht. Bewusst per
+    // Name statt fester RowId gesucht (es gibt z.B. mehrere "Newest"-Zeilen, siehe
+    // GetItinerantMoogleEntries). "Past"/"Seasonal" werden nicht angezeigt (ausdrücklicher Nutzerwunsch).
+    private static readonly string[] ItinerantMoogleShopNames =
+    {
+        "Newest Irregular Tomestone Exchange",
+        "Previous Irregular Tomestone Exchange",
+    };
+
+    private const string ItinerantMoogleVendorName = "Itinerant Moogle";
+
+    // Die drei Itinerant Moogles in den Hauptstädten (ENpcResident 1009434/1009433/1009435), Position
+    // aus dem Lumina-Sheet "Level" umgerechnet.
+    private static readonly (uint TerritoryId, uint MapId, float X, float Y)[] ItinerantMoogleLocations =
+    {
+        (129, 12, 9.4f, 11.7f),  // Limsa Lominsa Lower Decks
+        (132, 2, 12.4f, 12.2f),  // New Gridania
+        (130, 13, 9.6f, 9.1f),   // Ul'dah - Steps of Nald
+    };
+
+    /// <summary>
+    /// Baut die aktuell beim Itinerant Moogle unter "Newest" und "Previous" erhältlichen
+    /// Sammelobjekte LIVE aus den Spieldaten (SpecialShop) - ändert sich damit automatisch mit jedem
+    /// Moogle-Treasure-Trove-Event, ohne dass eine Liste gepflegt werden muss. Jede Ware wird über
+    /// ihr Freischalt-Item (siehe ResolveUnlockItemId) dem passenden Sammelobjekt aus baseEntries
+    /// zugeordnet und je Stadt einmal (Händlerposition) mit exaktem Preis angelegt. Nur während des
+    /// Events erhältlich (siehe CollectibleEntry.EventName/KnownEventWindows);
+    /// Die Slot-Quests der Shop-Daten (v.a. bei Triple-Triad-Karten) werden bewusst NICHT übernommen -
+    /// beim Moogle gelten die Waren als kaufbar (ausdrücklicher Nutzerwunsch), nur die generelle
+    /// Triple-Triad-Freischaltung (siehe TripleTriadUnlockQuestName) wird weiter geprüft.
+    /// </summary>
+    public static List<CollectibleEntry> GetItinerantMoogleEntries(IReadOnlyList<CollectibleEntry> baseEntries)
+    {
+        var result = new List<CollectibleEntry>();
+        try
+        {
+            var specialShopSheet = DataManager.GetExcelSheet<SpecialShop>();
+            if (specialShopSheet == null)
+                return result;
+
+            // Freischalt-Item -> Sammelobjekt (erster Treffer gewinnt, z.B. Frisuren gibt es je
+            // Rasse/Geschlecht mehrfach mit demselben Buch).
+            var entryByUnlockItem = new Dictionary<uint, CollectibleEntry>();
+            foreach (var entry in baseEntries)
+            {
+                var itemId = ResolveUnlockItemId(entry);
+                if (itemId != 0)
+                    entryByUnlockItem.TryAdd(itemId, entry);
+            }
+
+            var moogleShops = specialShopSheet.Where(s => ItinerantMoogleShopNames.Contains(s.Name.ToString())).ToList();
+            var seen = new HashSet<(CollectibleType, uint)>();
+            foreach (var shop in moogleShops)
+            {
+                var shopName = shop.Name.ToString();
+
+                foreach (var slot in shop.Item)
+                {
+                    try
+                    {
+                        var receivedItemId = slot.ReceiveItems.FirstOrDefault(r => r.Item.RowId != 0).Item.RowId;
+                        if (receivedItemId == 0 || !entryByUnlockItem.TryGetValue(receivedItemId, out var baseEntry))
+                            continue;
+
+                        // Dieselbe Ware kann in mehreren Shops/Währungen auftauchen (z.B. Uolon Horn
+                        // für Astronomy I UND II) - einmal reicht.
+                        if (!seen.Add((baseEntry.Type, baseEntry.Id)))
+                            continue;
+
+                        var costs = new List<CollectibleCurrency>();
+                        foreach (var cost in slot.ItemCosts)
+                        {
+                            if (cost.ItemCost.RowId == 0 || cost.CurrencyCost == 0 || cost.ItemCost.ValueNullable is not { } costItem)
+                                continue;
+
+                            costs.Add(new CollectibleCurrency
+                            {
+                                Currency = $"{cost.CurrencyCost:N0} {costItem.Name}",
+                                CurrencyIconId = costItem.Icon,
+                                CurrencyItemId = cost.ItemCost.RowId,
+                                CurrencyAmount = cost.CurrencyCost,
+                            });
+                        }
+
+                        if (costs.Count == 0)
+                            continue;
+
+                        foreach (var (territoryId, mapId, x, y) in ItinerantMoogleLocations)
+                        {
+                            result.Add(new CollectibleEntry
+                            {
+                                Id = baseEntry.Id,
+                                Name = baseEntry.Name,
+                                Type = baseEntry.Type,
+                                Category = "Saisonevent",
+                                TerritoryTypeId = territoryId,
+                                MapId = mapId,
+                                Vendor = ItinerantMoogleVendorName,
+                                VendorMapX = x,
+                                VendorMapY = y,
+                                Currency = costs[0].Currency,
+                                CurrencyIconId = costs[0].CurrencyIconId,
+                                CurrencyItemId = costs[0].CurrencyItemId,
+                                CurrencyAmount = costs[0].CurrencyAmount,
+                                AdditionalCurrencies = costs.Count > 1 ? costs.Skip(1).ToList() : null,
+                                Source = $"{ItinerantMoogleVendorName} - Moogle Treasure Trove ({shopName})",
+                                FrameKitUnlockKind = baseEntry.FrameKitUnlockKind,
+                                FrameKitUnlockId = baseEntry.FrameKitUnlockId,
+                                EventName = MoogleTreasureTroveEventName,
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Einzelne leere/reservierte Slots können beim Auslesen werfen (siehe
+                        // EnrichFrameKitVendors) - nur diesen Slot überspringen.
+                        Log.Debug(ex, $"[MoogleTrove] Slot in SpecialShop {shop.RowId} übersprungen.");
+                    }
+                }
+            }
+
+            Log.Info($"[MoogleTrove] {result.Count / ItinerantMoogleLocations.Length} Sammelobjekte beim Itinerant Moogle (Newest/Previous).");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der Itinerant-Moogle-Waren.");
+        }
+
+        return result;
+    }
+
+    /// <summary>Ob für dieses Sammelobjekt ein freischaltendes Item bekannt ist (siehe ResolveUnlockItemId).</summary>
+    public static bool HasUnlockItem(CollectibleEntry entry) => ResolveUnlockItemId(entry) != 0;
+
+    // Lumina "ItemAction"-Typen (ItemAction.Action.RowId) der Items, die ein Sammelobjekt
+    // freischalten - per Auswertung der Spieldaten verifiziert (z.B. "Uolon Horn" = 1322 mit
+    // Data[0] = Mount-RowId 414, "Wind-up Cursor" = 853 mit Data[0] = Companion-RowId 51,
+    // "Maelstrom Command Orchestrion Roll" = 25183 mit AdditionalData = Orchestrion-RowId 549).
+    private const uint ItemActionCompanion = 853;
+    private const uint ItemActionBuddyEquip = 1013;
+    private const uint ItemActionMount = 1322;
+    private const uint ItemActionUnlockLink = 2633; // u.a. Emotes: Data[0] = Emote.UnlockLink
+    private const uint ItemActionTripleTriadCard = 3357;
+    private const uint ItemActionOrnament = 20086;
+    private const uint ItemActionOrchestrion = 25183; // Orchestrion-RowId steht in Item.AdditionalData, nicht in Data
+    private const uint ItemActionGlasses = 37312;
+    private const uint ItemActionFramersKit = 29459; // Kit-ID (== CollectibleEntry.FrameKitUnlockId) steht in Item.AdditionalData
+
+    private static Dictionary<(CollectibleType Type, uint Id), uint>? unlockItemIdCache;
+    private static Dictionary<string, uint>? glassesItemIdByNameCache;
+
+    /// <summary>
+    /// Item-RowId des Items, das dieses Sammelobjekt freischaltet - 0, wenn keins bekannt ist (dann
+    /// sucht Allagan Tools per Name). Einmalig aus dem Item-Sheet aufgebaut. Gibt es mehrere Items
+    /// für dasselbe Sammelobjekt, gewinnt das mit der kleinsten RowId (in der Regel das
+    /// ursprüngliche, nicht eine spätere Neuauflage).
+    /// </summary>
+    private static uint ResolveUnlockItemId(CollectibleEntry entry)
+    {
+        if (unlockItemIdCache == null)
+            BuildUnlockItemCaches();
+
+        // Frisuren: das "Modern Aesthetics"-Buch steht direkt in CharaMakeCustomize.HintItem (entry.Id
+        // ist die CharaMakeCustomize-RowId, siehe GetHairstyleEntries).
+        if (entry.Type == CollectibleType.Hairstyle)
+        {
+            var customizeSheet = DataManager.GetExcelSheet<CharaMakeCustomize>();
+            return customizeSheet != null && customizeSheet.TryGetRow(entry.Id, out var customize) ? customize.HintItem.RowId : 0u;
+        }
+
+        // Framer's Kits: nur Rahmen, die über ein Kit-Item freigeschaltet werden (andere Arten, z.B.
+        // per Errungenschaft, haben kein Item - dann Namenssuche wie bisher).
+        if (entry.Type == CollectibleType.FrameKit)
+        {
+            return entry.FrameKitUnlockKind == FrameKitUnlockKind.FramersKitItem
+                ? unlockItemIdCache!.GetValueOrDefault((CollectibleType.FrameKit, entry.FrameKitUnlockId), 0u)
+                : 0u;
+        }
+
+        // Facewear: die Einträge nutzen eine andere ID als die Items (Glasses vs. GlassesStyle ließen
+        // sich nicht eindeutig zuordnen) - daher über den Namen des Items ("The Faces We Wear - <Name>").
+        if (entry.Type == CollectibleType.Facewear)
+            return glassesItemIdByNameCache!.GetValueOrDefault(entry.Name.Trim(), 0u);
+
+        var key = entry.Type == CollectibleType.Emote
+            ? (CollectibleType.Emote, ResolveEmoteUnlockLink(entry.Id))
+            : (entry.Type, entry.Id);
+        return unlockItemIdCache!.GetValueOrDefault(key, 0u);
+    }
+
+    private static uint ResolveEmoteUnlockLink(uint emoteId)
+    {
+        var emoteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+        return emoteSheet != null && emoteSheet.TryGetRow(emoteId, out var emote) ? emote.UnlockLink : 0u;
+    }
+
+    private static void BuildUnlockItemCaches()
+    {
+        var byKey = new Dictionary<(CollectibleType Type, uint Id), uint>();
+        var glassesByName = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            var itemSheet = DataManager.GetExcelSheet<Item>();
+            if (itemSheet != null)
+            {
+                foreach (var item in itemSheet)
+                {
+                    if (item.ItemAction.RowId == 0 || item.ItemAction.ValueNullable is not { } action)
+                        continue;
+
+                    var data0 = (uint)action.Data[0];
+                    (CollectibleType Type, uint Id)? key = action.Action.RowId switch
+                    {
+                        ItemActionCompanion => (CollectibleType.Minion, data0),
+                        ItemActionBuddyEquip => (CollectibleType.Barding, data0),
+                        ItemActionMount => (CollectibleType.Mount, data0),
+                        ItemActionUnlockLink => (CollectibleType.Emote, data0),
+                        ItemActionTripleTriadCard => (CollectibleType.TripleTriadCard, data0),
+                        ItemActionOrnament => (CollectibleType.FashionAccessory, data0),
+                        ItemActionOrchestrion => (CollectibleType.Orchestrion, item.AdditionalData.RowId),
+                        ItemActionFramersKit => (CollectibleType.FrameKit, item.AdditionalData.RowId),
+                        _ => null,
+                    };
+
+                    if (key is { } k && k.Id != 0)
+                        byKey.TryAdd(k, item.RowId);
+
+                    if (action.Action.RowId == ItemActionGlasses)
+                    {
+                        // "The Faces We Wear - Oval Spectacles" -> "Oval Spectacles"
+                        var itemName = item.Name.ToString();
+                        var dash = itemName.LastIndexOf(" - ", StringComparison.Ordinal);
+                        var glassesName = dash >= 0 ? itemName[(dash + 3)..] : itemName;
+                        glassesByName.TryAdd(glassesName.Trim(), item.RowId);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der Freischalt-Item-Zuordnung für Allagan Tools.");
+        }
+
+        unlockItemIdCache = byKey;
+        glassesItemIdByNameCache = glassesByName;
+    }
+
     // Anders als OpenAllaganToolsItemInfo (Chat-Befehl) hier bewusst echte IPC - "AllaganTools.
     // GetItemCountsByCharacter(itemId, currentCharacterOnly, inventoryCategories, includeSharedStorage)"
     // liefert je Charakter-/Retainer-ID (ulong) die besessene Menge, unabhängig davon, ob dessen
@@ -4638,6 +5287,71 @@ public sealed class Plugin : IDalamudPlugin
     /// IDs abgeglichen werden (schließt dabei automatisch Werte für die eigene Spielfigur/FC-Truhen
     /// aus, auch ohne die genaue InventoryCategory-Aufschlüsselung von Allagan Tools zu kennen).
     /// </summary>
+    // Siehe GetAllaganToolsCharacterNames.
+    private static Dictionary<ulong, string> allaganToolsCharacterNames = new();
+    private static DateTime allaganToolsConfigLastWrite = DateTime.MinValue;
+    private static DateTime allaganToolsConfigLastCheck = DateTime.MinValue;
+    private static readonly TimeSpan AllaganToolsConfigCheckInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Namen der Allagan Tools bekannten Charaktere/Retainer/FCs je ID - Allagan Tools bietet dafür
+    /// KEINE IPC (nur IDs, siehe GetRetainerItemCounts), speichert sie aber in seiner eigenen
+    /// Konfigurationsdatei ("SavedCharacters": ID -> { CharacterId, Name, OwnerId, ... }). Nur
+    /// lesend geöffnet (FileShare.ReadWrite, Allagan Tools darf jederzeit weiterschreiben) und nur
+    /// neu eingelesen, wenn sich die Datei geändert hat (höchstens alle
+    /// AllaganToolsConfigCheckInterval geprüft). Bei jedem Fehler bleibt der letzte Stand erhalten.
+    /// </summary>
+    private static Dictionary<ulong, string> GetAllaganToolsCharacterNames()
+    {
+        if (DateTime.UtcNow - allaganToolsConfigLastCheck < AllaganToolsConfigCheckInterval)
+            return allaganToolsCharacterNames;
+
+        allaganToolsConfigLastCheck = DateTime.UtcNow;
+        try
+        {
+            var configDirectory = PluginInterface.ConfigFile.DirectoryName;
+            if (configDirectory == null)
+                return allaganToolsCharacterNames;
+
+            var path = System.IO.Path.Combine(configDirectory, AllaganToolsInternalName + ".json");
+            if (!System.IO.File.Exists(path))
+                return allaganToolsCharacterNames;
+
+            var lastWrite = System.IO.File.GetLastWriteTimeUtc(path);
+            if (lastWrite == allaganToolsConfigLastWrite)
+                return allaganToolsCharacterNames;
+
+            using var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
+            using var document = System.Text.Json.JsonDocument.Parse(stream);
+            var names = new Dictionary<ulong, string>();
+            if (document.RootElement.TryGetProperty("SavedCharacters", out var savedCharacters)
+                && savedCharacters.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                foreach (var character in savedCharacters.EnumerateObject())
+                {
+                    if (character.Value.ValueKind != System.Text.Json.JsonValueKind.Object)
+                        continue;
+
+                    // CharacterId kann (z.B. bei FCs) größer als long.MaxValue sein - daher ulong.
+                    if (!character.Value.TryGetProperty("CharacterId", out var idElement) || !idElement.TryGetUInt64(out var id))
+                        continue;
+
+                    if (character.Value.TryGetProperty("Name", out var nameElement) && nameElement.ValueKind == System.Text.Json.JsonValueKind.String)
+                        names[id] = nameElement.GetString() ?? string.Empty;
+                }
+            }
+
+            allaganToolsCharacterNames = names;
+            allaganToolsConfigLastWrite = lastWrite;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Konnte Retainer-Namen nicht aus der Allagan-Tools-Konfiguration lesen.");
+        }
+
+        return allaganToolsCharacterNames;
+    }
+
     public static unsafe Dictionary<string, uint> GetRetainerItemCounts(uint itemId)
     {
         var result = new Dictionary<string, uint>();
@@ -4661,17 +5375,49 @@ public sealed class Plugin : IDalamudPlugin
             return result;
         }
 
+        // Namen nur, soweit RetainerManager sie kennt - dessen Liste ist erst gefüllt, nachdem in
+        // DIESER Sitzung eine Glocke benutzt wurde. Bisher wurden deshalb ausschließlich dort
+        // bekannte IDs übernommen und alle Allagan-Tools-Bestände verworfen, solange die Liste leer
+        // war (Nutzer-Report: Retainer mit 80+ Stück, angezeigt wurde gar nichts). Jetzt zählt jede
+        // von Allagan Tools gelieferte ID außer der eigenen Spielfigur (currentCharacterOnly=true
+        // beschränkt bereits auf eigene Retainer/FC-/Haus-Lager); unbekannte bekommen einen
+        // Platzhalternamen.
+        var retainerNames = new Dictionary<ulong, string>();
         var retainerManager = RetainerManager.Instance();
-        if (retainerManager == null)
-            return result;
-
-        foreach (var retainer in retainerManager->Retainers)
+        if (retainerManager != null)
         {
-            if (retainer.RetainerId == 0)
+            foreach (var retainer in retainerManager->Retainers)
+            {
+                if (retainer.RetainerId != 0)
+                    retainerNames[retainer.RetainerId] = retainer.NameString;
+            }
+        }
+
+        var ownCharacterId = PlayerState.Instance()->ContentId;
+        var allaganToolsNames = GetAllaganToolsCharacterNames();
+        var unknownIndex = 0;
+        foreach (var (ownerId, count) in byCharacter)
+        {
+            if (ownerId == ownCharacterId || count == 0)
                 continue;
 
-            if (byCharacter.TryGetValue(retainer.RetainerId, out var count) && count > 0)
-                result[retainer.NameString] = count;
+            string name;
+            if (retainerNames.TryGetValue(ownerId, out var knownName) && !string.IsNullOrEmpty(knownName))
+            {
+                name = knownName;
+            }
+            else if (allaganToolsNames.TryGetValue(ownerId, out var savedName) && !string.IsNullOrEmpty(savedName))
+            {
+                name = savedName;
+            }
+            else
+            {
+                unknownIndex++;
+                name = Loc.T($"Retainer/Lager {unknownIndex}", $"Retainer/storage {unknownIndex}");
+            }
+
+
+            result[name] = result.GetValueOrDefault(name) + count;
         }
 
         return result;
@@ -5277,6 +6023,10 @@ public sealed class Plugin : IDalamudPlugin
         return classJobRowId;
     }
 
+    // Höchstens so viele Zehner-Stufen je Klasse (ARR-Basisklassen haben 5) - nicht vorhandene
+    // MonsterNote-Zeilen werden in GetHuntingLogEntries ohnehin übersprungen.
+    private const int MaxHuntingLogTiers = 10;
+
     /// <summary>
     /// Berechnet die Hunting-Log-Einträge des AKTUELL AKTIVEN Rangs der AKTUELLEN Klasse, die zur
     /// übergebenen Zone gehören - live pro Frame berechnet (nicht gecacht wie GetLiveZoneEntries,
@@ -5327,29 +6077,51 @@ public sealed class Plugin : IDalamudPlugin
 
         var zonePlaceNameId = territoryRow.PlaceName.RowId;
 
-        for (var subRank = 0; subRank < 10; subRank++)
+        // Neben der aktiven Stufe auch alle HÖHEREN (noch nicht erreichten) Stufen anzeigen -
+        // markiert als "Bedingung nicht erfüllt" (siehe CollectibleEntry.HuntingLogRequiredRank),
+        // da Kills dort noch nicht zählen. Niedrigere Stufen sind per Definition bereits komplett
+        // (das Spiel schaltet erst nach allen 10 Teil-Rängen weiter). Dasselbe Monster kann in
+        // mehreren Stufen vorkommen - dann nur einmal (die niedrigste Stufe gewinnt), sonst gäbe es
+        // doppelte Einträge mit derselben Id (siehe z.B. ImGui-IDs im Overlay, StillNeeded).
+        var addedTargetIds = new HashSet<uint>();
+        for (var noteTier = tier; noteTier < MaxHuntingLogTiers; noteTier++)
         {
-            var monsterNoteRowId = (uint)(classId * 10000 + tier * 10 + subRank + 1);
-            if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
-                continue;
-
-            var rankCounts = slot.RankData[subRank];
-
-            // Teil-Rang schon komplett (alle seine Ziele erreicht)? Dann überspringen - siehe
-            // Klassenkommentar oben.
-            var isComplete = true;
-            for (var i = 0; i < 4; i++)
+            var isLockedTier = noteTier > tier;
+            for (var subRank = 0; subRank < 10; subRank++)
             {
-                if (note.MonsterNoteTarget[i].RowId != 0 && rankCounts[i] < note.Count[i])
+                var monsterNoteRowId = (uint)(classId * 10000 + noteTier * 10 + subRank + 1);
+                if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
+                    continue;
+
+                // Fortschritt gibt es nur für die aktive Stufe - höhere starten bei 0.
+                var rankCounts = new int[4];
+                if (!isLockedTier)
                 {
-                    isComplete = false;
-                    break;
+                    var liveCounts = slot.RankData[subRank];
+                    for (var i = 0; i < 4; i++)
+                        rankCounts[i] = liveCounts[i];
                 }
+
+                // Teil-Rang schon komplett (alle seine Ziele erreicht)? Dann überspringen - siehe
+                // Klassenkommentar oben.
+                var isComplete = !isLockedTier;
+                for (var i = 0; i < 4 && isComplete; i++)
+                {
+                    if (note.MonsterNoteTarget[i].RowId != 0 && rankCounts[i] < note.Count[i])
+                        isComplete = false;
+                }
+
+                if (isComplete)
+                    continue;
+
+                AddHuntingLogTargets(note, rankCounts, isLockedTier, noteTier, subRank);
             }
+        }
 
-            if (isComplete)
-                continue;
+        return result;
 
+        void AddHuntingLogTargets(Lumina.Excel.Sheets.MonsterNote note, int[] rankCounts, bool isLockedTier, int noteTier, int subRank)
+        {
             for (var i = 0; i < 4; i++)
             {
                 var targetRef = note.MonsterNoteTarget[i];
@@ -5385,6 +6157,9 @@ public sealed class Plugin : IDalamudPlugin
                 if (string.IsNullOrEmpty(monsterName))
                     continue;
 
+                if (!addedTargetIds.Add(target.Value.RowId))
+                    continue;
+
                 ManualHuntingLogPositions.TryGetValue(target.Value.RowId, out var manualPosition);
 
                 result.Add(new CollectibleEntry
@@ -5397,12 +6172,11 @@ public sealed class Plugin : IDalamudPlugin
                     MapId = territoryRow.Map.RowId,
                     WorldPosition = manualPosition == default ? null : manualPosition,
                     BNpcNameId = target.Value.BNpcName.RowId,
-                    Source = $"{className} {tier * 10 + subRank + 1:00}",
+                    Source = $"{className} {noteTier * 10 + subRank + 1:00}",
+                    HuntingLogRequiredRank = isLockedTier ? noteTier + 1 : null,
                 });
             }
         }
-
-        return result;
     }
 
     /// <summary>
@@ -5455,6 +6229,7 @@ public sealed class Plugin : IDalamudPlugin
         CompactOverlayWindow.Dispose();
         NavigationArrowWindow.Dispose();
         QuestAutomation.Dispose();
+        CombatPluginInstance.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
 
