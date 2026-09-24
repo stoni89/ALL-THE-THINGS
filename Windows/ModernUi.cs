@@ -179,7 +179,7 @@ public static class ModernUi
     // Deutlich knapper als CardMargin (14, für links/rechts nötig, damit der Kartenhintergrund mit
     // dem eingerückten Inhalt UND der GroupLabel-Überschrift darüber fluchtet) - nur oben/unten gab
     // es keinen Grund für denselben großzügigen Wert, das ließ jede Karte unnötig hoch wirken.
-    private const float CardVerticalPadding = 10f;
+    public const float CardVerticalPadding = 10f;
 
     // Abstand NACH einer Karte (bis zur nächsten Überschrift/Karte) - bewusst eigener, größerer Wert
     // statt CardVerticalPadding wiederzuverwenden: CardVerticalPadding bestimmt zusätzlich die
@@ -253,19 +253,60 @@ public static class ModernUi
     /// Inhaltsbereichs (Karte/Fenster), NACHDEM label links geschrieben wurde - für Zeilen im
     /// Stil "Beschriftung ..................... Regler" wie im Referenzdesign. Ruft selbst kein
     /// Widget auf - direkt danach z.B. ImGui.SliderFloat mit SetNextItemWidth(controlWidth) davor.
+    /// helpText siehe HelpIconIfHovered-Kommentar - die Zeilenhöhe wird dabei als einfache
+    /// Framehöhe angenommen (für mehrzeilige Controls direkt HelpIconIfHovered selbst aufrufen).
     /// </summary>
-    public static void LabelRow(string label, float controlWidth)
+    public static void LabelRow(string label, float controlWidth, string? helpText = null)
     {
+        var rowScreenMin = ImGui.GetCursorScreenPos();
+        var totalAvail = ImGui.GetContentRegionAvail().X - CardMargin;
+
         // Richtet die Textgrundlinie an der eines Standard-Widgets (Slider/Dropdown/Button) aus -
         // ohne das säße der (niedrigere) reine Text sichtbar zu weit oben, während das danach per
         // SameLine() gezeichnete, durch FramePadding höhere Widget die restliche Zeilenhöhe füllt.
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(label);
+        var labelMax = ImGui.GetItemRectMax();
+        var labelMinY = ImGui.GetItemRectMin().Y;
+
         ImGui.SameLine();
         var avail = ImGui.GetContentRegionAvail().X - CardMargin;
         if (avail > controlWidth)
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + avail - controlWidth);
         ImGui.SetNextItemWidth(controlWidth);
+
+        if (!string.IsNullOrEmpty(helpText))
+            HelpIconIfHovered(rowScreenMin, new Vector2(totalAvail, ImGui.GetFrameHeight()), labelMax, labelMinY, helpText);
+    }
+
+    /// <summary>
+    /// Zeichnet ein kleines "?"-Icon direkt hinter labelEndScreenPos (und zeigt helpText als
+    /// Tooltip), aber NUR solange die Maus irgendwo über der übergebenen Zeilenfläche
+    /// (rowScreenMin bis rowScreenMin+rowSize) schwebt - verschwindet wieder, sobald die Maus die
+    /// Zeile verlässt (siehe ToggleRow/LabelRow-Aufrufer). Per Draw-List statt eines echten Widgets,
+    /// damit es das Layout/die Cursor-Position nicht beeinflusst.
+    /// </summary>
+    public static void HelpIconIfHovered(Vector2 rowScreenMin, Vector2 rowSize, Vector2 labelEndScreenPos, float labelTopScreenY, string helpText)
+    {
+        if (!ImGui.IsMouseHoveringRect(rowScreenMin, rowScreenMin + rowSize))
+            return;
+
+        Vector2 iconSize;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            iconSize = ImGui.CalcTextSize(FontAwesomeIcon.QuestionCircle.ToIconString());
+
+        var iconPos = new Vector2(labelEndScreenPos.X + 6f, labelTopScreenY + (ImGui.GetTextLineHeight() - iconSize.Y) * 0.5f);
+
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            ImGui.GetWindowDrawList().AddText(iconPos, ImGui.ColorConvertFloat4ToU32(TextMuted), FontAwesomeIcon.QuestionCircle.ToIconString());
+        }
+
+        // Tooltip bewusst nur, wenn die Maus wirklich über dem kleinen Icon selbst steht (nicht
+        // schon irgendwo in der Zeile, die nur den Icon-Zeichnungsversuch auslöst) - explizite
+        // Nutzeranforderung.
+        if (ImGui.IsMouseHoveringRect(iconPos, iconPos + iconSize))
+            ImGui.SetTooltip(helpText);
     }
 
     // Von ToggleRow UND ToggleSwitch genutzt, damit beide immer dieselbe Höhe annehmen - größer
@@ -274,9 +315,11 @@ public static class ModernUi
 
     /// <summary>
     /// Zeile "Beschriftung ..................... Toggle" - Kombination aus LabelRow und
-    /// ToggleSwitch für den häufigsten Fall (ein Bool-Setting pro Zeile).
+    /// ToggleSwitch für den häufigsten Fall (ein Bool-Setting pro Zeile). helpText siehe
+    /// HelpIconIfHovered-Kommentar - ersetzt den früher permanent darunter stehenden Fließtext:
+    /// erscheint nur noch als "?"-Icon neben dem Titel, solange die Zeile gehovert wird.
     /// </summary>
-    public static bool ToggleRow(string label, ref bool value)
+    public static bool ToggleRow(string label, ref bool value, string? helpText = null)
     {
         // Bewusst mit von Hand berechneten Positionen statt AlignTextToFramePadding() (das nimmt
         // die volle Standard-Framehöhe an) - der Toggle weicht davon ab (siehe ToggleHeightScale),
@@ -288,6 +331,7 @@ public static class ModernUi
         var textHeight = ImGui.GetTextLineHeight();
         var rowHeight = MathF.Max(toggleHeight, textHeight);
         var rowStart = ImGui.GetCursorPos();
+        var rowScreenMin = ImGui.GetCursorScreenPos();
 
         // VOR jeder Cursor-Bewegung gemessen - liefert die Breite von rowStart.X bis zum rechten
         // Kartenrand, unabhängig davon, wie breit das Label ist.
@@ -295,10 +339,15 @@ public static class ModernUi
 
         ImGui.SetCursorPos(rowStart + new Vector2(0f, (rowHeight - textHeight) * 0.5f));
         ImGui.TextUnformatted(label);
+        var labelMax = ImGui.GetItemRectMax();
+        var labelMinY = ImGui.GetItemRectMin().Y;
 
         var toggleX = totalAvail > toggleWidth ? rowStart.X + totalAvail - toggleWidth : rowStart.X;
         ImGui.SetCursorPos(new Vector2(toggleX, rowStart.Y + (rowHeight - toggleHeight) * 0.5f));
         var changed = ToggleSwitch($"##toggle_{label}", ref value);
+
+        if (!string.IsNullOrEmpty(helpText))
+            HelpIconIfHovered(rowScreenMin, new Vector2(totalAvail, rowHeight), labelMax, labelMinY, helpText);
 
         ImGui.SetCursorPos(rowStart + new Vector2(0f, rowHeight));
         return changed;

@@ -19,6 +19,7 @@ using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
 using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using LuminaSupplemental.Excel.Model;
@@ -76,15 +77,96 @@ public sealed class Plugin : IDalamudPlugin
     public SightseeingAutomation SightseeingAutomation { get; init; }
     public ChocobokeepAutomation ChocobokeepAutomation { get; init; }
 
+    // Eine einzige, geteilte Instanz statt je einer pro Automation - es gibt nur EINEN Chocobo-
+    // Begleiter/eine Gysahl-Greens-Abklingzeit im Spiel; mit getrennten Instanzen könnten
+    // QuestAutomation und HuntingLogAutomation (falls beide gleichzeitig aktiv) unabhängig
+    // voneinander gleichzeitig einen Beschwören-Versuch auslösen, ohne voneinander zu wissen.
+    public ChocoboCompanionSupport ChocoboCompanionSupportInstance { get; init; }
+
+    /// <summary>Siehe ChocoboCompanionSupportInstance-Kommentar - für QuestAutomation/HuntingLogAutomation, die keine Plugin-Instanz halten.</summary>
+    public static ChocoboCompanionSupport ChocoboCompanionSupport => instance.ChocoboCompanionSupportInstance;
+
+    // Siehe CombatPluginBridge - eine geteilte Instanz (hält u.a. die Wrath-Combo-Lease).
+    public CombatPluginBridge CombatPluginInstance { get; init; }
+
+    public static CombatPluginBridge CombatPlugin => instance.CombatPluginInstance;
+
+    /// <summary>Siehe Configuration.CombatPlugin.</summary>
+    public static CombatPluginKind? ConfiguredCombatPlugin => instance.Configuration.CombatPlugin;
+
+    // Schneller Nachschlage-Index über Configuration.Blacklist (wird im Overlay pro Frame für jeden
+    // Eintrag abgefragt) - bei jeder Änderung über AddToBlacklist/RemoveFromBlacklist neu aufgebaut.
+    private static HashSet<(CollectibleType Type, uint Id)>? blacklistIndex;
+
+    private static HashSet<(CollectibleType Type, uint Id)> BlacklistIndex =>
+        blacklistIndex ??= instance.Configuration.Blacklist.Select(b => (b.Type, b.Id)).ToHashSet();
+
+    /// <summary>
+    /// Ob der Eintrag auf der Blacklist steht (siehe Configuration.Blacklist) - dann weder im Overlay
+    /// angezeigt noch von einer Automation erfasst (siehe CompactOverlayWindow.DrawContent).
+    /// </summary>
+    public static bool IsBlacklisted(CollectibleEntry entry) => BlacklistIndex.Contains((entry.Type, entry.Id));
+
+    // "(1/3)"-Fortschritt am Ende von Hunting-Log-Namen - gehört nicht in den gespeicherten Namen.
+    private static readonly System.Text.RegularExpressions.Regex ProgressSuffixPattern = new(@"\s*\(\d+/\d+\)$");
+
+    public static void AddToBlacklist(CollectibleEntry entry)
+    {
+        if (IsBlacklisted(entry))
+            return;
+
+        instance.Configuration.Blacklist.Add(new BlacklistedEntry
+        {
+            Type = entry.Type,
+            Id = entry.Id,
+            Name = ProgressSuffixPattern.Replace(entry.Name, string.Empty),
+        });
+        instance.Configuration.Save();
+        blacklistIndex = null;
+    }
+
+    public static void RemoveFromBlacklist(CollectibleType type, uint id)
+    {
+        if (instance.Configuration.Blacklist.RemoveAll(b => b.Type == type && b.Id == id) == 0)
+            return;
+
+        instance.Configuration.Save();
+        blacklistIndex = null;
+    }
+
+    /// <summary>
+    /// Trägt das installierte Kampf-Plugin als Auswahl ein, solange keines (oder ein nicht mehr
+    /// installiertes) gewählt ist - siehe Configuration.CombatPlugin. Speichert nur bei einer
+    /// tatsächlichen Änderung, darf also jeden Frame aufgerufen werden (Einstellungsseite).
+    /// </summary>
+    public static void EnsureCombatPluginDefault()
+    {
+        var config = instance.Configuration;
+        var installed = CombatPluginBridge.GetInstalled();
+        if (installed.Count == 0 || (config.CombatPlugin.HasValue && installed.Contains(config.CombatPlugin.Value)))
+            return;
+
+        config.CombatPlugin = installed[0];
+        config.Save();
+    }
+
     public Plugin()
     {
         instance = this;
+
+        // Welcher Build gerade tatsächlich geladen ist (Dev-Plugin-Reload greift nicht in jedem
+        // parallel laufenden Spielclient) - einfacher Abgleich mit dem Zeitstempel der DLL.
+        Log.Info($"[TheExplorersCodex] Geladen - Build {System.IO.File.GetLastWriteTime(PluginInterface.AssemblyLocation.FullName):yyyy-MM-dd HH:mm:ss}.");
 
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         Configuration.SanitizeTypeOrder();
 
         navigationFlagToPointQuery = PluginInterface.GetIpcSubscriber<Vector3?>("vnavmesh.Query.Mesh.FlagToPoint");
+        vnavPathfindInProgress = PluginInterface.GetIpcSubscriber<bool>("vnavmesh.SimpleMove.PathfindInProgress");
 
+        ChocoboCompanionSupportInstance = new ChocoboCompanionSupport();
+        CombatPluginInstance = new CombatPluginBridge();
+        EnsureCombatPluginDefault();
         QuestAutomation = new QuestAutomation();
         AetheryteAutomation = new AetheryteAutomation();
         GoToAutomation = new GoToAutomation();
@@ -661,7 +743,8 @@ public sealed class Plugin : IDalamudPlugin
     /// Gil-Händler (GilShopItem) werden absichtlich NICHT abgedeckt (siehe Kommentar unten) -
     /// betrifft vermutlich nur einen kleinen Teil der Kit-Item-Rahmen.
     /// </summary>
-    private readonly record struct FrameKitShopMatch(uint ShopId, uint CurrencyAmount, uint CurrencyItemId, uint CurrencyIconId, string CurrencyText);
+    // RequiredAchievement: nur bei kostenlosen Errungenschafts-Belohnungen (siehe EnrichFrameKitVendors), sonst null.
+    private readonly record struct FrameKitShopMatch(uint ShopId, uint CurrencyAmount, uint CurrencyItemId, uint CurrencyIconId, string CurrencyText, string? RequiredAchievement = null);
 
     private static void EnrichFrameKitVendors(List<CollectibleEntry> entries)
     {
@@ -736,7 +819,17 @@ public sealed class Plugin : IDalamudPlugin
                             }
 
                             if (costAmount == 0)
+                            {
+                                // Kostenlose "Achievement Rewards"-Slots (z.B. Kornago Merchant: "Crucible
+                                // Framer's Kit" für "Freeing the Beast") - statt eines Preises zählt dort nur
+                                // die Errungenschaft (siehe CollectibleEntry.RequiredAchievement).
+                                var achievementName = slot.AchievementUnlock.RowId != 0 ? slot.AchievementUnlock.ValueNullable?.Name.ToString() : null;
+                                if (string.IsNullOrEmpty(achievementName))
+                                    continue;
+
+                                itemRowIdToShopMatch[itemRowId] = new FrameKitShopMatch(shop.RowId, 0, 0, 0, string.Empty, achievementName);
                                 continue;
+                            }
 
                             itemRowIdToShopMatch[itemRowId] = new FrameKitShopMatch(shop.RowId, costAmount, costItemId, costIconId, $"{costAmount:N0} {costName}");
                         }
@@ -955,7 +1048,8 @@ public sealed class Plugin : IDalamudPlugin
                     entry.CurrencyIconId = match.CurrencyIconId;
                     entry.CurrencyItemId = match.CurrencyItemId;
                     entry.CurrencyAmount = match.CurrencyAmount;
-                    entry.Source = $"{vendorName} - {match.CurrencyText}";
+                    entry.RequiredAchievement ??= match.RequiredAchievement;
+                    entry.Source = string.IsNullOrEmpty(match.CurrencyText) ? vendorName : $"{vendorName} - {match.CurrencyText}";
                     enrichedCount++;
                 }
                 catch (Exception ex)
@@ -1206,10 +1300,15 @@ public sealed class Plugin : IDalamudPlugin
             if (!itemName.StartsWith("Modern Aesthetics", StringComparison.OrdinalIgnoreCase))
                 continue;
 
+            // Nur der eigentliche Frisurname ("Loosened Locks" statt "Modern Aesthetics - Loosened
+            // Locks") - die Zeile im Overlay wäre sonst zu lang, der Typ steht ohnehin schon dabei.
+            var dash = itemName.IndexOf(" - ", StringComparison.Ordinal);
+            var hairstyleName = dash >= 0 ? itemName[(dash + 3)..].Trim() : itemName;
+
             result.Add(new CollectibleEntry
             {
                 Id = row.RowId,
-                Name = itemName,
+                Name = hairstyleName,
                 Type = CollectibleType.Hairstyle,
                 Category = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
                 Source = Loc.T("Moderne Ästhetik", "Modern Aesthetics"),
@@ -1217,9 +1316,60 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         EnrichHairstyleVendors(result);
+        EnrichHairstyleSpecialCurrencyVendors(result);
 
         hairstyleEntriesCache = result;
         return result;
+    }
+
+    // Von Hand nachgetragene Händler für "Modern Aesthetics"-Bücher, die NICHT für Gil, sondern über
+    // einen Sonderwährungs-Tauschhändler (SpecialShop) verkauft werden - EnrichHairstyleVendors
+    // deckt bewusst nur reine Gil-Händler ab (siehe dessen Kommentar), solche Fälle blieben sonst
+    // ohne Fundort. Schlüssel ist der Frisurname ohne "Modern Aesthetics - "-Präfix (siehe
+    // GetHairstyleEntries, nicht die CharaMakeCustomize-RowId) - dasselbe Buch
+    // taucht im Sheet einmal PRO Rasse/Geschlecht auf (mehrere RowIds, ein Name), hier reicht ein
+    // einziger Eintrag für alle.
+    private static readonly Dictionary<string, (string Vendor, uint TerritoryId, uint MapId, float X, float Y, string CurrencyText, uint CurrencyIconId, uint CurrencyItemId, uint CurrencyAmount, string? RequiredQuest)> HairstyleSpecialVendorOverrides = new()
+    {
+        // Ose Wyd (Il Mheg) - Pilgrim's-Traverse-Tauschhändler, siehe Plugin.cs-Git-Historie.
+        ["Simple and Clean"] = ("Ose Wyd", 816, 494, 29.9f, 5.9f, "99 Luminous Oil", 22654, 47342, 99, null),
+
+        // Kornago Merchant (Central Shroud, Bentbranch Meadows) - Beastmaster-Tauschhändler, laut
+        // SpecialShop-Daten erst nach der Quest "Gobsmacked" kaufbar (später als die übrigen
+        // Faded-Remnant-Waren, siehe CurrencyRequiredQuest).
+        ["Loosened Locks"] = ("Kornago Merchant", 148, 4, 21.9f, 22.7f, "500 Faded Remnants of Resilience", 20217, 51734, 500, "Gobsmacked"),
+    };
+
+    private static void EnrichHairstyleSpecialCurrencyVendors(List<CollectibleEntry> entries)
+    {
+        // Dasselbe Buch steht einmal PRO Rasse/Geschlecht in der Liste (siehe Kommentar an
+        // HairstyleSpecialVendorOverrides) - nur der ERSTE Eintrag je Name bekommt den Händler
+        // (wie bei EnrichHairstyleVendors), sonst stünde das Buch im Overlay bis zu 10x in der
+        // Händlerzone. Freischaltung gilt ohnehin je Buch (gleiche UnlockLink), nicht je Zeile.
+        var enrichedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in entries)
+        {
+            if (entry.Type != CollectibleType.Hairstyle || entry.TerritoryTypeId != 0)
+                continue;
+
+            if (!HairstyleSpecialVendorOverrides.TryGetValue(entry.Name, out var vendor))
+                continue;
+
+            if (!enrichedNames.Add(entry.Name))
+                continue;
+
+            entry.Vendor = vendor.Vendor;
+            entry.TerritoryTypeId = vendor.TerritoryId;
+            entry.MapId = vendor.MapId;
+            entry.VendorMapX = vendor.X;
+            entry.VendorMapY = vendor.Y;
+            entry.Currency = vendor.CurrencyText;
+            entry.CurrencyIconId = vendor.CurrencyIconId;
+            entry.CurrencyItemId = vendor.CurrencyItemId;
+            entry.CurrencyAmount = vendor.CurrencyAmount;
+            entry.RequiredQuest ??= vendor.RequiredQuest;
+            entry.Source = $"{vendor.Vendor} - {vendor.CurrencyText}";
+        }
     }
 
     /// <summary>
@@ -1480,23 +1630,106 @@ public sealed class Plugin : IDalamudPlugin
     private static readonly Dictionary<uint, Vector3> SightseeingApproachOverrides = new()
     {
         [2162688] = new Vector3(-83.241394f, 42.393375f, -170.998f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162691] = new Vector3(-269.60074f, 29.380001f, -206.16368f), // The Skylift (Middle La Noscea)
+        [2162690] = new Vector3(-58.95674f, 27.313725f, -118.16382f),  // Seasong Grotto (Middle La Noscea)
+        [2162692] = new Vector3(194.44441f, 73.78774f, 302.63824f),    // La Thagran Eastroad (Middle La Noscea)
+        [2162708] = new Vector3(-72.16092f, 11.995184f, -416.05194f),  // Woad Whisper Canyon (Middle La Noscea)
+        [2162709] = new Vector3(213.05968f, 117.65125f, -222.40886f),  // Summerford Farms (Middle La Noscea)
+        [2162695] = new Vector3(425.21655f, 15.025984f, 464.70297f),   // The Brewer's Beacon (Western La Noscea)
+        [2162694] = new Vector3(597.14575f, 73.67687f, -112.00588f),   // Red Rooster Stead (Lower La Noscea)
+        [2162710] = new Vector3(503.04245f, 106.69299f, -434.7053f),   // The Grey Fleet (Lower La Noscea)
+        [2162715] = new Vector3(67.52792f, 1.9575521f, 47.7629f),      // Camp Skull Valley (Western La Noscea)
+        [2162719] = new Vector3(381.97714f, 5.188155f, 198.84981f),    // Jijiroon's Trading Post (Upper La Noscea)
+        [2162718] = new Vector3(-428.29407f, 69.60198f, 28.178936f),   // Thalaos (Upper La Noscea)
     };
 
-    // Von Hand nachgetragener ZWISCHENSTOPP vor der eigentlichen Zielposition (Key = Adventure-
-    // RowId) - für Punkte, bei denen selbst der über die Karten-Flagge/FlagToPoint gefundene grobe
-    // Laufweg (siehe SightseeingAutomation.BeginNavigateToEntry) gegen eine Wand/ein Geländer läuft,
-    // statt zunächst einen sicheren nahegelegenen Punkt anzulaufen. Ist einer hinterlegt, läuft die
-    // Automation ZUERST dorthin (mit der normalen, großzügigen Toleranz) und erst von dort den
-    // letzten, engen Schritt zur echten Position (siehe SightseeingApproachOverrides/
-    // BeginFinalApproach) - der Umweg über die Karten-Flagge entfällt dann komplett.
-    private static readonly Dictionary<uint, Vector3> SightseeingApproachWaypoints = new()
+    // Je Zwischenstopp: Position + ob dieses Teilstück fliegend angeflogen werden darf (false =
+    // erzwungen zu Fuß/abgemountet, z.B. für einen Durchgang wie eine Tür, durch die man nicht
+    // hindurchfliegen kann) - siehe SightseeingApproachWaypoints-Kommentar.
+    public readonly record struct SightseeingApproachWaypoint(Vector3 Position, bool AllowFlying = true);
+
+    // Von Hand nachgetragene ZWISCHENSTOPPS (der Reihe nach abzulaufen) vor der eigentlichen
+    // Zielposition (Key = Adventure-RowId) - für Punkte, bei denen selbst der über die Karten-
+    // Flagge/FlagToPoint gefundene grobe Laufweg (siehe SightseeingAutomation.BeginNavigateToEntry)
+    // gegen eine Wand/ein Geländer läuft oder ein enger Durchgang (z.B. eine Tür) einen bestimmten,
+    // NICHT fliegenden Anflugweg braucht, statt direkt den geraden/groben Weg zu nehmen. Sind welche
+    // hinterlegt, läuft die Automation ZUERST der Reihe nach dorthin (jeweils mit der normalen,
+    // großzügigen Toleranz, fliegend nur wenn AllowFlying) und erst vom letzten Zwischenstopp aus den
+    // finalen, engen (wieder fliegend erlaubten) Schritt zur echten Position (siehe
+    // SightseeingApproachOverrides/BeginFinalApproach) - der Umweg über die Karten-Flagge entfällt
+    // dann komplett.
+    private static readonly Dictionary<uint, SightseeingApproachWaypoint[]> SightseeingApproachWaypoints = new()
     {
-        [2162688] = new Vector3(-82.96662f, 41.993416f, -170.93227f), // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162688] = new[] { new SightseeingApproachWaypoint(new Vector3(-82.96662f, 41.993416f, -170.93227f)) }, // Barracuda Piers (Limsa Lominsa Upper Decks)
+        [2162709] = new[] // Summerford Farms (Middle La Noscea) - erst hinfliegen, dann (weiterhin beritten, nur nicht mehr fliegend, siehe SightseeingAutomation.TryBeginPathfindAccepted) durch die Tür, dann fliegend hoch zum eigentlichen Punkt
+        {
+            new SightseeingApproachWaypoint(new Vector3(210.27715f, 113.26443f, -215.51048f)),
+            new SightseeingApproachWaypoint(new Vector3(224.70628f, 113.49955f, -227.0562f), AllowFlying: false),
+            // Erst senkrecht hoch (gleiche X/Z wie der Türausgang, nur auf Höhe von Punkt 3) - direkt
+            // von der Tür aus horizontal loszufliegen führte über einen Umweg (vermutlich, weil der
+            // Türausgang selbst navmesh-technisch noch als "drinnen" gilt).
+            new SightseeingApproachWaypoint(new Vector3(224.70628f, 118.22706f, -227.0562f)),
+            new SightseeingApproachWaypoint(new Vector3(213.03912f, 118.22706f, -222.41542f)),
+        },
     };
 
     /// <summary>Siehe SightseeingApproachWaypoints-Kommentar.</summary>
-    public static bool TryGetSightseeingApproachWaypoint(uint adventureId, out Vector3 waypoint) =>
-        SightseeingApproachWaypoints.TryGetValue(adventureId, out waypoint);
+    public static bool TryGetSightseeingApproachWaypoints(uint adventureId, out IReadOnlyList<SightseeingApproachWaypoint> waypoints)
+    {
+        if (SightseeingApproachWaypoints.TryGetValue(adventureId, out var found))
+        {
+            waypoints = found;
+            return true;
+        }
+
+        waypoints = Array.Empty<SightseeingApproachWaypoint>();
+        return false;
+    }
+
+    // Von Hand nachgetragene ZWISCHENSTOPPS, die NACH dem Freischalten eines Punkts der Reihe nach
+    // zu Fuß (nie fliegend) abgelaufen werden, bevor es zum nächsten Sightseeing-Punkt weitergeht
+    // (Key = Adventure-RowId) - für Punkte, deren Anflug (siehe SightseeingApproachWaypoints) durch
+    // einen engen Durchgang wie eine Tür führt: derselbe Weg muss zu Fuß auch wieder raus, bevor
+    // erneut losgeflogen werden kann. Nur, wenn nach dem aktuellen Punkt überhaupt noch ein anderer,
+    // aktuell erreichbarer Sightseeing-Punkt übrig ist (siehe SightseeingAutomation.TryWalkOutOrFinish).
+    private static readonly Dictionary<uint, Vector3[]> SightseeingPostCompletionWaypoints = new()
+    {
+        [2162709] = new[] // Summerford Farms (Middle La Noscea) - zu Fuß zurück durch die Tür
+        {
+            new Vector3(219.65729f, 113.499664f, -223.12563f),
+            new Vector3(210.64354f, 113.49537f, -215.86862f),
+        },
+    };
+
+    /// <summary>Siehe SightseeingPostCompletionWaypoints-Kommentar.</summary>
+    public static bool TryGetSightseeingPostCompletionWaypoints(uint adventureId, out IReadOnlyList<Vector3> waypoints)
+    {
+        if (SightseeingPostCompletionWaypoints.TryGetValue(adventureId, out var found))
+        {
+            waypoints = found;
+            return true;
+        }
+
+        waypoints = Array.Empty<Vector3>();
+        return false;
+    }
+
+    // Von Hand nachgetragene, genaue Steh-Position NACH dem Abmounten am Zielpunkt (Key = Adventure-
+    // RowId) - für Punkte, bei denen die normale Lande-/Ankunftsposition nach dem Abmounten (siehe
+    // SightseeingAutomation.UpdateWaitingForUnlock) noch spürbar neben der tatsächlich zur
+    // Freischaltung nötigen Stelle liegt (z.B. weil dort gelandet statt exakt draufgelaufen wird) -
+    // dann dort noch ein letztes kurzes Stück zu Fuß hin, bevor überhaupt auf die Freischaltung
+    // gewartet/der Emote ausgeführt wird, sonst schaltet der Punkt u.U. gar nicht frei.
+    private static readonly Dictionary<uint, Vector3> SightseeingExactStandPositions = new()
+    {
+        [2162709] = new Vector3(213.07825f, 117.651245f, -222.44019f), // Summerford Farms (Middle La Noscea)
+    };
+
+    /// <summary>Siehe SightseeingExactStandPositions-Kommentar.</summary>
+    public static bool TryGetSightseeingExactStandPosition(uint adventureId, out Vector3 position)
+    {
+        return SightseeingExactStandPositions.TryGetValue(adventureId, out position);
+    }
 
     private static List<CollectibleEntry>? sightseeingEntriesCache;
     private static List<(uint FirstAdventureId, uint LastAdventureId, uint QuestId)>? sightseeingGateQuestsCache;
@@ -1649,14 +1882,21 @@ public sealed class Plugin : IDalamudPlugin
     /// Client-Uhr, damit eine falsch eingestellte PC-Uhrzeit die Prüfung nicht verfälscht - dieselbe
     /// Formel wie im Dalamud-Plugin "AutoSightseeingLog" (Core/Time/EorzeaTime.cs).
     /// </summary>
-    private static unsafe int GetCurrentEorzeaBell()
+    private static int GetCurrentEorzeaBell()
     {
-        var serverTime = Framework.GetServerTime();
-        if (serverTime <= 0)
-            serverTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-        return (int)(serverTime / 175 % 24);
+        return (int)(GetServerUnixSeconds() / 175 % 24);
     }
+
+    /// <summary>
+    /// Unix-Sekunden für die Eorzeazeit-/Wetterberechnung - bewusst die lokale Uhr (DateTime.UtcNow),
+    /// NICHT Framework.GetServerTime(): Framework.GetServerTime() spiegelt offenbar nur den zuletzt
+    /// vom Server empfangenen Zeitstempel wider (aktualisiert sich nicht jeden Frame live), wodurch
+    /// er ein paar Sekunden hinter der tatsächlichen Zeit zurückliegen kann - das führte zu einer
+    /// spürbaren (~2s) Abweichung gegenüber dem Dalamud-Plugin "Tourist", das (wie die meisten
+    /// Wetter-Tools) durchgängig die lokale Uhr nutzt. Bei korrekt eingestellter PC-Uhr (Standard bei
+    /// automatischer Zeitsynchronisation) ist die lokale Uhr hier daher tatsächlich genauer.
+    /// </summary>
+    private static long GetServerUnixSeconds() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
     /// <summary>
     /// Ob die aktuelle Eorzea-Zeit im (ggf. über Mitternacht laufenden) Zeitfenster des Punkts liegt.
@@ -1671,15 +1911,309 @@ public sealed class Plugin : IDalamudPlugin
     }
 
     /// <summary>
-    /// Ob das aktuelle Wetter der Zone des Punkts zu seiner SightseeingWeatherMask passt - live über
-    /// FFXIVClientStructs' WeatherManager (funktioniert für JEDE Zone, nicht nur die aktuell
-    /// geladene, da FFXIV-Wetter deterministisch aus der Zone selbst berechnet wird). Nur für
-    /// Einträge mit SightseeingWeatherMask != 0 relevant (ausschließlich A-Realm-Reborn-Punkte).
+    /// Ob das aktuelle Wetter der Zone des Punkts zu seiner SightseeingWeatherMask passt - über
+    /// GetWeatherIdAtUnixSeconds (funktioniert für JEDE Zone, nicht nur die aktuell geladene, da
+    /// FFXIV-Wetter deterministisch aus Zone + Zeit berechnet wird). Nur für Einträge mit
+    /// SightseeingWeatherMask != 0 relevant (ausschließlich A-Realm-Reborn-Punkte).
     /// </summary>
-    private static unsafe bool IsSightseeingWeatherOk(CollectibleEntry entry)
+    private static bool IsSightseeingWeatherOk(CollectibleEntry entry)
     {
-        var weatherId = WeatherManager.Instance()->GetWeatherForHour((ushort)entry.TerritoryTypeId, 0);
-        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << weatherId)) != 0;
+        var weatherId = GetWeatherIdAtUnixSeconds(entry.TerritoryTypeId, GetServerUnixSeconds());
+        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << (int)weatherId)) != 0;
+    }
+
+    // Exakter FFXIV-Wetteralgorithmus (SaintCoinach/community-verifiziert, siehe
+    // github.com/karashiiro/FFXIVWeather, FFXIVWeatherService.CalculateTarget/GetCurrentWeather) -
+    // direkt gegen unsere eigenen Lumina-Daten (TerritoryType.WeatherRate -> WeatherRate-Sheet)
+    // nachgebaut, statt sich auf FFXIVClientStructs' WeatherManager.GetWeatherForHour(hourOffset) zu
+    // verlassen: dessen Ergebnisse für hourOffset != 0 wichen spürbar von etablierten Referenz-Tools
+    // wie dem Dalamud-Plugin "Tourist" ab (das denselben SaintCoinach-Algorithmus nutzt). Wetter-
+    // Perioden sind auf FESTE 1400-Sekunden-Blöcke (23min20s = 8 Eorzea-Stunden) seit der Unix-Epoche
+    // ausgerichtet, nicht relativ zu "jetzt" - diese Variante berechnet den exakten Perioden-Beginn
+    // direkt, keine Rundung auf ganze Eorzea-Stunden nötig.
+    private const long WeatherPeriodSeconds = 1400;
+
+    private static int CalculateWeatherTarget(long periodStartUnixSeconds)
+    {
+        var bell = periodStartUnixSeconds / 175;
+        // "Magic" aus SaintCoinach: für die Berechnung ist 16:00 = 0, 00:00 = 8, 08:00 = 16.
+        var increment = (uint)(bell + 8 - (bell % 8)) % 24;
+        var totalDays = (uint)(periodStartUnixSeconds / 4200);
+
+        var calcBase = totalDays * 100 + increment;
+        var step1 = (calcBase << 11) ^ calcBase;
+        var step2 = (step1 >> 8) ^ step1;
+        return (int)(step2 % 100);
+    }
+
+    /// <summary>
+    /// Wetter-Sheet-RowId für eine Zone zu einem beliebigen (auch zukünftigen) Zeitpunkt - 0, wenn
+    /// TerritoryType/WeatherRate nicht auflösbar sind.
+    /// </summary>
+    private static uint GetWeatherIdAtUnixSeconds(uint territoryId, long unixSeconds)
+    {
+        var periodStart = unixSeconds - (((unixSeconds % WeatherPeriodSeconds) + WeatherPeriodSeconds) % WeatherPeriodSeconds);
+        var target = CalculateWeatherTarget(periodStart);
+
+        var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+        if (territorySheet == null || !territorySheet.TryGetRow(territoryId, out var territory))
+            return 0;
+
+        var weatherRateSheet = DataManager.GetExcelSheet<WeatherRate>();
+        if (weatherRateSheet == null || !weatherRateSheet.TryGetRow(territory.WeatherRate.RowId, out var weatherRate))
+            return 0;
+
+        var cumulative = 0;
+        for (var i = 0; i < weatherRate.Rate.Count; i++)
+        {
+            cumulative += weatherRate.Rate[i];
+            if (target < cumulative)
+                return weatherRate.Weather[i].RowId;
+        }
+
+        return 0;
+    }
+
+    // Wetter ist KEIN festes Rotationsmuster - deterministisch aus Zone + absoluter Eorzea-Zeit
+    // berechnet (siehe GetWeatherIdAtUnixSeconds/CalculateWeatherTarget), ein seltenes Wetter kann
+    // daher mehrere Eorzea-Tage auf sich warten lassen. 120 Wetter-Perioden (168000 Sekunden, ca. 7
+    // Erdentage) als Obergrenze reichen praktisch immer, ohne den Scan unbegrenzt laufen zu lassen.
+    private const int SightseeingAvailabilityLookaheadPeriods = 120;
+    private static readonly TimeSpan SightseeingAvailabilityCacheTtl = TimeSpan.FromSeconds(30);
+
+    // Absolute Zeitpunkte statt fertiger Restdauern gecacht, damit die Anzeige (siehe
+    // GetSightseeingAvailabilityLabel/GetSightseeingActiveUntilLabel) bei jedem Aufruf frisch
+    // "verfügbar in X" nachrechnen und so wie ein echter Countdown runterzählen kann, ohne bei
+    // jedem UI-Frame den teuren Perioden-Scan erneut laufen zu lassen (der nur alle
+    // SightseeingAvailabilityCacheTtl neu passiert).
+    private static readonly Dictionary<uint, (DateTime ComputedAt, DateTime? AvailableAtUtc)> sightseeingAvailableAtCache = new();
+    private static readonly Dictionary<uint, (DateTime ComputedAt, DateTime? UnavailableAtUtc)> sightseeingUnavailableAtCache = new();
+
+    /// <summary>
+    /// Ob die Eorzea-Bell "bell" im (ggf. über Mitternacht laufenden) Zeitfenster des Punkts liegt.
+    /// </summary>
+    private static bool IsBellInSightseeingWindow(CollectibleEntry entry, int bell) =>
+        entry.SightseeingFirstBell <= entry.SightseeingLastBell
+            ? bell >= entry.SightseeingFirstBell && bell <= entry.SightseeingLastBell
+            : bell >= entry.SightseeingFirstBell || bell <= entry.SightseeingLastBell;
+
+    /// <summary>Ob das Wetter zum gegebenen Unix-Zeitpunkt zur SightseeingWeatherMask passt (true, wenn der Punkt gar keine Wetter-Bedingung hat).</summary>
+    private static bool IsWeatherOkAtUnixSeconds(CollectibleEntry entry, long unixSeconds)
+    {
+        if (entry.SightseeingWeatherMask == 0)
+            return true;
+
+        var weatherId = GetWeatherIdAtUnixSeconds(entry.TerritoryTypeId, unixSeconds);
+        return weatherId < 32 && (entry.SightseeingWeatherMask & (1u << (int)weatherId)) != 0;
+    }
+
+    /// <summary>
+    /// Absoluter Zeitpunkt (UTC), ab dem Wetter UND Uhrzeit gleichzeitig zum Punkt passen - null,
+    /// wenn der Punkt keine solche Bedingung hat, oder wenn dafür (innerhalb von
+    /// SightseeingAvailabilityLookaheadPeriods) partout keine passende Kombination gefunden wird.
+    /// Scannt dafür in EXAKTEN Wetter-Perioden (1400 Sekunden, absolut seit Unix-Epoche ausgerichtet
+    /// - siehe GetWeatherIdAtUnixSeconds/WeatherPeriodSeconds) vorwärts, nicht in 175-Sekunden-
+    /// Schritten relativ zu "jetzt": Wetter ist innerhalb einer Periode konstant, ein an "jetzt"
+    /// ausgerichtetes Raster würde die echte (an der Epoche ausgerichtete) Wechselgrenze verfehlen
+    /// und bis zu eine ganze Periode zu spät melden - genau das führte zu einer spürbaren Abweichung
+    /// gegenüber dem Dalamud-Plugin "Tourist". Innerhalb einer wetterlich passenden Periode wird bei
+    /// zusätzlichem Zeitfenster die exakte Bell-Grenze gesucht (175-Sekunden-Raster, 8 Bells je
+    /// Periode).
+    /// </summary>
+    private static DateTime? GetSightseeingAvailableAtUtc(CollectibleEntry entry)
+    {
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return null;
+
+        if (sightseeingAvailableAtCache.TryGetValue(entry.Id, out var cached) && DateTime.UtcNow - cached.ComputedAt < SightseeingAvailabilityCacheTtl)
+            return cached.AvailableAtUtc;
+
+        var now = DateTime.UtcNow;
+        var nowUnix = GetServerUnixSeconds();
+        var currentPeriodStart = nowUnix - (nowUnix % WeatherPeriodSeconds);
+        DateTime? result = null;
+
+        for (var p = 0; p <= SightseeingAvailabilityLookaheadPeriods && result == null; p++)
+        {
+            var candidatePeriodStart = currentPeriodStart + p * WeatherPeriodSeconds;
+
+            if (!IsWeatherOkAtUnixSeconds(entry, candidatePeriodStart))
+                continue;
+
+            if (!entry.SightseeingHasTimeWindow)
+            {
+                var candidateUnix = Math.Max(candidatePeriodStart, nowUnix);
+                result = now.AddSeconds(candidateUnix - nowUnix);
+                break;
+            }
+
+            for (var bellOffset = 0; bellOffset < 8; bellOffset++)
+            {
+                var candidateUnix = candidatePeriodStart + bellOffset * 175L;
+                if (candidateUnix < nowUnix)
+                    continue;
+
+                var bell = (int)(candidateUnix / 175 % 24);
+                if (IsBellInSightseeingWindow(entry, bell))
+                {
+                    result = now.AddSeconds(candidateUnix - nowUnix);
+                    break;
+                }
+            }
+        }
+
+        sightseeingAvailableAtCache[entry.Id] = (now, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Gegenstück zu GetSightseeingAvailableAtUtc - absoluter Zeitpunkt (UTC), ab dem Wetter ODER
+    /// Uhrzeit NICHT mehr passen (erste exakte Wetter-Perioden-/Bell-Grenze, an der mindestens eine
+    /// der beiden Bedingungen kippt, siehe dortigen Kommentar zur Perioden-Ausrichtung). Nur
+    /// sinnvoll, wenn der Punkt gerade aktiv ist - sonst (siehe GetSightseeingActiveUntilLabel) wird
+    /// diese Funktion gar nicht erst aufgerufen.
+    /// </summary>
+    private static DateTime? GetSightseeingUnavailableAtUtc(CollectibleEntry entry)
+    {
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return null;
+
+        if (sightseeingUnavailableAtCache.TryGetValue(entry.Id, out var cached) && DateTime.UtcNow - cached.ComputedAt < SightseeingAvailabilityCacheTtl)
+            return cached.UnavailableAtUtc;
+
+        var now = DateTime.UtcNow;
+        var nowUnix = GetServerUnixSeconds();
+        var currentPeriodStart = nowUnix - (nowUnix % WeatherPeriodSeconds);
+        DateTime? result = null;
+
+        for (var p = 0; p <= SightseeingAvailabilityLookaheadPeriods && result == null; p++)
+        {
+            var candidatePeriodStart = currentPeriodStart + p * WeatherPeriodSeconds;
+
+            if (!IsWeatherOkAtUnixSeconds(entry, candidatePeriodStart))
+            {
+                var candidateUnix = Math.Max(candidatePeriodStart, nowUnix);
+                result = now.AddSeconds(candidateUnix - nowUnix);
+                break;
+            }
+
+            if (!entry.SightseeingHasTimeWindow)
+                continue;
+
+            for (var bellOffset = 0; bellOffset < 8; bellOffset++)
+            {
+                var candidateUnix = candidatePeriodStart + bellOffset * 175L;
+                if (candidateUnix < nowUnix)
+                    continue;
+
+                var bell = (int)(candidateUnix / 175 % 24);
+                if (!IsBellInSightseeingWindow(entry, bell))
+                {
+                    result = now.AddSeconds(candidateUnix - nowUnix);
+                    break;
+                }
+            }
+        }
+
+        sightseeingUnavailableAtCache[entry.Id] = (now, result);
+        return result;
+    }
+
+    private static TimeSpan? GetRemaining(DateTime? targetUtc)
+    {
+        if (targetUtc == null)
+            return null;
+
+        var remaining = targetUtc.Value - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// Dauer als echter HH:MM:SS-Countdown (z.B. "02:15:30") - wird bei jedem Aufruf frisch aus dem
+    /// gecachten Zielzeitpunkt neu berechnet (siehe GetRemaining), zählt dadurch bis auf die Sekunde
+    /// genau runter, nicht nur in groben Stunden-/Minutenschritten.
+    /// </summary>
+    private static string FormatSightseeingAvailableIn(TimeSpan span)
+    {
+        if (span < TimeSpan.Zero)
+            span = TimeSpan.Zero;
+
+        return $"{(int)span.TotalHours:00}:{span.Minutes:00}:{span.Seconds:00}";
+    }
+
+    /// <summary>
+    /// Ob bei diesem Sightseeing-Punkt alle Voraussetzungen MIT HÖHERER PRIORITÄT als Jumping-
+    /// Puzzle-Status/Wetter/Uhrzeit bereits erfüllt sind - Log freigeschaltet, Fliegen freigeschaltet,
+    /// ggf. erste 20 A-Realm-Reborn-Punkte erledigt und das Buch per Quest freigeschaltet (siehe
+    /// ComputeGrandCompanyOrTribeGateReason für die genaue Reihenfolge). Erst wenn das hier true ist,
+    /// sind Jumping-Puzzle-Status oder Wetter/Uhrzeit überhaupt der tatsächlich aktuelle Blockierer.
+    /// Ohne diese Prüfung würde z.B. bei noch gesperrtem Log/Fliegen ein irreführender Wetter/Zeit-
+    /// Timer angezeigt, obwohl der Punkt aus einem ganz anderen Grund nicht erreichbar ist.
+    /// </summary>
+    public static bool IsSightseeingBookAccessible(CollectibleEntry entry)
+    {
+        if (!IsSightseeingLogUnlocked())
+            return false;
+        if (!CanFly)
+            return false;
+        if (entry.SightseeingNeedsFirstTwenty && !AreFirstSightseeingBookEntriesComplete())
+            return false;
+        if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
+            return false;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Ob AKTUELL wirklich fehlendes Fliegen der Blockierer eines Sightseeing-Punkts ist (Log ist
+    /// schon freigeschaltet, sonst wäre DAS die eigentliche Ursache) - für den spezifischen inline
+    /// "(Bedingung nicht erfüllt (Fliegen nicht freigeschaltet))"-Hinweis im Overlay (siehe
+    /// CompactOverlayWindow), statt nur des generischen Labels.
+    /// </summary>
+    public static bool IsSightseeingBlockedByFlying(CollectibleEntry entry) =>
+        entry.Type == CollectibleType.Sightseeing && IsSightseeingLogUnlocked() && !CanFly;
+
+    /// <summary>
+    /// " - <Dauer>"-Zusatz fürs inline "(Bedingung nicht erfüllt)"-Label im Overlay (siehe
+    /// CompactOverlayWindow) - NUR für Sightseeing-Punkte, die AKTUELL wirklich durch Wetter/Uhrzeit
+    /// gesperrt sind (siehe IsSightseeingBookAccessible). Leer, wenn nicht anwendbar (anderer Typ/
+    /// anderer Sperrgrund) oder innerhalb der Vorschau partout kein Zeitpunkt gefunden wurde. Rechnet
+    /// die Restdauer bei jedem Aufruf frisch aus dem gecachten Zielzeitpunkt - zählt dadurch wie ein
+    /// echter Countdown runter, ohne den Scan selbst jedes Mal zu wiederholen.
+    /// </summary>
+    public static string GetSightseeingAvailabilityLabel(CollectibleEntry entry)
+    {
+        if (entry.Type != CollectibleType.Sightseeing || !IsSightseeingBookAccessible(entry))
+            return string.Empty;
+
+        var remaining = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+        return remaining.HasValue ? $" - {FormatSightseeingAvailableIn(remaining.Value)}" : string.Empty;
+    }
+
+    /// <summary>
+    /// " - noch <Dauer>"-Zusatz für einen grünen "(aktiv)"-Hinweis im Overlay (siehe
+    /// CompactOverlayWindow) - NUR für Sightseeing-Punkte mit Wetter-/Zeitfenster-Bedingung, die
+    /// GERADE aktiv (also nicht gesperrt) sind, mit Restdauer bis diese Bedingung wieder kippt.
+    /// Leer für Punkte ohne eine solche Bedingung (die sind ja nie "gesperrt", ein Aktiv-Hinweis
+    /// wäre dort bedeutungslos) oder wenn der Punkt gerade tatsächlich gesperrt ist.
+    /// </summary>
+    public static string GetSightseeingActiveUntilLabel(CollectibleEntry entry)
+    {
+        if (entry.Type != CollectibleType.Sightseeing)
+            return string.Empty;
+        if (entry.SightseeingWeatherMask == 0 && !entry.SightseeingHasTimeWindow)
+            return string.Empty;
+        if (!IsSightseeingBookAccessible(entry))
+            return string.Empty;
+        if (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
+            return string.Empty;
+        if (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry))
+            return string.Empty;
+
+        var remaining = GetRemaining(GetSightseeingUnavailableAtUtc(entry));
+        return remaining.HasValue
+            ? $" - {FormatSightseeingAvailableIn(remaining.Value)}"
+            : string.Empty;
     }
 
     /// <summary>
@@ -2006,10 +2540,49 @@ public sealed class Plugin : IDalamudPlugin
     /// Formulierung), wird der Eintrag trotzdem ausgeblendet - siehe Nutzerentscheidung dazu.
     /// Alle anderen Categories sind von diesem Filter unberührt (liefert dafür immer true).
     /// </summary>
+    // Von Hand nachgetragene, offiziell verifizierte Zeitfenster einzelner Cross-Game-
+    // Kollaborationen (siehe IsSeasonalEventEntryCurrentlyActive-Kommentar) - Schlüssel ist ein
+    // Teilstring, der gegen entry.Source geprüft wird. Ergänzt bei Bedarf für jede weitere
+    // Kollaboration, sobald ihr offizielles Zeitfenster bekannt ist (z.B. aus der SQUARE ENIX-/
+    // Lodestone-Ankündigung) - noch NICHT hier eingetragene Kollaborationen fallen weiterhin auf
+    // "generell erfüllt" zurück (siehe unten), nicht auf "nie erfüllt".
+    private static readonly (string SourceContains, DateTime StartUtc, DateTime EndUtc)[] KnownCollaborationWindows =
+    {
+        // "A Nocturne for Heroes" (FINAL FANTASY XV-Kollaboration, Regalia Type-G etc.) - offiziell
+        // Do. 24.09.2026 01:00 bis Di. 13.10.2026 07:59 (jeweils PDT/UTC-7), Quelle: offizielle
+        // SQUARE ENIX-/Lodestone-Ankündigung.
+        ("Final Fantasy XV Collaboration",
+            new DateTime(2026, 9, 24, 8, 0, 0, DateTimeKind.Utc),
+            new DateTime(2026, 10, 13, 14, 59, 0, DateTimeKind.Utc)),
+    };
+
+    // Offizielle Zeitfenster von Events, die (wie Kollaborationen) nicht über GameMain.ActiveFestivals
+    // laufen - Schlüssel ist CollectibleEntry.EventName. Bei jedem neuen Durchlauf ergänzen (Quelle:
+    // offizielle Lodestone-Ankündigung). Ohne passendes Fenster gilt das Event als NICHT laufend.
+    private const string MoogleTreasureTroveEventName = "Moogle Treasure Trove";
+
+    private static readonly (string EventName, DateTime StartUtc, DateTime EndUtc)[] KnownEventWindows =
+    {
+        // "Moogle Treasure Trove: The First Hunt for Astronomy" - Mi. 09.09.2026 01:00 bis Mo.
+        // 19.10.2026 07:59 (PDT/UTC-7), Quelle: Lodestone (mogmog-collection/202609).
+        (MoogleTreasureTroveEventName,
+            new DateTime(2026, 9, 9, 8, 0, 0, DateTimeKind.Utc),
+            new DateTime(2026, 10, 19, 14, 59, 0, DateTimeKind.Utc)),
+    };
+
     public static bool IsSeasonalEventEntryCurrentlyActive(CollectibleEntry entry)
     {
         if (entry.Category != "Saisonevent")
             return true;
+
+        // Events ohne auslesbaren Festival-Status (siehe CollectibleEntry.EventName) - über das von
+        // Hand hinterlegte, offizielle Zeitfenster (KnownEventWindows).
+        if (!string.IsNullOrEmpty(entry.EventName))
+        {
+            var nowUtc = DateTime.UtcNow;
+            return KnownEventWindows.Any(w => string.Equals(w.EventName, entry.EventName, StringComparison.OrdinalIgnoreCase)
+                                              && nowUtc >= w.StartUtc && nowUtc <= w.EndUtc);
+        }
 
         // Cross-Game-Kollaborationen (Yo-kai Watch, Final Fantasy XV/XI/XVI, Dragon Quest X,
         // Fall Guys/MGF, ...) laufen NICHT über das normale Festival-System
@@ -2017,11 +2590,23 @@ public sealed class Plugin : IDalamudPlugin
         // (Starlight, Hatching-tide, ...) ab. GetActiveFestivalNames() liefert für Kollaborationen
         // deshalb IMMER eine leere Liste, auch während die Kollaboration tatsächlich live ist
         // (per Debug-Dump bestätigt: beim laufenden Yo-kai-Watch-Event war die Liste leer, der
-        // Eintrag wurde fälschlich dauerhaft als "Bedingung nicht erfüllt" markiert). Es gibt
-        // dafür keine bekannte, live auslesbare Quelle - Kollaborationen gelten daher generell als
-        // erfüllt (nicht gated), statt permanent falsch negativ zu sein.
+        // Eintrag wurde fälschlich dauerhaft als "Bedingung nicht erfüllt" markiert).
         if (entry.Source.Contains("Collaboration", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var (sourceContains, startUtc, endUtc) in KnownCollaborationWindows)
+            {
+                if (entry.Source.Contains(sourceContains, StringComparison.OrdinalIgnoreCase))
+                {
+                    var nowUtc = DateTime.UtcNow;
+                    return nowUtc >= startUtc && nowUtc <= endUtc;
+                }
+            }
+
+            // Kein bekanntes Zeitfenster hinterlegt (siehe KnownCollaborationWindows) - es gibt
+            // dafür keine bekannte, live auslesbare Quelle, daher generell als erfüllt werten
+            // (nicht gated), statt permanent falsch negativ zu sein.
             return true;
+        }
 
         var activeNames = GetActiveFestivalNames();
         if (activeNames.Count == 0)
@@ -2578,17 +3163,99 @@ public sealed class Plugin : IDalamudPlugin
     /// live auslesbare Ruf-Rang-API - die gelten daher weiterhin als "erfüllt unbekannt/wahrscheinlich
     /// noch nicht" und bleiben statisch markiert, solange sie in AchievementOrRankGatedItems stehen.
     /// </summary>
+    /// <summary>
+    /// Währungen, die nur bei einem Händler ausgegeben werden können, dessen Sortiment erst nach
+    /// einer bestimmten Quest kaufbar ist - gilt damit für JEDEN Eintrag mit dieser Währung (auch
+    /// künftig ergänzte), ohne jeden einzeln pflegen zu müssen. Einzelne Einträge mit einer anderen
+    /// (späteren) Quest überschreiben das per CollectibleEntry.RequiredQuest. Item-RowIds/Quests per
+    /// Auswertung der SpecialShop-Daten des "Kornago Merchant" (Bentbranch Meadows) verifiziert.
+    /// </summary>
+    private static readonly Dictionary<uint, string> CurrencyRequiredQuest = new()
+    {
+        [51734] = "Into the Crucible",     // Faded Remnant of Resilience
+        [51735] = "A Beastmaster's Path",  // Bright Remnant of Resilience
+    };
+
+    // Schaltet das Triple-Triad-Kartenspiel frei (Quest 65973, per Spieldaten verifiziert) - siehe
+    // ComputeGrandCompanyOrTribeGateReason.
+    private const string TripleTriadUnlockQuestName = "Triple Triad Trial";
+
+    private static string? GetCurrencyRequiredQuest(CollectibleEntry entry)
+    {
+        if (CurrencyRequiredQuest.TryGetValue(entry.CurrencyItemId, out var quest))
+            return quest;
+
+        if (entry.AdditionalCurrencies != null)
+        {
+            foreach (var additional in entry.AdditionalCurrencies)
+            {
+                if (CurrencyRequiredQuest.TryGetValue(additional.CurrencyItemId, out quest))
+                    return quest;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsAchievementCompleteByName(string achievementName)
+    {
+        var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+        var achievementId = ResolveAchievementIdByName(achievementName);
+        return achievementId != null && achievementSheet != null
+            && achievementSheet.TryGetRow(achievementId.Value, out var row) && UnlockState.IsAchievementComplete(row);
+    }
+
     private static string? ComputeGrandCompanyOrTribeGateReason(CollectibleEntry entry)
     {
+        // Triple Triad selbst wird erst mit der Quest "Triple Triad Trial" freigeschaltet - vorher ist
+        // KEINE Karte nutzbar, egal wo/wie erhältlich. Hat daher Vorrang vor allen anderen
+        // Voraussetzungen der Karte.
+        if (entry.Type == CollectibleType.TripleTriadCard)
+        {
+            var tripleTriadQuestId = ResolveQuestIdByName(TripleTriadUnlockQuestName);
+            if (tripleTriadQuestId == null || !QuestManager.IsQuestComplete((ushort)tripleTriadQuestId.Value))
+            {
+                return Loc.T(
+                    $"Triple Triad ist noch nicht freigeschaltet - benötigt die abgeschlossene Quest \"{TripleTriadUnlockQuestName}\".",
+                    $"Triple Triad isn't unlocked yet - requires the completed quest \"{TripleTriadUnlockQuestName}\".");
+            }
+        }
+
+        // Händler-Voraussetzungen (siehe CollectibleEntry.RequiredQuest/RequiredAchievement und
+        // CurrencyRequiredQuest) - live geprüft, damit die Markierung sofort verschwindet.
+        var requiredVendorQuest = entry.RequiredQuest ?? GetCurrencyRequiredQuest(entry);
+        if (!string.IsNullOrEmpty(requiredVendorQuest))
+        {
+            var vendorQuestId = ResolveQuestIdByName(requiredVendorQuest);
+            if (vendorQuestId == null || !QuestManager.IsQuestComplete((ushort)vendorQuestId.Value))
+            {
+                return Loc.T(
+                    $"Benötigt die abgeschlossene Quest \"{requiredVendorQuest}\".",
+                    $"Requires the completed quest \"{requiredVendorQuest}\".");
+            }
+        }
+
+        if (!string.IsNullOrEmpty(entry.RequiredAchievement) && !IsAchievementCompleteByName(entry.RequiredAchievement))
+        {
+            return Loc.T(
+                $"Benötigt die Errungenschaft \"{entry.RequiredAchievement}\".",
+                $"Requires the achievement \"{entry.RequiredAchievement}\".");
+        }
+
+        // Hunting-Log-Ziel einer höheren, noch nicht erreichten Rang-Stufe (siehe GetHuntingLogEntries).
+        if (entry.Type == CollectibleType.HuntingLog && entry.HuntingLogRequiredRank is { } requiredHuntingRank)
+        {
+            return Loc.T(
+                $"Bedingung nicht erfüllt (Hunting-Log-Rang {requiredHuntingRank} noch nicht erreicht).",
+                $"Condition not met (hunting log rank {requiredHuntingRank} not reached yet).");
+        }
+
         // Das Sightseeing Log selbst wird über die Quest "A Sight to Behold" freigeschaltet, NICHT
         // durchs Fliegen (das war vorher fälschlich über IsTypeCurrentlyPossible/CanFly verknüpft) -
         // ohne freigeschaltetes Log lässt sich kein einziger Sightseeing-Eintrag abschließen. Live
         // geprüft, damit die Markierung sofort verschwindet, sobald die Quest erledigt ist.
         if (entry.Type == CollectibleType.Sightseeing)
         {
-            if (SightseeingUnsupportedByAutomation.TryGetValue(entry.Id, out var unsupportedReason))
-                return Loc.T(unsupportedReason.De, unsupportedReason.En);
-
             if (!IsSightseeingLogUnlocked())
             {
                 return Loc.T(
@@ -2596,6 +3263,23 @@ public sealed class Plugin : IDalamudPlugin
                     "Sightseeing Log not unlocked yet (quest \"A Sight to Behold\").");
             }
 
+            // Explizite Nutzeranforderung: die Automation/das Feature soll NUR mit freigeschaltetem
+            // Fliegen funktionieren - direkt nach der Log-Prüfung, noch vor allem Weiteren (auch vor
+            // Jumping-Puzzle-Unterstützung, siehe Priorität 1 unten). CanFly berücksichtigt dabei auch
+            // Zonen, in denen Fliegen erst durch genug gesammelte Ätherströmungen freigeschaltet wird.
+            if (!CanFly)
+            {
+                return Loc.T(
+                    "Fliegen nicht freigeschaltet.",
+                    "Flying not unlocked.");
+            }
+
+            // Priorität 1 (siehe Nutzeranfrage): erst die ersten 20 A-Realm-Reborn-Punkte, DANN erst
+            // Jumping-Puzzle-Unterstützung, DANN Wetter/Uhrzeit prüfen - ein noch nicht freigeschaltetes
+            // Buch ist der fundamentalste Blocker und soll daher vor allem anderen angezeigt werden,
+            // auch wenn der jeweilige Punkt zusätzlich noch ein Jumping Puzzle wäre oder gerade
+            // falsches Wetter hätte.
+            //
             // Die ersten 20 A-Realm-Reborn-Punkte sind mit dem Log selbst verfügbar - die restlichen
             // 60 (SightseeingNeedsFirstTwenty) erst, wenn ALLE ersten 20 aufgezeichnet sind (danach
             // schaltet Millith Ironheart in Old Gridania das Buch frei) - siehe SightseeingFirstBookCount.
@@ -2608,6 +3292,8 @@ public sealed class Plugin : IDalamudPlugin
 
             // Heavensward (feste Quest) bzw. Stormblood und später (siehe ResolveSightseeingGateQuests,
             // aus Lumina "AdventureExPhase" aufgelöst) - jedes spätere Buch braucht seine eigene Quest.
+            // Gleiche Kategorie wie SightseeingNeedsFirstTwenty oben (Buch-Freischaltung), daher direkt
+            // danach geprüft.
             if (entry.SightseeingGateQuestId != 0 && !QuestManager.IsQuestComplete((ushort)entry.SightseeingGateQuestId))
             {
                 var gateQuestName = ResolveQuestNameById(entry.SightseeingGateQuestId);
@@ -2618,20 +3304,36 @@ public sealed class Plugin : IDalamudPlugin
                         $"Requires the completed quest \"{gateQuestName}\" to unlock this sightseeing log book.");
             }
 
-            // Nur A-Realm-Reborn-Punkte verlangen ein bestimmtes Wetter (SightseeingWeatherMask != 0),
-            // siehe RealmRebornVistaWeathers.
+            // Priorität 2: Jumping-Puzzle-Unterstützung (siehe SightseeingUnsupportedByAutomation).
+            if (SightseeingUnsupportedByAutomation.TryGetValue(entry.Id, out var unsupportedReason))
+                return Loc.T(unsupportedReason.De, unsupportedReason.En);
+
+            // Priorität 3: Wetter/Uhrzeit. Nur A-Realm-Reborn-Punkte verlangen ein bestimmtes Wetter
+            // (SightseeingWeatherMask != 0),
+            // siehe RealmRebornVistaWeathers. Hängt bei beiden Meldungen unten zusätzlich einen
+            // "verfügbar in..."-Timer an (siehe GetSightseeingAvailableAtUtc), der - falls der Punkt
+            // ZUSÄTZLICH auch ein Zeitfenster hat - beide Bedingungen gemeinsam berücksichtigt, nicht
+            // nur die hier gerade geprüfte.
             if (entry.SightseeingWeatherMask != 0 && !IsSightseeingWeatherOk(entry))
             {
+                var availableIn = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+                var suffix = availableIn.HasValue
+                    ? Loc.T($" (verfügbar in {FormatSightseeingAvailableIn(availableIn.Value)})", $" (available in {FormatSightseeingAvailableIn(availableIn.Value)})")
+                    : "";
                 return Loc.T(
-                    "Das Wetter in dieser Zone passt gerade nicht (nur bei bestimmtem Wetter sichtbar/abschließbar).",
-                    "The weather in this zone isn't right currently (only visible/completable with specific weather).");
+                    $"Das Wetter in dieser Zone passt gerade nicht (nur bei bestimmtem Wetter sichtbar/abschließbar).{suffix}",
+                    $"The weather in this zone isn't right currently (only visible/completable with specific weather).{suffix}");
             }
 
             if (entry.SightseeingHasTimeWindow && !IsSightseeingTimeOk(entry))
             {
+                var availableIn = GetRemaining(GetSightseeingAvailableAtUtc(entry));
+                var suffix = availableIn.HasValue
+                    ? Loc.T($" (verfügbar in {FormatSightseeingAvailableIn(availableIn.Value)})", $" (available in {FormatSightseeingAvailableIn(availableIn.Value)})")
+                    : "";
                 return Loc.T(
-                    $"Nur zwischen {entry.SightseeingFirstBell:00}:00 und {entry.SightseeingLastBell:00}:59 Eorzeazeit sichtbar/abschließbar.",
-                    $"Only visible/completable between {entry.SightseeingFirstBell:00}:00 and {entry.SightseeingLastBell:00}:59 Eorzea time.");
+                    $"Nur zwischen {entry.SightseeingFirstBell:00}:00 und {entry.SightseeingLastBell:00}:59 Eorzeazeit sichtbar/abschließbar.{suffix}",
+                    $"Only visible/completable between {entry.SightseeingFirstBell:00}:00 and {entry.SightseeingLastBell:00}:59 Eorzea time.{suffix}");
             }
         }
 
@@ -2692,10 +3394,25 @@ public sealed class Plugin : IDalamudPlugin
         // Einträgen bereits als Klartext im Source-Feld (z.B. "The Rising (2026)").
         if (entry.Category == "Saisonevent" && !IsSeasonalEventEntryCurrentlyActive(entry))
         {
+            if (!string.IsNullOrEmpty(entry.EventName))
+            {
+                return Loc.T(
+                    $"Nur während des Events {entry.EventName} erhältlich, das gerade nicht läuft.",
+                    $"Only available during the event {entry.EventName}, which isn't currently running.");
+            }
+
             return Loc.T(
                 $"Nur während eines Events erhältlich ({entry.Source}), das gerade nicht läuft.",
                 $"Only available during an event ({entry.Source}), which isn't currently running.");
         }
+
+        // Die folgenden Prüfungen (Große Kompanie, Stammesrang) sind von Hand pro Typ + NAME gepflegt
+        // und gelten nur beim jeweiligen Kompanie-/Stammeshändler - dieselbe Ware beim Itinerant
+        // Moogle (EventName gesetzt, siehe GetItinerantMoogleEntries) ist dort ohne Rang kaufbar
+        // (Nutzer-Report: z.B. Stammes-Waren im "Previous"-Reiter fälschlich als "Rang fehlt"
+        // markiert). Deren eigene Voraussetzungen (Event-Zeitfenster, Quest) sind oben schon geprüft.
+        if (!string.IsNullOrEmpty(entry.EventName))
+            return null;
 
         // Quartiermeister-Waren (Bardings/Hatchling-Minions/Orchestrion-Rollen) sind an die JEWEILS
         // EIGENE Kompanie gebunden (siehe GrandCompanySpecificItems-Kommentar).
@@ -2765,12 +3482,25 @@ public sealed class Plugin : IDalamudPlugin
                 "Requirement (achievement/rank) not yet met.");
         }
 
-        // Übrig bleiben die echten Stammes-Objekte (Vanu Vanu, Vath, Moogles, ...) - deren Ruf-Rang
-        // lässt sich hier (noch) nicht live auslesen, daher bleibt nur die Textanzeige, keine
-        // echte Erfüllt/Nicht-erfüllt-Prüfung.
+        // Übrig bleiben die echten Stammes-Objekte (Vanu Vanu, Vath, Moogles, Kojin, ...) - live gegen
+        // den Ruf-Rang DES STAMMES geprüft (PlayerState.GetBeastTribeRank, siehe ResolveBeastTribe),
+        // nicht gegen den Händler: früher stand dort der Händlername (z.B. "Shikitahe" statt "Kojin")
+        // und die Markierung blieb auch bei längst erreichtem Rang dauerhaft stehen (Nutzer-Report).
         if (AchievementOrRankGatedItems.Contains((entry.Type, entry.Name)))
         {
             var tribeRankMatch = CurrencyRankPattern.Match(entry.Currency ?? string.Empty);
+            if (tribeRankMatch.Success && ResolveBeastTribe(entry) is { } tribe && byte.TryParse(tribeRankMatch.Groups[1].Value, out var requiredTribeRank))
+            {
+                // Manche Datendatei-Angaben liegen über dem Höchstrang des Stammes - dann zählt der Höchstrang.
+                var effectiveRequiredRank = Math.Min(requiredTribeRank, tribe.MaxRank);
+                if (GetBeastTribeRank(tribe.TribeId) >= effectiveRequiredRank)
+                    return null;
+
+                return Loc.T(
+                    $"Benötigt {tribe.Name}-Stammesrang {requiredTribeRank}.",
+                    $"Requires {tribe.Name} tribe rank {requiredTribeRank}.");
+            }
+
             if (tribeRankMatch.Success)
             {
                 var rank = tribeRankMatch.Groups[1].Value;
@@ -2790,6 +3520,58 @@ public sealed class Plugin : IDalamudPlugin
 
     public static bool IsAchievementOrRankGated(CollectibleEntry entry) =>
         ComputeGrandCompanyOrTribeGateReason(entry) != null;
+
+    // Stammeshändler, die mit GIL statt der stammeseigenen Währung verkaufen - dort lässt sich der
+    // Stamm nicht über die Währung (siehe ResolveBeastTribe) bestimmen. Wert = Lumina-BeastTribe-RowId.
+    private static readonly Dictionary<string, uint> BeastTribeByGilVendor = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Luna Vanu"] = 6,         // Vanu Vanu
+        ["Vath Stickpeddler"] = 7, // Vath
+        ["Mogmul Mogbelly"] = 8,   // Moogles
+    };
+
+    private static Dictionary<uint, (uint TribeId, string Name, byte MaxRank)>? beastTribeByCurrencyCache;
+    private static Dictionary<uint, (uint TribeId, string Name, byte MaxRank)>? beastTribeByIdCache;
+
+    /// <summary>
+    /// Zu welchem Stamm ein Stammeshändler-Eintrag gehört - primär über die Währung (Lumina
+    /// "BeastTribe".CurrencyItem, z.B. "Kojin Sango" -> Kojin), für die Gil-Händler über
+    /// BeastTribeByGilVendor. null, wenn nicht zuordenbar.
+    /// </summary>
+    private static (uint TribeId, string Name, byte MaxRank)? ResolveBeastTribe(CollectibleEntry entry)
+    {
+        if (beastTribeByCurrencyCache == null)
+        {
+            beastTribeByCurrencyCache = new();
+            beastTribeByIdCache = new();
+            var sheet = DataManager.GetExcelSheet<BeastTribe>();
+            if (sheet != null)
+            {
+                foreach (var row in sheet)
+                {
+                    var name = row.Name.ToString();
+                    if (row.RowId == 0 || string.IsNullOrEmpty(name))
+                        continue;
+
+                    // Lumina führt einige Namen klein ("moogles", "pixies", ...) - für die Anzeige groß.
+                    var info = (row.RowId, char.ToUpperInvariant(name[0]) + name[1..], row.MaxRank);
+                    beastTribeByIdCache[row.RowId] = info;
+                    if (row.CurrencyItem.RowId != 0)
+                        beastTribeByCurrencyCache.TryAdd(row.CurrencyItem.RowId, info);
+                }
+            }
+        }
+
+        if (beastTribeByCurrencyCache.TryGetValue(entry.CurrencyItemId, out var byCurrency))
+            return byCurrency;
+
+        if (BeastTribeByGilVendor.TryGetValue(entry.Vendor ?? string.Empty, out var tribeId) && beastTribeByIdCache!.TryGetValue(tribeId, out var byVendor))
+            return byVendor;
+
+        return null;
+    }
+
+    private static unsafe byte GetBeastTribeRank(uint tribeId) => PlayerState.Instance()->GetBeastTribeRank((byte)tribeId);
 
     /// <summary>
     /// Erklärt, WAS genau bei einem als gated erkannten Eintrag fehlt (z.B. "Benötigt Kobold-Rang
@@ -3882,6 +4664,98 @@ public sealed class Plugin : IDalamudPlugin
         return nearest;
     }
 
+    // Siehe HasPathStartGraceElapsed.
+    private static ICallGateSubscriber<bool>? vnavPathfindInProgress;
+    private static DateTime lastVnavPathfindInProgressAt = DateTime.MinValue;
+    private static readonly TimeSpan VnavPathfindMaxDuration = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Ob vnavmesh einen per SimpleMove.PathfindAndMoveCloseTo angenommenen Auftrag gerade noch
+    /// berechnet - währenddessen ist Path.IsRunning noch false. Merkt sich den Zeitpunkt für
+    /// HasPathStartGraceElapsed.
+    /// </summary>
+    public static bool IsVnavPathfindInProgress()
+    {
+        try
+        {
+            var computing = vnavPathfindInProgress is { HasFunction: true } && vnavPathfindInProgress.InvokeFunc();
+            if (computing)
+                lastVnavPathfindInProgressAt = DateTime.UtcNow;
+
+            return computing;
+        }
+        catch
+        {
+            return false; // vnavmesh fehlt oder eine Version ohne diesen Endpunkt
+        }
+    }
+
+    /// <summary>
+    /// Für die "Laufweg nie gestartet"-Prüfung aller Automationen (jeweils PathStartGracePeriod):
+    /// true, sobald seit startedAt (Betreten des Lauf-Zustands) die Gnadenfrist verstrichen ist,
+    /// OHNE die Zeit mitzuzählen, in der vnavmesh den Weg noch berechnet hat - lange (v.a.
+    /// fliegende) Wege brauchen dafür deutlich länger als die üblichen 5s und wurden sonst
+    /// fälschlich übersprungen, obwohl vnavmesh sie angenommen hatte. Spätestens nach
+    /// VnavPathfindMaxDuration zählt auch eine noch laufende Berechnung als "nie gestartet".
+    /// </summary>
+    public static bool HasPathStartGraceElapsed(DateTime startedAt, TimeSpan gracePeriod)
+    {
+        var now = DateTime.UtcNow;
+        if (IsVnavPathfindInProgress() && now - startedAt < VnavPathfindMaxDuration)
+            return false;
+
+        var graceStart = lastVnavPathfindInProgressAt > startedAt ? lastVnavPathfindInProgressAt : startedAt;
+        return now - graceStart > gracePeriod;
+    }
+
+    private const byte CombatantBattleNpcSubKind = 5;
+
+    /// <summary>
+    /// Sucht den nächstgelegenen lebenden Gegner, der gerade den eigenen Charakter anvisiert (also
+    /// angreift) - für HuntingLogAutomation: RotationSolver läuft dort im Manual-Modus und greift
+    /// nur das aktuelle Ziel an, Beifang-Gegner, die sich selbst angehängt haben, müssen deshalb
+    /// selbst anvisiert werden, statt wehrlos stehen zu bleiben.
+    /// </summary>
+    public static Dalamud.Game.ClientState.Objects.Types.IBattleNpc? FindNearestAttacker(Vector3 nearPosition)
+    {
+        var player = ObjectTable.LocalPlayer;
+        if (player == null)
+            return null;
+
+        Dalamud.Game.ClientState.Objects.Types.IBattleNpc? nearest = null;
+        var bestDistance = float.MaxValue;
+
+        foreach (var obj in ObjectTable)
+        {
+            if (obj is not Dalamud.Game.ClientState.Objects.Types.IBattleNpc battleNpc)
+                continue;
+
+            // SubKind 5 = kämpfender Gegner (BattleNpcSubKind "Enemy"/"Combatant" - der Name unterscheidet
+            // sich je nach Dalamud-Version, der Zahlenwert nicht).
+            if (battleNpc.SubKind != CombatantBattleNpcSubKind || !battleNpc.IsTargetable || battleNpc.CurrentHp == 0)
+                continue;
+
+            // Greift entweder uns selbst an oder etwas, das uns gehört (z.B. den Chocobo-Begleiter,
+            // siehe ChocoboCompanionSupport) - beides hält uns im Kampf.
+            var target = battleNpc.TargetObject;
+            if (target == null || (target.GameObjectId != player.GameObjectId && target.OwnerId != player.EntityId))
+                continue;
+
+            var distance = Vector3.Distance(battleNpc.Position, nearPosition);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                nearest = battleNpc;
+            }
+        }
+
+        return nearest;
+    }
+
+    /// <summary>Ob das aktuelle Spielziel noch ein lebender Gegner ist (false auch ohne Ziel).</summary>
+    public static bool HasLiveTarget() =>
+        TargetManager.Target is Dalamud.Game.ClientState.Objects.Types.IBattleChara { CurrentHp: > 0 };
+
     // General Action "Sprint" - feste Spiel-ID, kein Excel-Sheet-Lookup nötig (ändert sich nicht
     // zwischen Spiel-Patches).
     private const uint SprintGeneralActionId = 4;
@@ -3923,16 +4797,630 @@ public sealed class Plugin : IDalamudPlugin
     /// nicht von selbst, wenn man nicht auch tatsächlich in einen Kampf verwickelt wird (bloßes
     /// Anvisieren reicht dafür nicht).
     /// </summary>
-    public static unsafe void TryDismount()
+    /// <returns>Ob das Spiel den Absteige-Aufruf angenommen hat (false auch, wenn gar nicht beritten).</returns>
+    public static unsafe bool TryDismount()
     {
         if (!Condition[ConditionFlag.Mounted])
-            return;
+            return false;
 
         var actionManager = ActionManager.Instance();
         if (actionManager == null)
+            return false;
+
+        return actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
+    }
+
+    /// <summary>Siehe Configuration.UseChocoboCompanion/ChocoboCompanionSupport.</summary>
+    public static bool UseChocoboCompanion => instance.Configuration.UseChocoboCompanion;
+
+    /// <summary>Siehe Configuration.ChocoboStance/ChocoboCompanionSupport.</summary>
+    public static ChocoboStance ChocoboStance => instance.Configuration.ChocoboStance;
+
+    // Quest "My Feisty Little Chocobo" - schaltet das komplette Chocobo-Begleiter-System frei
+    // (Beschwören per Gysahl Greens, Rang/Stances), unabhängig von Großkompanie o.ä. Bewusst kein
+    // "const" (siehe (ushort)-Cast in IsChocoboCompanionUnlocked): die volle Lumina-RowId liegt über
+    // ushort.MaxValue, ein "const" würde dort einen Compile-Fehler (CS0221) auslösen statt der
+    // gewollten Laufzeit-Trunkierung auf die 16-Bit-Quest-ID des Spielclients.
+    private static readonly uint ChocoboCompanionUnlockQuestId = 66698;
+
+    // Item "Gysahl Greens" - wird beim Beschwören automatisch vom Spiel verbraucht (wie ein
+    // Verzehr-Item), kein eigenständiges "Item benutzen" nötig - siehe TrySummonChocoboCompanion.
+    private const uint GysahlGreensItemId = 4868;
+
+    // Lumina-Sheet "BuddyAction"-RowIds für die vier Chocobo-Stances - über ActionManager.UseAction
+    // mit ActionType.BuddyAction ausgelöst (siehe TrySetChocoboStance), wie ein "Companion Order"-Klick
+    // im Buddy-Fenster.
+    private static readonly Dictionary<ChocoboStance, uint> ChocoboStanceBuddyActionIds = new()
+    {
+        [ChocoboStance.Attacker] = 6,
+        [ChocoboStance.Defender] = 5,
+        [ChocoboStance.Healer] = 7,
+        [ChocoboStance.FreeStance] = 4,
+    };
+
+    // Index in UIState.Buddy.CompanionInfo.Levels (FixedSizeArray3<byte>, siehe FFXIVClientStructs-
+    // Quelltext) - JEDE dieser drei Stances hat ein eigenes, per Kampfeinsatz in dieser Stance
+    // steigendes Level (unabhängig vom Gesamt-Rang des Begleiters, siehe GetChocoboCompanionRank)
+    // und ist erst ab Level 1 überhaupt nutzbar. Free Stance hat KEIN eigenes Level und ist von
+    // Anfang an nutzbar (siehe IsChocoboStanceUnlocked).
+    private static readonly Dictionary<ChocoboStance, int> ChocoboStanceLevelIndex = new()
+    {
+        [ChocoboStance.Defender] = 0,
+        [ChocoboStance.Attacker] = 1,
+        [ChocoboStance.Healer] = 2,
+    };
+
+    public static bool IsChocoboCompanionUnlocked() => QuestManager.IsQuestComplete((ushort)ChocoboCompanionUnlockQuestId);
+
+    public static unsafe int GetChocoboCompanionRank() => UIState.Instance()->Buddy.CompanionInfo.Rank;
+
+    public static unsafe bool IsChocoboStanceUnlocked(ChocoboStance stance)
+    {
+        if (stance == ChocoboStance.FreeStance)
+            return true;
+
+        return UIState.Instance()->Buddy.CompanionInfo.Levels[ChocoboStanceLevelIndex[stance]] >= 1;
+    }
+
+    /// <summary>Verbleibende Beschwörungsdauer in Sekunden - 0 (oder kleiner), solange gerade nicht beschworen.</summary>
+    public static unsafe float GetChocoboSummonTimeLeft() => UIState.Instance()->Buddy.CompanionInfo.TimeLeft;
+
+    /// <summary>
+    /// Ob gerade eine Aktion/ein Item-Einsatz "sperrt" (echte Zauberzeit ODER die kurze
+    /// Animationssperre eines instant genutzten Items wie Gysahl Greens) - für
+    /// ChocoboCompanionSupport, damit nicht mitten in einem laufenden Beschwören-Versuch ein
+    /// zweiter losgeschickt wird (würde den ersten abbrechen/neu starten).
+    /// </summary>
+    public static unsafe bool IsAnimationLocked()
+    {
+        var actionManager = ActionManager.Instance();
+        return actionManager != null && actionManager->AnimationLock > 0f;
+    }
+
+    /// <summary>
+    /// Ob man sich gerade in einem Instanz-Inhalt (Dungeon, Trial, Raid, ...) befindet - für die
+    /// im Overlay ausgegrauten "Auto ..."-Knöpfe (siehe CompactOverlayWindow), da vnavmesh/die
+    /// hier gesteuerten Fremdplugins dort ohnehin nicht sinnvoll funktionieren. Die üblichen drei
+    /// ConditionFlags decken zusammen alle Varianten ab (BoundByDuty = normale Duty, BoundByDuty56
+    /// = z.B. Deep Dungeons/Eureka, BoundByDuty95 = z.B. Bozja/Zadnor-Gebiete).
+    /// </summary>
+    public static bool IsInInstancedContent() =>
+        Condition[ConditionFlag.BoundByDuty] || Condition[ConditionFlag.BoundByDuty56] || Condition[ConditionFlag.BoundByDuty95];
+
+    public static bool IsChocoboCompanionSummoned() => GetChocoboSummonTimeLeft() > 0f;
+
+    public static uint GetGysahlGreensCount() => instance.GetCurrencyAmount(GysahlGreensItemId);
+
+    // In welchen der vier normalen Inventar-Bags nach Gysahl Greens gesucht wird (siehe
+    // TrySummonChocoboCompanion) - dieselbe Reihenfolge wie im echten Inventar-Fenster.
+    private static readonly InventoryType[] ChocoboSummonSearchBags =
+    {
+        InventoryType.Inventory1,
+        InventoryType.Inventory2,
+        InventoryType.Inventory3,
+        InventoryType.Inventory4,
+    };
+
+    /// <summary>
+    /// Beschwört den Chocobo-Begleiter (verbraucht dabei automatisch eine Gysahl Greens aus dem
+    /// Inventar) - für ChocoboCompanionSupport. Gibt false zurück (ohne Nebenwirkung), falls das
+    /// System noch nicht freigeschaltet ist oder keine Gysahl Greens gefunden werden. Bewusst NICHT
+    /// über ActionManager.UseAction(ActionType.Item, ...) (das hat sich für dieses Item als
+    /// zuverlässig wirkungslos herausgestellt - Gysahl Greens hat laut Lumina ItemAction-Sheet einen
+    /// besonderen Typ (5), keinen normalen "Verzehr"-Typ), sondern über AgentInventoryContext.
+    /// UseItem - exakt derselbe Aufruf, den ein Rechtsklick -> "Benutzen" im Inventar-Fenster selbst
+    /// auslöst, und damit unabhängig vom jeweiligen ItemAction-Typ zuverlässig.
+    /// </summary>
+    public static unsafe bool TrySummonChocoboCompanion()
+    {
+        if (!IsChocoboCompanionUnlocked())
+            return false;
+
+        var inventoryManager = InventoryManager.Instance();
+        if (inventoryManager == null)
+            return false;
+
+        foreach (var bag in ChocoboSummonSearchBags)
+        {
+            var container = inventoryManager->GetInventoryContainer(bag);
+            if (container == null)
+                continue;
+
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = container->GetInventorySlot(i);
+                if (slot == null || slot->ItemId != GysahlGreensItemId || slot->Quantity <= 0)
+                    continue;
+
+                var agent = AgentInventoryContext.Instance();
+                if (agent == null)
+                    return false;
+
+                agent->UseItem(GysahlGreensItemId, bag, (uint)slot->Slot, 0);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Stellt die gewünschte Chocobo-Stance ein (wie ein Klick im Buddy-Fenster) - für
+    /// ChocoboCompanionSupport. Gibt false zurück (ohne Nebenwirkung), falls der Begleiter gerade
+    /// nicht beschworen ist oder der nötige Rang für diese Stance fehlt.
+    /// </summary>
+    public static unsafe bool TrySetChocoboStance(ChocoboStance stance)
+    {
+        if (!IsChocoboCompanionSummoned() || !IsChocoboStanceUnlocked(stance))
+            return false;
+
+        var actionManager = ActionManager.Instance();
+        if (actionManager == null)
+            return false;
+
+        return actionManager->UseAction(ActionType.BuddyAction, ChocoboStanceBuddyActionIds[stance]);
+    }
+
+    private const string AllaganToolsInternalName = "InventoryTools"; // Anzeigename im Spiel ist "Allagan Tools"
+
+    /// <summary>
+    /// Ob das optionale Fremdplugin "Allagan Tools" aktuell installiert und geladen ist - für die
+    /// Freischaltung von Configuration.EnableAllaganToolsIntegration (siehe MainWindow QoL-
+    /// Einstellungen), die dort automatisch wieder ausgeschaltet wird, falls das Plugin nachträglich
+    /// entfernt wird.
+    /// </summary>
+    public static bool IsAllaganToolsAvailable() =>
+        PluginInterface.InstalledPlugins.Any(p => p.InternalName == AllaganToolsInternalName && p.IsLoaded);
+
+    /// <summary>
+    /// Öffnet Allagan Tools' "Mehr Informationen"-Fenster für ein Item - per SHIFT + Linksklick auf
+    /// einen Sammelobjekt-Namen oder eine Währungsangabe im kompakten Overlay (siehe
+    /// CompactOverlayWindow.DrawClickableName/DrawCurrencyRequirement), nur wenn Configuration.
+    /// EnableAllaganToolsIntegration aktiv UND das Plugin geladen ist. Ruft dessen selbst
+    /// registrierten Chat-Befehl "/moreinfo" auf (akzeptiert sowohl Item-Namen als auch Item-ID) -
+    /// Allagan Tools' eigene IPC bietet aktuell keine Methode, um das Item-Fenster zu öffnen (nur
+    /// Bestands-/Filter-bezogene Funktionen, siehe dessen IPC/IPCService.cs).
+    /// </summary>
+    public static void OpenAllaganToolsItemInfo(string itemNameOrId)
+    {
+        if (!instance.Configuration.EnableAllaganToolsIntegration || !IsAllaganToolsAvailable())
             return;
 
-        actionManager->UseAction(ActionType.GeneralAction, DismountGeneralActionId);
+        try
+        {
+            CommandManager.ProcessCommand($"/moreinfo {itemNameOrId}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Öffnen von Allagan Tools' Item-Fenster.");
+        }
+    }
+
+    /// <summary>Wie OpenAllaganToolsItemInfo(string), für eine bekannte Item-RowId (z.B. eine Währung).</summary>
+    public static void OpenAllaganToolsItemInfo(uint itemId)
+    {
+        if (itemId != 0)
+            OpenAllaganToolsItemInfo(itemId.ToString());
+    }
+
+    /// <summary>
+    /// Für ein Sammelobjekt (SHIFT + Linksklick im Overlay) - Allagan Tools kennt nur ITEMS, der
+    /// Anzeigename eines Sammelobjekts ist aber oft nicht der Name des freischaltenden Items
+    /// ("Maelstrom Command" statt "Maelstrom Command Orchestrion Roll", Mount "Uolon" statt "Uolon
+    /// Horn"). Daher wird - wo möglich - die Item-ID des freischaltenden Items übergeben (siehe
+    /// ResolveUnlockItemId), sonst wie bisher der Name.
+    /// </summary>
+    public static void OpenAllaganToolsItemInfo(CollectibleEntry entry)
+    {
+        var itemId = ResolveUnlockItemId(entry);
+        if (itemId != 0)
+            OpenAllaganToolsItemInfo(itemId);
+        else
+            OpenAllaganToolsItemInfo(entry.Name);
+    }
+
+    // Die beiden Reiter "Newest"/"Previous" beim Itinerant Moogle (Moogle Treasure Trove) - im Spiel
+    // eigene SpecialShops, deren Inhalt Square Enix mit jedem Event-Patch austauscht. Bewusst per
+    // Name statt fester RowId gesucht (es gibt z.B. mehrere "Newest"-Zeilen, siehe
+    // GetItinerantMoogleEntries). "Past"/"Seasonal" werden nicht angezeigt (ausdrücklicher Nutzerwunsch).
+    private static readonly string[] ItinerantMoogleShopNames =
+    {
+        "Newest Irregular Tomestone Exchange",
+        "Previous Irregular Tomestone Exchange",
+    };
+
+    private const string ItinerantMoogleVendorName = "Itinerant Moogle";
+
+    // Die drei Itinerant Moogles in den Hauptstädten (ENpcResident 1009434/1009433/1009435), Position
+    // aus dem Lumina-Sheet "Level" umgerechnet.
+    private static readonly (uint TerritoryId, uint MapId, float X, float Y)[] ItinerantMoogleLocations =
+    {
+        (129, 12, 9.4f, 11.7f),  // Limsa Lominsa Lower Decks
+        (132, 2, 12.4f, 12.2f),  // New Gridania
+        (130, 13, 9.6f, 9.1f),   // Ul'dah - Steps of Nald
+    };
+
+    /// <summary>
+    /// Baut die aktuell beim Itinerant Moogle unter "Newest" und "Previous" erhältlichen
+    /// Sammelobjekte LIVE aus den Spieldaten (SpecialShop) - ändert sich damit automatisch mit jedem
+    /// Moogle-Treasure-Trove-Event, ohne dass eine Liste gepflegt werden muss. Jede Ware wird über
+    /// ihr Freischalt-Item (siehe ResolveUnlockItemId) dem passenden Sammelobjekt aus baseEntries
+    /// zugeordnet und je Stadt einmal (Händlerposition) mit exaktem Preis angelegt. Nur während des
+    /// Events erhältlich (siehe CollectibleEntry.EventName/KnownEventWindows);
+    /// Die Slot-Quests der Shop-Daten (v.a. bei Triple-Triad-Karten) werden bewusst NICHT übernommen -
+    /// beim Moogle gelten die Waren als kaufbar (ausdrücklicher Nutzerwunsch), nur die generelle
+    /// Triple-Triad-Freischaltung (siehe TripleTriadUnlockQuestName) wird weiter geprüft.
+    /// </summary>
+    public static List<CollectibleEntry> GetItinerantMoogleEntries(IReadOnlyList<CollectibleEntry> baseEntries)
+    {
+        var result = new List<CollectibleEntry>();
+        try
+        {
+            var specialShopSheet = DataManager.GetExcelSheet<SpecialShop>();
+            if (specialShopSheet == null)
+                return result;
+
+            // Freischalt-Item -> Sammelobjekt (erster Treffer gewinnt, z.B. Frisuren gibt es je
+            // Rasse/Geschlecht mehrfach mit demselben Buch).
+            var entryByUnlockItem = new Dictionary<uint, CollectibleEntry>();
+            foreach (var entry in baseEntries)
+            {
+                var itemId = ResolveUnlockItemId(entry);
+                if (itemId != 0)
+                    entryByUnlockItem.TryAdd(itemId, entry);
+            }
+
+            var moogleShops = specialShopSheet.Where(s => ItinerantMoogleShopNames.Contains(s.Name.ToString())).ToList();
+            var seen = new HashSet<(CollectibleType, uint)>();
+            foreach (var shop in moogleShops)
+            {
+                var shopName = shop.Name.ToString();
+
+                foreach (var slot in shop.Item)
+                {
+                    try
+                    {
+                        var receivedItemId = slot.ReceiveItems.FirstOrDefault(r => r.Item.RowId != 0).Item.RowId;
+                        if (receivedItemId == 0 || !entryByUnlockItem.TryGetValue(receivedItemId, out var baseEntry))
+                            continue;
+
+                        // Dieselbe Ware kann in mehreren Shops/Währungen auftauchen (z.B. Uolon Horn
+                        // für Astronomy I UND II) - einmal reicht.
+                        if (!seen.Add((baseEntry.Type, baseEntry.Id)))
+                            continue;
+
+                        var costs = new List<CollectibleCurrency>();
+                        foreach (var cost in slot.ItemCosts)
+                        {
+                            if (cost.ItemCost.RowId == 0 || cost.CurrencyCost == 0 || cost.ItemCost.ValueNullable is not { } costItem)
+                                continue;
+
+                            costs.Add(new CollectibleCurrency
+                            {
+                                Currency = $"{cost.CurrencyCost:N0} {costItem.Name}",
+                                CurrencyIconId = costItem.Icon,
+                                CurrencyItemId = cost.ItemCost.RowId,
+                                CurrencyAmount = cost.CurrencyCost,
+                            });
+                        }
+
+                        if (costs.Count == 0)
+                            continue;
+
+                        foreach (var (territoryId, mapId, x, y) in ItinerantMoogleLocations)
+                        {
+                            result.Add(new CollectibleEntry
+                            {
+                                Id = baseEntry.Id,
+                                Name = baseEntry.Name,
+                                Type = baseEntry.Type,
+                                Category = "Saisonevent",
+                                TerritoryTypeId = territoryId,
+                                MapId = mapId,
+                                Vendor = ItinerantMoogleVendorName,
+                                VendorMapX = x,
+                                VendorMapY = y,
+                                Currency = costs[0].Currency,
+                                CurrencyIconId = costs[0].CurrencyIconId,
+                                CurrencyItemId = costs[0].CurrencyItemId,
+                                CurrencyAmount = costs[0].CurrencyAmount,
+                                AdditionalCurrencies = costs.Count > 1 ? costs.Skip(1).ToList() : null,
+                                Source = $"{ItinerantMoogleVendorName} - Moogle Treasure Trove ({shopName})",
+                                FrameKitUnlockKind = baseEntry.FrameKitUnlockKind,
+                                FrameKitUnlockId = baseEntry.FrameKitUnlockId,
+                                EventName = MoogleTreasureTroveEventName,
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Einzelne leere/reservierte Slots können beim Auslesen werfen (siehe
+                        // EnrichFrameKitVendors) - nur diesen Slot überspringen.
+                        Log.Debug(ex, $"[MoogleTrove] Slot in SpecialShop {shop.RowId} übersprungen.");
+                    }
+                }
+            }
+
+            Log.Info($"[MoogleTrove] {result.Count / ItinerantMoogleLocations.Length} Sammelobjekte beim Itinerant Moogle (Newest/Previous).");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der Itinerant-Moogle-Waren.");
+        }
+
+        return result;
+    }
+
+    /// <summary>Ob für dieses Sammelobjekt ein freischaltendes Item bekannt ist (siehe ResolveUnlockItemId).</summary>
+    public static bool HasUnlockItem(CollectibleEntry entry) => ResolveUnlockItemId(entry) != 0;
+
+    // Lumina "ItemAction"-Typen (ItemAction.Action.RowId) der Items, die ein Sammelobjekt
+    // freischalten - per Auswertung der Spieldaten verifiziert (z.B. "Uolon Horn" = 1322 mit
+    // Data[0] = Mount-RowId 414, "Wind-up Cursor" = 853 mit Data[0] = Companion-RowId 51,
+    // "Maelstrom Command Orchestrion Roll" = 25183 mit AdditionalData = Orchestrion-RowId 549).
+    private const uint ItemActionCompanion = 853;
+    private const uint ItemActionBuddyEquip = 1013;
+    private const uint ItemActionMount = 1322;
+    private const uint ItemActionUnlockLink = 2633; // u.a. Emotes: Data[0] = Emote.UnlockLink
+    private const uint ItemActionTripleTriadCard = 3357;
+    private const uint ItemActionOrnament = 20086;
+    private const uint ItemActionOrchestrion = 25183; // Orchestrion-RowId steht in Item.AdditionalData, nicht in Data
+    private const uint ItemActionGlasses = 37312;
+    private const uint ItemActionFramersKit = 29459; // Kit-ID (== CollectibleEntry.FrameKitUnlockId) steht in Item.AdditionalData
+
+    private static Dictionary<(CollectibleType Type, uint Id), uint>? unlockItemIdCache;
+    private static Dictionary<string, uint>? glassesItemIdByNameCache;
+
+    /// <summary>
+    /// Item-RowId des Items, das dieses Sammelobjekt freischaltet - 0, wenn keins bekannt ist (dann
+    /// sucht Allagan Tools per Name). Einmalig aus dem Item-Sheet aufgebaut. Gibt es mehrere Items
+    /// für dasselbe Sammelobjekt, gewinnt das mit der kleinsten RowId (in der Regel das
+    /// ursprüngliche, nicht eine spätere Neuauflage).
+    /// </summary>
+    private static uint ResolveUnlockItemId(CollectibleEntry entry)
+    {
+        if (unlockItemIdCache == null)
+            BuildUnlockItemCaches();
+
+        // Frisuren: das "Modern Aesthetics"-Buch steht direkt in CharaMakeCustomize.HintItem (entry.Id
+        // ist die CharaMakeCustomize-RowId, siehe GetHairstyleEntries).
+        if (entry.Type == CollectibleType.Hairstyle)
+        {
+            var customizeSheet = DataManager.GetExcelSheet<CharaMakeCustomize>();
+            return customizeSheet != null && customizeSheet.TryGetRow(entry.Id, out var customize) ? customize.HintItem.RowId : 0u;
+        }
+
+        // Framer's Kits: nur Rahmen, die über ein Kit-Item freigeschaltet werden (andere Arten, z.B.
+        // per Errungenschaft, haben kein Item - dann Namenssuche wie bisher).
+        if (entry.Type == CollectibleType.FrameKit)
+        {
+            return entry.FrameKitUnlockKind == FrameKitUnlockKind.FramersKitItem
+                ? unlockItemIdCache!.GetValueOrDefault((CollectibleType.FrameKit, entry.FrameKitUnlockId), 0u)
+                : 0u;
+        }
+
+        // Facewear: die Einträge nutzen eine andere ID als die Items (Glasses vs. GlassesStyle ließen
+        // sich nicht eindeutig zuordnen) - daher über den Namen des Items ("The Faces We Wear - <Name>").
+        if (entry.Type == CollectibleType.Facewear)
+            return glassesItemIdByNameCache!.GetValueOrDefault(entry.Name.Trim(), 0u);
+
+        var key = entry.Type == CollectibleType.Emote
+            ? (CollectibleType.Emote, ResolveEmoteUnlockLink(entry.Id))
+            : (entry.Type, entry.Id);
+        return unlockItemIdCache!.GetValueOrDefault(key, 0u);
+    }
+
+    private static uint ResolveEmoteUnlockLink(uint emoteId)
+    {
+        var emoteSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Emote>();
+        return emoteSheet != null && emoteSheet.TryGetRow(emoteId, out var emote) ? emote.UnlockLink : 0u;
+    }
+
+    private static void BuildUnlockItemCaches()
+    {
+        var byKey = new Dictionary<(CollectibleType Type, uint Id), uint>();
+        var glassesByName = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            var itemSheet = DataManager.GetExcelSheet<Item>();
+            if (itemSheet != null)
+            {
+                foreach (var item in itemSheet)
+                {
+                    if (item.ItemAction.RowId == 0 || item.ItemAction.ValueNullable is not { } action)
+                        continue;
+
+                    var data0 = (uint)action.Data[0];
+                    (CollectibleType Type, uint Id)? key = action.Action.RowId switch
+                    {
+                        ItemActionCompanion => (CollectibleType.Minion, data0),
+                        ItemActionBuddyEquip => (CollectibleType.Barding, data0),
+                        ItemActionMount => (CollectibleType.Mount, data0),
+                        ItemActionUnlockLink => (CollectibleType.Emote, data0),
+                        ItemActionTripleTriadCard => (CollectibleType.TripleTriadCard, data0),
+                        ItemActionOrnament => (CollectibleType.FashionAccessory, data0),
+                        ItemActionOrchestrion => (CollectibleType.Orchestrion, item.AdditionalData.RowId),
+                        ItemActionFramersKit => (CollectibleType.FrameKit, item.AdditionalData.RowId),
+                        _ => null,
+                    };
+
+                    if (key is { } k && k.Id != 0)
+                        byKey.TryAdd(k, item.RowId);
+
+                    if (action.Action.RowId == ItemActionGlasses)
+                    {
+                        // "The Faces We Wear - Oval Spectacles" -> "Oval Spectacles"
+                        var itemName = item.Name.ToString();
+                        var dash = itemName.LastIndexOf(" - ", StringComparison.Ordinal);
+                        var glassesName = dash >= 0 ? itemName[(dash + 3)..] : itemName;
+                        glassesByName.TryAdd(glassesName.Trim(), item.RowId);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der Freischalt-Item-Zuordnung für Allagan Tools.");
+        }
+
+        unlockItemIdCache = byKey;
+        glassesItemIdByNameCache = glassesByName;
+    }
+
+    // Anders als OpenAllaganToolsItemInfo (Chat-Befehl) hier bewusst echte IPC - "AllaganTools.
+    // GetItemCountsByCharacter(itemId, currentCharacterOnly, inventoryCategories, includeSharedStorage)"
+    // liefert je Charakter-/Retainer-ID (ulong) die besessene Menge, unabhängig davon, ob dessen
+    // Inventar in DIESER Sitzung schon einmal geöffnet wurde (Allagan Tools hält eine eigene,
+    // sitzungsübergreifende Datenbank) - name/RowId und Registrierung per Dekompilieren von
+    // InventoryTools/IPC/IPCService.cs verifiziert (dort registriert unter genau diesem Namen).
+    private static ICallGateSubscriber<uint, bool, uint[], bool, Dictionary<ulong, uint>>? allaganToolsGetItemCountsByCharacter;
+
+    /// <summary>
+    /// Wie viel eines Items auf den eigenen Retainern liegt, aufgeschlüsselt je Retainer-Name - für
+    /// den "(<Anzahl>)"-Zusatz hinter "Deine Währungen" (siehe CompactOverlayWindow.
+    /// DrawCurrencyWallet/Configuration.ShowRetainerItemCounts). Leer (kein Fehler), solange Allagan
+    /// Tools nicht installiert/geladen ist oder der IPC-Aufruf aus irgendeinem Grund fehlschlägt.
+    /// Retainer-IDs/-Namen kommen bewusst NICHT aus Allagan Tools selbst (das liefert nur IDs, keine
+    /// Namen) - stattdessen aus RetainerManager (immer verfügbar für alle eigenen Retainer, auch
+    /// ohne sie in dieser Sitzung geöffnet zu haben), gegen das die von Allagan Tools gelieferten
+    /// IDs abgeglichen werden (schließt dabei automatisch Werte für die eigene Spielfigur/FC-Truhen
+    /// aus, auch ohne die genaue InventoryCategory-Aufschlüsselung von Allagan Tools zu kennen).
+    /// </summary>
+    // Siehe GetAllaganToolsCharacterNames.
+    private static Dictionary<ulong, string> allaganToolsCharacterNames = new();
+    private static DateTime allaganToolsConfigLastWrite = DateTime.MinValue;
+    private static DateTime allaganToolsConfigLastCheck = DateTime.MinValue;
+    private static readonly TimeSpan AllaganToolsConfigCheckInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Namen der Allagan Tools bekannten Charaktere/Retainer/FCs je ID - Allagan Tools bietet dafür
+    /// KEINE IPC (nur IDs, siehe GetRetainerItemCounts), speichert sie aber in seiner eigenen
+    /// Konfigurationsdatei ("SavedCharacters": ID -> { CharacterId, Name, OwnerId, ... }). Nur
+    /// lesend geöffnet (FileShare.ReadWrite, Allagan Tools darf jederzeit weiterschreiben) und nur
+    /// neu eingelesen, wenn sich die Datei geändert hat (höchstens alle
+    /// AllaganToolsConfigCheckInterval geprüft). Bei jedem Fehler bleibt der letzte Stand erhalten.
+    /// </summary>
+    private static Dictionary<ulong, string> GetAllaganToolsCharacterNames()
+    {
+        if (DateTime.UtcNow - allaganToolsConfigLastCheck < AllaganToolsConfigCheckInterval)
+            return allaganToolsCharacterNames;
+
+        allaganToolsConfigLastCheck = DateTime.UtcNow;
+        try
+        {
+            var configDirectory = PluginInterface.ConfigFile.DirectoryName;
+            if (configDirectory == null)
+                return allaganToolsCharacterNames;
+
+            var path = System.IO.Path.Combine(configDirectory, AllaganToolsInternalName + ".json");
+            if (!System.IO.File.Exists(path))
+                return allaganToolsCharacterNames;
+
+            var lastWrite = System.IO.File.GetLastWriteTimeUtc(path);
+            if (lastWrite == allaganToolsConfigLastWrite)
+                return allaganToolsCharacterNames;
+
+            using var stream = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
+            using var document = System.Text.Json.JsonDocument.Parse(stream);
+            var names = new Dictionary<ulong, string>();
+            if (document.RootElement.TryGetProperty("SavedCharacters", out var savedCharacters)
+                && savedCharacters.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                foreach (var character in savedCharacters.EnumerateObject())
+                {
+                    if (character.Value.ValueKind != System.Text.Json.JsonValueKind.Object)
+                        continue;
+
+                    // CharacterId kann (z.B. bei FCs) größer als long.MaxValue sein - daher ulong.
+                    if (!character.Value.TryGetProperty("CharacterId", out var idElement) || !idElement.TryGetUInt64(out var id))
+                        continue;
+
+                    if (character.Value.TryGetProperty("Name", out var nameElement) && nameElement.ValueKind == System.Text.Json.JsonValueKind.String)
+                        names[id] = nameElement.GetString() ?? string.Empty;
+                }
+            }
+
+            allaganToolsCharacterNames = names;
+            allaganToolsConfigLastWrite = lastWrite;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Konnte Retainer-Namen nicht aus der Allagan-Tools-Konfiguration lesen.");
+        }
+
+        return allaganToolsCharacterNames;
+    }
+
+    public static unsafe Dictionary<string, uint> GetRetainerItemCounts(uint itemId)
+    {
+        var result = new Dictionary<string, uint>();
+        if (itemId == 0 || !instance.Configuration.ShowRetainerItemCounts || !IsAllaganToolsAvailable())
+            return result;
+
+        allaganToolsGetItemCountsByCharacter ??=
+            PluginInterface.GetIpcSubscriber<uint, bool, uint[], bool, Dictionary<ulong, uint>>("AllaganTools.GetItemCountsByCharacter");
+
+        Dictionary<ulong, uint> byCharacter;
+        try
+        {
+            if (!allaganToolsGetItemCountsByCharacter.HasFunction)
+                return result;
+
+            byCharacter = allaganToolsGetItemCountsByCharacter.InvokeFunc(itemId, true, Array.Empty<uint>(), false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Abfragen der Retainer-Bestände über Allagan Tools.");
+            return result;
+        }
+
+        // Namen nur, soweit RetainerManager sie kennt - dessen Liste ist erst gefüllt, nachdem in
+        // DIESER Sitzung eine Glocke benutzt wurde. Bisher wurden deshalb ausschließlich dort
+        // bekannte IDs übernommen und alle Allagan-Tools-Bestände verworfen, solange die Liste leer
+        // war (Nutzer-Report: Retainer mit 80+ Stück, angezeigt wurde gar nichts). Jetzt zählt jede
+        // von Allagan Tools gelieferte ID außer der eigenen Spielfigur (currentCharacterOnly=true
+        // beschränkt bereits auf eigene Retainer/FC-/Haus-Lager); unbekannte bekommen einen
+        // Platzhalternamen.
+        var retainerNames = new Dictionary<ulong, string>();
+        var retainerManager = RetainerManager.Instance();
+        if (retainerManager != null)
+        {
+            foreach (var retainer in retainerManager->Retainers)
+            {
+                if (retainer.RetainerId != 0)
+                    retainerNames[retainer.RetainerId] = retainer.NameString;
+            }
+        }
+
+        var ownCharacterId = PlayerState.Instance()->ContentId;
+        var allaganToolsNames = GetAllaganToolsCharacterNames();
+        var unknownIndex = 0;
+        foreach (var (ownerId, count) in byCharacter)
+        {
+            if (ownerId == ownCharacterId || count == 0)
+                continue;
+
+            string name;
+            if (retainerNames.TryGetValue(ownerId, out var knownName) && !string.IsNullOrEmpty(knownName))
+            {
+                name = knownName;
+            }
+            else if (allaganToolsNames.TryGetValue(ownerId, out var savedName) && !string.IsNullOrEmpty(savedName))
+            {
+                name = savedName;
+            }
+            else
+            {
+                unknownIndex++;
+                name = Loc.T($"Retainer/Lager {unknownIndex}", $"Retainer/storage {unknownIndex}");
+            }
+
+
+            result[name] = result.GetValueOrDefault(name) + count;
+        }
+
+        return result;
     }
 
     // Von Hand als "nicht von der Automation unterstützt" markierte Sightseeing-Punkte (Key =
@@ -4535,6 +6023,10 @@ public sealed class Plugin : IDalamudPlugin
         return classJobRowId;
     }
 
+    // Höchstens so viele Zehner-Stufen je Klasse (ARR-Basisklassen haben 5) - nicht vorhandene
+    // MonsterNote-Zeilen werden in GetHuntingLogEntries ohnehin übersprungen.
+    private const int MaxHuntingLogTiers = 10;
+
     /// <summary>
     /// Berechnet die Hunting-Log-Einträge des AKTUELL AKTIVEN Rangs der AKTUELLEN Klasse, die zur
     /// übergebenen Zone gehören - live pro Frame berechnet (nicht gecacht wie GetLiveZoneEntries,
@@ -4585,29 +6077,51 @@ public sealed class Plugin : IDalamudPlugin
 
         var zonePlaceNameId = territoryRow.PlaceName.RowId;
 
-        for (var subRank = 0; subRank < 10; subRank++)
+        // Neben der aktiven Stufe auch alle HÖHEREN (noch nicht erreichten) Stufen anzeigen -
+        // markiert als "Bedingung nicht erfüllt" (siehe CollectibleEntry.HuntingLogRequiredRank),
+        // da Kills dort noch nicht zählen. Niedrigere Stufen sind per Definition bereits komplett
+        // (das Spiel schaltet erst nach allen 10 Teil-Rängen weiter). Dasselbe Monster kann in
+        // mehreren Stufen vorkommen - dann nur einmal (die niedrigste Stufe gewinnt), sonst gäbe es
+        // doppelte Einträge mit derselben Id (siehe z.B. ImGui-IDs im Overlay, StillNeeded).
+        var addedTargetIds = new HashSet<uint>();
+        for (var noteTier = tier; noteTier < MaxHuntingLogTiers; noteTier++)
         {
-            var monsterNoteRowId = (uint)(classId * 10000 + tier * 10 + subRank + 1);
-            if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
-                continue;
-
-            var rankCounts = slot.RankData[subRank];
-
-            // Teil-Rang schon komplett (alle seine Ziele erreicht)? Dann überspringen - siehe
-            // Klassenkommentar oben.
-            var isComplete = true;
-            for (var i = 0; i < 4; i++)
+            var isLockedTier = noteTier > tier;
+            for (var subRank = 0; subRank < 10; subRank++)
             {
-                if (note.MonsterNoteTarget[i].RowId != 0 && rankCounts[i] < note.Count[i])
+                var monsterNoteRowId = (uint)(classId * 10000 + noteTier * 10 + subRank + 1);
+                if (!noteSheet.TryGetRow(monsterNoteRowId, out var note))
+                    continue;
+
+                // Fortschritt gibt es nur für die aktive Stufe - höhere starten bei 0.
+                var rankCounts = new int[4];
+                if (!isLockedTier)
                 {
-                    isComplete = false;
-                    break;
+                    var liveCounts = slot.RankData[subRank];
+                    for (var i = 0; i < 4; i++)
+                        rankCounts[i] = liveCounts[i];
                 }
+
+                // Teil-Rang schon komplett (alle seine Ziele erreicht)? Dann überspringen - siehe
+                // Klassenkommentar oben.
+                var isComplete = !isLockedTier;
+                for (var i = 0; i < 4 && isComplete; i++)
+                {
+                    if (note.MonsterNoteTarget[i].RowId != 0 && rankCounts[i] < note.Count[i])
+                        isComplete = false;
+                }
+
+                if (isComplete)
+                    continue;
+
+                AddHuntingLogTargets(note, rankCounts, isLockedTier, noteTier, subRank);
             }
+        }
 
-            if (isComplete)
-                continue;
+        return result;
 
+        void AddHuntingLogTargets(Lumina.Excel.Sheets.MonsterNote note, int[] rankCounts, bool isLockedTier, int noteTier, int subRank)
+        {
             for (var i = 0; i < 4; i++)
             {
                 var targetRef = note.MonsterNoteTarget[i];
@@ -4643,6 +6157,9 @@ public sealed class Plugin : IDalamudPlugin
                 if (string.IsNullOrEmpty(monsterName))
                     continue;
 
+                if (!addedTargetIds.Add(target.Value.RowId))
+                    continue;
+
                 ManualHuntingLogPositions.TryGetValue(target.Value.RowId, out var manualPosition);
 
                 result.Add(new CollectibleEntry
@@ -4655,12 +6172,11 @@ public sealed class Plugin : IDalamudPlugin
                     MapId = territoryRow.Map.RowId,
                     WorldPosition = manualPosition == default ? null : manualPosition,
                     BNpcNameId = target.Value.BNpcName.RowId,
-                    Source = $"{className} {tier * 10 + subRank + 1:00}",
+                    Source = $"{className} {noteTier * 10 + subRank + 1:00}",
+                    HuntingLogRequiredRank = isLockedTier ? noteTier + 1 : null,
                 });
             }
         }
-
-        return result;
     }
 
     /// <summary>
@@ -4713,6 +6229,7 @@ public sealed class Plugin : IDalamudPlugin
         CompactOverlayWindow.Dispose();
         NavigationArrowWindow.Dispose();
         QuestAutomation.Dispose();
+        CombatPluginInstance.Dispose();
 
         CommandManager.RemoveHandler(CommandName);
 
