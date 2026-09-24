@@ -24,6 +24,8 @@ public sealed class SightseeingAutomation
         Mounting,
         MovingTo,
         WaitingForUnlock,
+        EnsuringExactPosition,
+        WalkingOut,
     }
 
     private static readonly TimeSpan MountWaitTimeout = TimeSpan.FromSeconds(6);
@@ -34,7 +36,26 @@ public sealed class SightseeingAutomation
     // nach dem groben Laufweg (der über den navmesh-genähten "floorPoint" nur die Erreichbarkeit
     // sicherstellt, siehe StartMovingTo) folgt daher ein zweiter, viel engerer Laufauftrag direkt zur
     // echten geloggten Position, siehe BeginFinalApproach.
-    private const float FinalApproachTolerance = 0.75f;
+    // Buchstäblich 0 lässt den fliegenden Anflug (Schweben mit dem Mount) hier und da nie exakt
+    // "ankommen" (pathIsRunning bleibt endlos true) - deshalb ein winziger, aber nicht-null Wert.
+    private const float FinalApproachTolerance = 0.1f;
+
+    // Toleranz für den (optionalen) letzten Schritt NACH dem Abmounten am Zielpunkt, siehe Plugin.
+    // SightseeingExactStandPositions/UpdateEnsuringExactPosition - noch enger als
+    // FinalApproachTolerance, da hier wirklich exakt die zur Freischaltung nötige Stelle erreicht
+    // werden muss, nicht nur "nah genug dran".
+    private const float ExactPositionTolerance = 0.15f;
+
+    // Toleranz für die Landekorrektur nach dem fliegenden ersten Zwischenstopp (siehe UpdateMoving/
+    // hasLandedAtFirstApproachWaypoint) - eng genug, um eine spürbare Restschwebehöhe zu erzwingen,
+    // aber nicht so eng wie ExactPositionTolerance (hier geht es nur ums Landen, nicht um einen
+    // exakten Freischalt-Punkt).
+    private const float ApproachWaypointLandingTolerance = 0.5f;
+
+    // Kurze Pause zwischen den einzelnen von Hand hinterlegten Zwischenstopps (siehe Plugin.
+    // SightseeingApproachWaypoints/UpdateMoving), bevor jeweils zum nächsten weitergelaufen/
+    // -geflogen wird.
+    private static readonly TimeSpan InterWaypointPauseDuration = TimeSpan.FromSeconds(0.1);
 
     // Ankunftstoleranz beim Zwischenstopp an einem Aethernetz-Kristall (siehe BeginWalkToLocalAethernet)
     // - dieselben Werte wie AetheryteAutomation.SmallAetheryteFinalApproachDistance/
@@ -60,6 +81,12 @@ public sealed class SightseeingAutomation
     // erneut anlaufen lässt) - kein Emote nötig, nur kurz am Punkt stehen bleiben, damit man den
     // erreichten Punkt optisch bestätigt bekommt, dann weiter zum nächsten.
     private static readonly TimeSpan AlreadyCompleteLingerDuration = TimeSpan.FromSeconds(1.5);
+
+    // Condition[Mounted] wird schon VOR dem Ende der sichtbaren Absteige-/Lande-Animation false -
+    // nach dem Abmounten (siehe UpdateWaitingForUnlock) zusätzlich noch kurz warten, damit der
+    // Emote nicht mitten in dieser Animation ins Leere läuft. Gleicher Wert/Begründung wie
+    // AetheryteAutomation.DismountSettleDelay.
+    private static readonly TimeSpan DismountSettleDelay = TimeSpan.FromSeconds(1);
 
     // Wie lange maximal auf eine Lifestream-Reise in einen Nachbarbezirk gewartet wird (Ladebildschirm
     // + eventuelles eigenes Laufen von Lifestream zum Ziel-Aetheryten) - siehe GoToAutomation/
@@ -95,7 +122,23 @@ public sealed class SightseeingAutomation
     private readonly NavigationStuckDetector stuckDetector = new();
     private bool hasSentEmote;
     private bool didFinalApproach;
+    private DateTime? interWaypointPauseStartedAt;
     private DateTime? districtTravelFinishedAt;
+    private DateTime? dismountedAt;
+    private IReadOnlyList<Plugin.SightseeingApproachWaypoint>? pendingApproachWaypoints;
+    private int pendingApproachWaypointIndex;
+    private bool hasLandedAtFirstApproachWaypoint;
+    private IReadOnlyList<Vector3>? pendingPostCompletionWaypoints;
+    private int postCompletionWaypointIndex;
+    private bool hasEnsuredExactPosition;
+
+    // Ob das AKTUELLE Teilstück (siehe currentTargetPosition) fliegend versucht werden darf - true
+    // für den Normalfall (Karten-Flagge/FlagToPoint-Umweg, erster Zwischenstopp, finaler Schritt),
+    // false für einen Zwischenstopp mit AllowFlying=false (z.B. ein Durchgang wie eine Tür, durch
+    // die man nicht hindurchfliegen kann - siehe Plugin.SightseeingApproachWaypoints). Nur von
+    // BeginPathfind gelesen, das bei erneuten Versuchen (Steckengeblieben, nach dem Aufsteigen) für
+    // GENAU DASSELBE Teilstück erneut aufgerufen wird.
+    private bool currentLegAllowsFlying = true;
 
     public bool IsActive { get; private set; }
 
@@ -195,6 +238,11 @@ public sealed class SightseeingAutomation
         state = State.Idle;
         currentTargetEntry = null;
         StopPath();
+
+        // Zusätzlich zum IPC-Stop (StopPath) noch den echten Chat-Befehl absetzen - manuell
+        // angefordert, offenbar bricht das den laufenden vnavmesh-Pfad zuverlässiger komplett ab.
+        Plugin.SendGameChatCommand("/vnav stop");
+
         StopLifestream();
         Plugin.ClearNavigationTarget();
     }
@@ -240,6 +288,14 @@ public sealed class SightseeingAutomation
                 case State.WaitingForUnlock:
                     UpdateWaitingForUnlock(sightseeingInZone);
                     break;
+
+                case State.EnsuringExactPosition:
+                    UpdateEnsuringExactPosition();
+                    break;
+
+                case State.WalkingOut:
+                    UpdateWalkingOut();
+                    break;
             }
         }
         catch (Exception ex)
@@ -284,6 +340,16 @@ public sealed class SightseeingAutomation
         currentTargetEntry = entry;
         hasSentEmote = false;
         didFinalApproach = false;
+        interWaypointPauseStartedAt = null;
+        dismountedAt = null;
+        pendingApproachWaypoints = null;
+        pendingApproachWaypointIndex = 0;
+        hasLandedAtFirstApproachWaypoint = false;
+        pendingPostCompletionWaypoints = null;
+        postCompletionWaypointIndex = 0;
+        lastPathRetryAt = DateTime.MinValue;
+        hasEnsuredExactPosition = false;
+        currentLegAllowsFlying = true;
 
         // Sightseeing-Punkte einer geteilten Hauptstadt können in einem ANDEREN Bezirk liegen als
         // dem, in dem man gerade steht (siehe siblingTerritories-Filter in CompactOverlayWindow, z.B.
@@ -313,13 +379,18 @@ public sealed class SightseeingAutomation
             return;
         }
 
-        // Von Hand hinterlegter Zwischenstopp (siehe Plugin.SightseeingApproachWaypoints) hat Vorrang
-        // vor dem Karten-Flagge-Umweg - für Punkte, bei denen selbst der darüber gefundene grobe Punkt
-        // noch gegen eine Wand/ein Geländer führt. Der eigentliche letzte, enge Schritt zur echten
-        // Position passiert unverändert danach über BeginFinalApproach (siehe UpdateMoving).
-        if (Plugin.TryGetSightseeingApproachWaypoint(entry.Id, out var waypoint))
+        // Von Hand hinterlegte Zwischenstopps (siehe Plugin.SightseeingApproachWaypoints) haben
+        // Vorrang vor dem Karten-Flagge-Umweg - für Punkte, bei denen selbst der darüber gefundene
+        // grobe Punkt noch gegen eine Wand/ein Geländer führt, oder ein enger Durchgang (z.B. eine
+        // Tür) einen bestimmten Anflugweg braucht. Läuft sie der Reihe nach ab (siehe UpdateMoving),
+        // der eigentliche letzte, enge Schritt zur echten Position passiert unverändert danach über
+        // BeginFinalApproach.
+        if (Plugin.TryGetSightseeingApproachWaypoints(entry.Id, out var waypoints))
         {
-            currentTargetPosition = waypoint;
+            pendingApproachWaypoints = waypoints;
+            pendingApproachWaypointIndex = 0;
+            currentTargetPosition = waypoints[0].Position;
+            currentLegAllowsFlying = waypoints[0].AllowFlying;
         }
         else
         {
@@ -448,7 +519,7 @@ public sealed class SightseeingAutomation
         // Angekommen (oder nie richtig losgelaufen, siehe PathStartGracePeriod) - jetzt den
         // Aethernetz-Sprung probieren. Ist man doch noch zu weit vom Kristall weg, lehnt Lifestream
         // selbst ab und TryTravelToDistrict fällt auf den bezahlten Teleport zurück.
-        if (hasSeenPathRunning || DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (hasSeenPathRunning || Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
             TryTravelToDistrict(currentTargetEntry);
     }
 
@@ -544,19 +615,7 @@ public sealed class SightseeingAutomation
 
     private void BeginPathfind()
     {
-        var mounted = Plugin.Condition[ConditionFlag.Mounted];
-        var accepted = false;
-
-        // Fliegend nur versuchen, wenn Plugin.CanFly gerade true ist - sonst nimmt vnavmesh einen
-        // Flugauftrag teils trotzdem an, obwohl der Charakter gar nicht abheben kann, und hüpft nur
-        // sinnlos am Boden herum statt zu laufen.
-        if (mounted && Plugin.CanFly)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
-
-        if (!accepted)
-            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ArrivalTolerance);
-
-        if (!accepted)
+        if (!TryBeginPathfindAccepted())
         {
             SkipCurrent(Loc.T("vnavmesh lehnt Laufweg ab", "vnavmesh rejected the path"));
             return;
@@ -589,6 +648,39 @@ public sealed class SightseeingAutomation
 
         if (!accepted)
             accepted = pathfindAndMoveCloseTo.InvokeFunc(target, false, FinalApproachTolerance);
+
+        return accepted;
+    }
+
+    /// <summary>
+    /// Läuft zum NÄCHSTEN von Hand hinterlegten Zwischenstopp (siehe Plugin.
+    /// SightseeingApproachWaypoints) - mit der normalen, großzügigen Toleranz wie BeginPathfind (das
+    /// hier auch für Fliegen-Erlaubnis/Abmounten wiederverwendet wird, siehe currentLegAllowsFlying),
+    /// da es sich (wie der erste Zwischenstopp) nur um einen groben Etappenpunkt handelt, nicht die
+    /// echte Zielposition selbst.
+    /// </summary>
+    private bool BeginNextApproachWaypoint(Plugin.SightseeingApproachWaypoint waypoint)
+    {
+        currentTargetPosition = waypoint.Position;
+        currentLegAllowsFlying = waypoint.AllowFlying;
+        return TryBeginPathfindAccepted();
+    }
+
+    /// <summary>Wie BeginPathfind, gibt aber zusätzlich zurück, ob vnavmesh den Laufweg angenommen hat (statt bei Ablehnung SkipCurrent aufzurufen) - für Aufrufer, die bei Ablehnung selbst einen Fallback haben (siehe BeginNextApproachWaypoint).</summary>
+    private bool TryBeginPathfindAccepted()
+    {
+        // Bewusst KEIN erzwungenes Abmounten mehr hier, auch wenn currentLegAllowsFlying false ist -
+        // der Charakter soll während des Anflugs (auch für Teilstücke, die nicht fliegend
+        // zurückgelegt werden können, z.B. durch eine Tür) beritten bleiben und dort einfach am Boden
+        // mit dem Mount laufen, statt komplett abzusteigen. Nur der spätere Rückweg NACH dem
+        // Freischalten (siehe TryRequestWalkOutPath) mountet bewusst ab.
+        var mounted = Plugin.Condition[ConditionFlag.Mounted];
+        var accepted = false;
+        if (currentLegAllowsFlying && mounted && Plugin.CanFly)
+            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, true, ArrivalTolerance);
+
+        if (!accepted)
+            accepted = pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ArrivalTolerance);
 
         return accepted;
     }
@@ -648,8 +740,65 @@ public sealed class SightseeingAutomation
 
         if (hasSeenPathRunning)
         {
+            // Weiterer von Hand hinterlegter Zwischenstopp übrig (siehe Plugin.
+            // SightseeingApproachWaypoints)? Dann erst dorthin, bevor der finale enge Schritt
+            // (BeginFinalApproach) überhaupt versucht wird.
+            if (pendingApproachWaypoints is { } waypoints && pendingApproachWaypointIndex + 1 < waypoints.Count)
+            {
+                // Nach dem fliegenden ersten Zwischenstopp erst sicherstellen, dass wirklich am Boden
+                // gelandet wurde (der lockere ArrivalTolerance beim fliegenden Anflug lässt den
+                // Charakter u.U. noch leicht in der Luft stehen) - sonst kann der Bodenlaufweg zum
+                // nächsten (ggf. nicht-fliegenden) Zwischenstopp abgelehnt werden, weil kein gültiger
+                // Startpunkt auf dem Navmesh gefunden wird.
+                if (pendingApproachWaypointIndex == 0 && !hasLandedAtFirstApproachWaypoint)
+                {
+                    hasLandedAtFirstApproachWaypoint = true;
+                    if (pathfindAndMoveCloseTo.InvokeFunc(waypoints[0].Position, false, ApproachWaypointLandingTolerance))
+                    {
+                        hasSeenPathRunning = false;
+                        stateEnteredAt = DateTime.UtcNow;
+                        stuckDetector.Reset();
+                        StatusText = Loc.T(
+                            $"Lande am Zwischenstopp: {currentTargetEntry.Name}...",
+                            $"Landing at the waypoint: {currentTargetEntry.Name}...");
+                        return;
+                    }
+
+                    // Bereits genau genug am Boden - direkt weiter zum nächsten Zwischenstopp.
+                }
+
+                // Kurze Pause zwischen den einzelnen Zwischenstopps.
+                interWaypointPauseStartedAt ??= DateTime.UtcNow;
+                if (DateTime.UtcNow - interWaypointPauseStartedAt.Value < InterWaypointPauseDuration)
+                    return;
+                interWaypointPauseStartedAt = null;
+
+                pendingApproachWaypointIndex++;
+                if (BeginNextApproachWaypoint(waypoints[pendingApproachWaypointIndex]))
+                {
+                    hasSeenPathRunning = false;
+                    stateEnteredAt = DateTime.UtcNow;
+                    stuckDetector.Reset();
+                    StatusText = Loc.T(
+                        $"Laufe zum nächsten Zwischenstopp: {currentTargetEntry.Name}...",
+                        $"Walking to the next waypoint: {currentTargetEntry.Name}...");
+                    return;
+                }
+
+                // vnavmesh lehnt ab - direkt mit dem finalen Schritt weiter, statt hier hängen zu bleiben.
+            }
+
             if (!didFinalApproach)
             {
+                // Kurze Pause nach dem letzten Zwischenstopp, bevor zum eigentlichen Punkt geflogen wird.
+                if (pendingApproachWaypoints != null)
+                {
+                    interWaypointPauseStartedAt ??= DateTime.UtcNow;
+                    if (DateTime.UtcNow - interWaypointPauseStartedAt.Value < InterWaypointPauseDuration)
+                        return;
+                    interWaypointPauseStartedAt = null;
+                }
+
                 didFinalApproach = true;
                 if (BeginFinalApproach())
                 {
@@ -671,7 +820,7 @@ public sealed class SightseeingAutomation
             return;
         }
 
-        if (DateTime.UtcNow - stateEnteredAt > PathStartGracePeriod)
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
             SkipCurrent(Loc.T("Laufweg nie gestartet", "Movement never started"));
     }
 
@@ -694,15 +843,66 @@ public sealed class SightseeingAutomation
             return;
         }
 
-        // Bereits aufgezeichnet ODER Simulation-Modus aktiv (siehe Configuration.
-        // SimulateSightseeingAutomation - dort bewusst NIE ein Emote senden, auch nicht bei einem
-        // noch nicht aufgezeichneten Punkt: der Modus dient nur zum Testen von Laufweg/Ankunfts-
-        // position, nicht zum tatsächlichen Abschließen) - kein Emote senden, stattdessen nur kurz
-        // stehen bleiben und weiter zum nächsten Punkt.
+        // Erst abmounten (v.a. nach einem fliegenden Anflug) und die Absteige-/Lande-Animation
+        // abwarten - AUCH im Simulation-Modus (siehe Configuration.SimulateSightseeingAutomation)
+        // und bei bereits aufgezeichneten Punkten, nicht erst danach: sonst bliebe der Charakter beim
+        // Weiterfliegen zum nächsten Punkt durchgehend beritten/in der Luft, statt wie beim echten
+        // Abschließen auch sichtbar am jeweiligen Punkt zu landen. Gleiches Muster wie
+        // AetheryteAutomation.UpdateInteracting (siehe DismountSettleDelay-Kommentar).
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            Plugin.TryDismount();
+            dismountedAt = null;
+            return;
+        }
+
+        dismountedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - dismountedAt.Value < DismountSettleDelay)
+            return;
+
+        // stateEnteredAt (verwendet unten für PreEmoteDelay/UnlockWaitTimeout/AlreadyCompleteLingerDuration)
+        // stammt noch vom Betreten von WaitingForUnlock, also von VOR dem Abmounten - einmalig neu
+        // setzen, damit diese Wartezeiten wirklich erst NACH der Lande-/Absteige-Animation zu zählen
+        // beginnen.
+        if (stateEnteredAt < dismountedAt.Value)
+            stateEnteredAt = DateTime.UtcNow;
+
+        // Für manche Punkte reicht die normale Lande-/Ankunftsposition nach dem Abmounten nicht ganz
+        // (siehe Plugin.SightseeingExactStandPositions-Kommentar) - dann hier einmalig noch ein
+        // letztes kurzes Stück zu Fuß exakt hin, BEVOR überhaupt auf die Freischaltung gewartet oder
+        // ein Emote ausgeführt wird, sonst schaltet der Punkt u.U. gar nicht frei.
+        if (!hasEnsuredExactPosition)
+        {
+            hasEnsuredExactPosition = true;
+            if (Plugin.TryGetSightseeingExactStandPosition(currentTargetEntry.Id, out var exactPos))
+            {
+                var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? exactPos;
+                if (Vector3.Distance(playerPos, exactPos) > ExactPositionTolerance)
+                {
+                    currentTargetPosition = exactPos;
+                    state = State.EnsuringExactPosition;
+                    stateEnteredAt = DateTime.UtcNow;
+                    hasSeenPathRunning = false;
+                    stuckDetector.Reset();
+                    lastPathRetryAt = DateTime.MinValue;
+                    StatusText = Loc.T(
+                        $"Laufe genau auf den Punkt: {currentTargetEntry.Name}...",
+                        $"Walking precisely onto the point: {currentTargetEntry.Name}...");
+                    pathfindAndMoveCloseTo.InvokeFunc(exactPos, false, ExactPositionTolerance);
+                    lastPathRetryAt = DateTime.UtcNow;
+                    return;
+                }
+            }
+        }
+
+        // Bereits aufgezeichnet ODER Simulation-Modus aktiv - dort bewusst NIE ein Emote senden, auch
+        // nicht bei einem noch nicht aufgezeichneten Punkt: der Modus dient nur zum Testen von
+        // Laufweg/Ankunftsposition, nicht zum tatsächlichen Abschließen - kein Emote senden,
+        // stattdessen nur kurz (bereits abgemountet) stehen bleiben und weiter zum nächsten Punkt.
         if (Plugin.IsAdventureComplete(currentTargetEntry.Id) || Plugin.SimulateSightseeingAutomation)
         {
             if (DateTime.UtcNow - stateEnteredAt > AlreadyCompleteLingerDuration)
-                FinishCurrent();
+                TryWalkOutOrFinish(entries);
             return;
         }
 
@@ -737,12 +937,198 @@ public sealed class SightseeingAutomation
         if (Plugin.IsAdventureComplete(currentTargetEntry.Id))
         {
             Plugin.Log.Info($"[SightseeingAutomation] UpdateWaitingForUnlock({currentTargetEntry.Name}): freigeschaltet.");
-            FinishCurrent();
+            TryWalkOutOrFinish(entries);
             return;
         }
 
         if (DateTime.UtcNow - stateEnteredAt > UnlockWaitTimeout)
             SkipCurrent(Loc.T("Nicht automatisch freigeschaltet (evtl. falscher Emote oder zu weit weg)", "Not unlocked automatically (maybe the wrong emote or too far away)"));
+    }
+
+    /// <summary>
+    /// Läuft (siehe UpdateWaitingForUnlock) noch ein letztes kurzes, enges Stück zu Fuß exakt auf
+    /// Plugin.SightseeingExactStandPositions, bevor es zurück zu WaitingForUnlock geht, das dann mit
+    /// der eigentlichen Freischaltungs-/Emote-Prüfung weitermacht (hasEnsuredExactPosition/
+    /// dismountedAt sind zu diesem Zeitpunkt bereits gesetzt). Gibt bei Steckenbleiben/Timeout/nie
+    /// gestartetem Laufweg trotzdem auf statt endlos zu warten - dann eben mit der normalen
+    /// Landeposition weiter, besser als hier hängen zu bleiben.
+    /// </summary>
+    private void UpdateEnsuringExactPosition()
+    {
+        if (currentTargetEntry == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (pathIsRunning.InvokeFunc())
+        {
+            hasSeenPathRunning = true;
+
+            var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[SightseeingAutomation] UpdateEnsuringExactPosition({currentTargetEntry.Name}): scheinbar steckengeblieben - weiter mit der bisherigen Position.");
+                StopPath();
+                state = State.WaitingForUnlock;
+                stateEnteredAt = DateTime.UtcNow;
+                return;
+            }
+
+            if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
+            {
+                StopPath();
+                state = State.WaitingForUnlock;
+                stateEnteredAt = DateTime.UtcNow;
+            }
+
+            return;
+        }
+
+        if (hasSeenPathRunning)
+        {
+            state = State.WaitingForUnlock;
+            stateEnteredAt = DateTime.UtcNow;
+            return;
+        }
+
+        // Noch nie sichtbar losgelaufen - z.B. weil der Charakter gerade erst nach dem Abmounten
+        // fällt/landet und vnavmesh den Laufweg deshalb zunächst ablehnt. Innerhalb der Anlaufzeit in
+        // kurzen Abständen erneut versuchen, statt sofort aufzugeben.
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
+        {
+            state = State.WaitingForUnlock;
+            stateEnteredAt = DateTime.UtcNow;
+            return;
+        }
+
+        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval && !Plugin.IsVnavPathfindInProgress())
+        {
+            lastPathRetryAt = DateTime.UtcNow;
+            pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ExactPositionTolerance);
+        }
+    }
+
+    /// <summary>
+    /// Nach Erledigen eines Punkts MIT von Hand hinterlegten Rückweg-Zwischenstopps (siehe Plugin.
+    /// SightseeingPostCompletionWaypoints, z.B. Summerford Farms) erst zu Fuß der Reihe nach dorthin,
+    /// statt direkt loszufliegen - der enge Anflugweg (Tür/Wand) muss zu Fuß auch wieder raus. Nur,
+    /// wenn danach überhaupt noch ein anderer, aktuell erreichbarer Sightseeing-Punkt übrig ist -
+    /// sonst (letzter Punkt der Zone) lohnt sich der Umweg nicht, die Automation stoppt ohnehin gleich.
+    /// </summary>
+    private void TryWalkOutOrFinish(IReadOnlyList<CollectibleEntry> entries)
+    {
+        if (currentTargetEntry != null
+            && Plugin.TryGetSightseeingPostCompletionWaypoints(currentTargetEntry.Id, out var waypoints)
+            && waypoints.Count > 0
+            && entries.Any(e => e.Id != currentTargetEntry.Id && !skippedIds.Contains(e.Id)))
+        {
+            pendingPostCompletionWaypoints = waypoints;
+            postCompletionWaypointIndex = 0;
+            BeginWalkOutLeg();
+            return;
+        }
+
+        FinishCurrent();
+    }
+
+    private void BeginWalkOutLeg()
+    {
+        if (pendingPostCompletionWaypoints == null)
+        {
+            FinishCurrent();
+            return;
+        }
+
+        currentTargetPosition = pendingPostCompletionWaypoints[postCompletionWaypointIndex];
+
+        state = State.WalkingOut;
+        stateEnteredAt = DateTime.UtcNow;
+        hasSeenPathRunning = false;
+        stuckDetector.Reset();
+        lastPathRetryAt = DateTime.MinValue;
+        StatusText = Loc.T(
+            $"Laufe zurück zum Ausgang: {currentTargetEntry?.Name}...",
+            $"Walking back to the exit: {currentTargetEntry?.Name}...");
+
+        // Erster Versuch direkt hier - weitere folgen ggf. über UpdateWalkingOut (siehe dort und
+        // PathRetryInterval-Kommentar). Nie fliegend, immer zu Fuß.
+        TryRequestWalkOutPath();
+    }
+
+    /// <summary>Immer zu Fuß (nie fliegend) - sicherheitshalber vor jedem Versuch abmounten.</summary>
+    private void TryRequestWalkOutPath()
+    {
+        lastPathRetryAt = DateTime.UtcNow;
+        Plugin.TryDismount();
+        pathfindAndMoveCloseTo.InvokeFunc(currentTargetPosition, false, ArrivalTolerance);
+    }
+
+    // Zwischen zwei erneuten Pathfind-Versuchen, falls der erste Aufruf noch keinen sichtbaren
+    // Laufweg ausgelöst hat (siehe UpdateWalkingOut/UpdateEnsuringExactPosition) - z.B. weil der
+    // Charakter gerade erst nach einem Abmounten fällt/landet und vnavmesh deshalb zunächst ablehnt.
+    private DateTime lastPathRetryAt = DateTime.MinValue;
+    private static readonly TimeSpan PathRetryInterval = TimeSpan.FromSeconds(1);
+
+    private void UpdateWalkingOut()
+    {
+        if (currentTargetEntry == null || pendingPostCompletionWaypoints == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (pathIsRunning.InvokeFunc())
+        {
+            hasSeenPathRunning = true;
+
+            var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
+            if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
+                Plugin.TryUseSprint();
+
+            if (stuckDetector.CheckStuck(playerPos))
+            {
+                Plugin.Log.Info($"[SightseeingAutomation] UpdateWalkingOut({currentTargetEntry.Name}): scheinbar steckengeblieben - Rückweg wird abgebrochen.");
+                StopPath();
+                FinishCurrent();
+                return;
+            }
+
+            if (DateTime.UtcNow - stateEnteredAt > StepMaxDuration)
+            {
+                StopPath();
+                FinishCurrent();
+            }
+
+            return;
+        }
+
+        if (hasSeenPathRunning)
+        {
+            // Wirklich angekommen - weiter zum nächsten Zwischenstopp, oder fertig.
+            postCompletionWaypointIndex++;
+            if (postCompletionWaypointIndex < pendingPostCompletionWaypoints.Count)
+            {
+                BeginWalkOutLeg();
+                return;
+            }
+
+            FinishCurrent();
+            return;
+        }
+
+        // Noch nie sichtbar losgelaufen - z.B. weil der Charakter nach dem Abmounten am vorherigen
+        // (erhöhten) Punkt gerade erst landet/fällt und vnavmesh den Laufweg deshalb zunächst
+        // ablehnt. Innerhalb der Anlaufzeit (PathStartGracePeriod) in kurzen Abständen erneut
+        // versuchen, statt sofort aufzugeben und (fälschlich) direkt zum nächsten Punkt weiterzuziehen.
+        if (Plugin.HasPathStartGraceElapsed(stateEnteredAt, PathStartGracePeriod))
+        {
+            FinishCurrent();
+            return;
+        }
+
+        if (DateTime.UtcNow - lastPathRetryAt > PathRetryInterval && !Plugin.IsVnavPathfindInProgress())
+            TryRequestWalkOutPath();
     }
 
     private void FinishCurrent()

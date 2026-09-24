@@ -19,11 +19,18 @@ public sealed class QuestAutomation
 {
     private enum State
     {
+        SummoningChocobo,
         Idle,
         WaitingForPickup,
         Running,
         TravelingHome,
     }
+
+    // Wie lange maximal auf das Beschwören + Setzen der Stance gewartet wird, bevor trotzdem mit der
+    // eigentlichen Automation begonnen wird (z.B. falls keine Gysahl Greens vorhanden sind) - siehe
+    // UpdateSummoningChocobo. Großzügig, da ggf. erst aus der Luft gelandet werden muss (siehe
+    // ChocoboCompanionSupport.TryRequestLanding).
+    private static readonly TimeSpan ChocoboSummonWaitTimeout = TimeSpan.FromSeconds(30);
 
     // Wie lange nach dem Start einer Quest gewartet wird, bis Questionable sie tatsächlich
     // übernimmt (IsRunning == true) - reagiert es nicht, gilt die Quest als nicht unterstützt.
@@ -66,12 +73,6 @@ public sealed class QuestAutomation
 
     private readonly ICallGateSubscriber<string, bool> startSingleQuest;
     private readonly ICallGateSubscriber<bool> isRunning;
-
-    // Nur für die proaktive Ausgrau-Prüfung im Overlay (siehe IsRotationSolverAvailable) - Quest-
-    // Automation steuert RotationSolver selbst NICHT an (anders als HuntingLogAutomation), aber
-    // während Questionable läuft können durchaus kampfpflichtige Quest-Schritte auftreten, die ohne
-    // eine laufende Kampf-Rotation ins Stocken geraten würden.
-    private readonly ICallGateSubscriber<bool> rsrAutorotationActive;
 
     // questId -> "gesperrt"? Prüft nur (ohne Nebenwirkung), ob Questionable eine Quest aktuell
     // bearbeiten könnte - für die proaktive Support-Markierung im Overlay direkt beim Betreten
@@ -141,7 +142,6 @@ public sealed class QuestAutomation
         startSingleQuest = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.StartSingleQuest");
         isRunning = Plugin.PluginInterface.GetIpcSubscriber<bool>("Questionable.IsRunning");
         isQuestLocked = Plugin.PluginInterface.GetIpcSubscriber<string, bool>("Questionable.IsQuestLocked");
-        rsrAutorotationActive = Plugin.PluginInterface.GetIpcSubscriber<bool>("RotationSolverReborn.AutorotationActive");
 
         lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
         lifestreamIsBusy = Plugin.PluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
@@ -186,23 +186,6 @@ public sealed class QuestAutomation
         try
         {
             return startSingleQuest.HasFunction && isRunning.HasFunction;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Prüft, ob RotationSolver Reborn aktuell installiert/geladen ist - siehe Feldkommentar an
-    /// rsrAutorotationActive, warum das auch für die Quest-Automation relevant ist, obwohl sie
-    /// selbst keine RotationSolver-IPC aufruft.
-    /// </summary>
-    public bool IsRotationSolverAvailable()
-    {
-        try
-        {
-            return rsrAutorotationActive.HasFunction;
         }
         catch
         {
@@ -264,7 +247,6 @@ public sealed class QuestAutomation
     public void Start(uint homeTerritoryId)
     {
         IsActive = true;
-        state = State.Idle;
         currentQuestId = null;
         this.homeTerritoryId = homeTerritoryId;
         travelHomeFinishedAt = null;
@@ -272,7 +254,22 @@ public sealed class QuestAutomation
         runningWentFalseAt = null;
         skippedQuestIds.Clear();
         attemptCounts.Clear();
-        StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        Plugin.ChocoboCompanionSupport.Reset();
+
+        // Erst den Chocobo-Begleiter beschwören/die Stance setzen (siehe UpdateSummoningChocobo),
+        // BEVOR überhaupt die erste Quest gestartet wird - nur, wenn das Feature aktiv und
+        // freigeschaltet ist, sonst direkt wie bisher.
+        if (Plugin.UseChocoboCompanion && Plugin.IsChocoboCompanionUnlocked())
+        {
+            state = State.SummoningChocobo;
+            stateEnteredAt = DateTime.UtcNow;
+            StatusText = Loc.T("Beschwöre Chocobo-Begleiter...", "Summoning Chocobo Companion...");
+        }
+        else
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
     }
 
     /// <summary>
@@ -339,6 +336,36 @@ public sealed class QuestAutomation
     }
 
     /// <summary>
+    /// Blockiert den eigentlichen Automation-Start, bis der Chocobo-Begleiter beschworen und die
+    /// gewünschte Stance gesetzt ist (Plugin.ChocoboCompanionSupport.Tick() übernimmt das eigentliche
+    /// Beschwören/Stance-Setzen, hier wird nur beobachtet, wann das erledigt ist) - gibt aber
+    /// spätestens nach ChocoboSummonWaitTimeout auf (z.B. falls keine Gysahl Greens vorhanden sind),
+    /// statt die Quest-Automation endlos zu blockieren.
+    /// </summary>
+    private void UpdateSummoningChocobo()
+    {
+        var settled = !Plugin.UseChocoboCompanion || !Plugin.IsChocoboCompanionUnlocked();
+        if (!settled)
+        {
+            // Erst fertig, wenn nicht (mehr) beschworen werden muss (auch bei weniger als 1 Minute
+            // Restzeit, siehe ChocoboCompanionSupport.NeedsSummon) UND die Stance steht.
+            settled = !ChocoboCompanionSupport.NeedsSummon
+                && (!Plugin.IsChocoboCompanionSummoned()
+                    || Plugin.ChocoboCompanionSupport.HasAppliedStanceForCurrentSummon
+                    || !Plugin.IsChocoboStanceUnlocked(Plugin.ChocoboStance)
+                    // Beritten wird die Stance erst beim nächsten Absteigen gesetzt (siehe ChocoboCompanionSupport.Tick) -
+                    // bereits beschworen reicht dann, statt den Start dafür zu blockieren.
+                    || Plugin.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.Mounted]);
+        }
+
+        if (settled || DateTime.UtcNow - stateEnteredAt > ChocoboSummonWaitTimeout)
+        {
+            state = State.Idle;
+            StatusText = Loc.T("Automation gestartet...", "Automation started...");
+        }
+    }
+
+    /// <summary>
     /// Muss jeden Frame (während das Overlay offen ist) mit den aktuell fehlenden Quests DER
     /// STARTZONE (siehe Start) und der aktuell aufgelösten Zone des Spielers aufgerufen werden.
     /// Startet nach und nach jede Quest per Questionable-IPC und wartet jeweils, bis Questionable
@@ -351,10 +378,16 @@ public sealed class QuestAutomation
         if (!IsActive)
             return;
 
+        Plugin.ChocoboCompanionSupport.Tick(allowDismount: state == State.SummoningChocobo);
+
         try
         {
             switch (state)
             {
+                case State.SummoningChocobo:
+                    UpdateSummoningChocobo();
+                    break;
+
                 case State.Idle:
                     // Split-Hauptstädte (Ul'dah etc.) zählen als EIN Zuhause, egal in welchem
                     // Bezirk man gerade steht (siehe Plugin.GetSplitCityTerritories) - konsistent

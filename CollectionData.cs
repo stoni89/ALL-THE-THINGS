@@ -62,6 +62,27 @@ public class CollectibleEntry
     // angegriffen werden soll).
     public uint? BNpcNameId { get; init; }
 
+    // Nur für Hunting-Log-Einträge einer noch NICHT erreichten Rang-Stufe (siehe
+    // Plugin.GetHuntingLogEntries) - die im Spiel angezeigte Rang-Gruppe (1-basiert, "RANK 2" usw.),
+    // die dafür erst erreicht werden muss. null = Eintrag gehört zur aktuell aktiven Stufe. Solche
+    // Einträge gelten als "Bedingung nicht erfüllt" (Kills zählen dort noch nicht).
+    public int? HuntingLogRequiredRank { get; init; }
+
+    // Händler-Voraussetzungen einzelner Einträge (Englische Anzeigenamen, exakt wie im Spiel, wie
+    // SpecialShop.Item[].Quest/AchievementUnlock) - live geprüft in
+    // Plugin.ComputeGrandCompanyOrTribeGateReason und solange nicht erfüllt als "Bedingung nicht
+    // erfüllt" markiert. Aus den Datendateien (JSON) oder zur Laufzeit gesetzt (siehe
+    // Plugin.EnrichFrameKitVendors). RequiredQuest hat Vorrang vor der währungsbasierten
+    // Voraussetzung (siehe Plugin.CurrencyRequiredQuest).
+    public string? RequiredQuest { get; set; }
+    public string? RequiredAchievement { get; set; }
+
+    // Name eines Events ohne auslesbaren Festival-Status (z.B. "Moogle Treasure Trove" - läuft wie die
+    // Cross-Game-Kollaborationen NICHT über GameMain.ActiveFestivals, per Log bestätigt), während dem
+    // dieser Eintrag erhältlich ist - geprüft über Plugin.KnownEventWindows und als Eventname im
+    // "Bedingung nicht erfüllt"-Tooltip genutzt (siehe Plugin.IsSeasonalEventEntryCurrentlyActive).
+    public string? EventName { get; init; }
+
     // Nur für Sightseeing-Log-Einträge - manche Aussichtspunkte (Lumina "Adventure".Emote) schalten
     // erst frei, wenn man am Zielort einen bestimmten Emote ausführt, nicht durch reine Nähe. Der
     // Chat-Befehl (z.B. "/sit") kommt direkt aus dem verlinkten Emote/TextCommand-Sheet.
@@ -200,6 +221,17 @@ public static class CollectionData
         entries.AddRange(Plugin.GetFrameKitEntries());
         entries.AddRange(Plugin.GetHairstyleEntries());
         entries.AddRange(Plugin.GetChocobokeepEntries());
+
+        // Itinerant Moogle (Moogle Treasure Trove): nur die aktuell unter "Newest"/"Previous"
+        // erhältlichen Waren, live aus den Spieldaten (siehe Plugin.GetItinerantMoogleEntries) - von
+        // Hand gepflegte Alt-Einträge dieses Händlers würden sonst veraltete Waren zeigen.
+        // Reihenfolge wichtig: ERST aus der vollständigen Liste aufbauen, DANN die Alt-Einträge
+        // entfernen - für manche Sammelobjekte (z.B. Mount "Uolon") ist der alte Itinerant-Moogle-
+        // Eintrag der einzige in den Datendateien; ohne ihn fände GetItinerantMoogleEntries kein
+        // passendes Sammelobjekt für das Freischalt-Item und die Ware fehlte (Nutzer-Report).
+        var itinerantMoogleEntries = Plugin.GetItinerantMoogleEntries(entries);
+        entries.RemoveAll(e => string.Equals(e.Vendor, "Itinerant Moogle", StringComparison.OrdinalIgnoreCase));
+        entries.AddRange(itinerantMoogleEntries);
 
         cachedEntries = entries;
         return entries;
