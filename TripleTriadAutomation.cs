@@ -250,6 +250,7 @@ public sealed class TripleTriadAutomation
         IsActive = true;
         state = State.Idle;
         finishedNpcIds.Clear();
+        learnAttempts.Clear();
         skippedNpcIds.Clear();
         currentNpcId = 0;
         ResetRoute();
@@ -354,6 +355,24 @@ public sealed class TripleTriadAutomation
 
     private void TryStartNext(IReadOnlyList<CollectibleEntry> missingNpcCardsInZone)
     {
+        // Karten, die schon im Inventar liegen (egal ob von dieser Automation geholt oder vorher),
+        // zuerst benutzen statt dafür zu spielen.
+        var cardsToLearn = missingNpcCardsInZone
+            .Where(card => !Plugin.Instance.IsOwned(card) && Plugin.Instance.GetCurrencyAmount(Plugin.GetUnlockItemId(card)) > 0
+                           && learnAttempts.GetValueOrDefault(Plugin.GetUnlockItemId(card)) < MaxLearnAttempts)
+            .GroupBy(card => Plugin.GetUnlockItemId(card))
+            .Select(g => g.First())
+            .ToList();
+        if (cardsToLearn.Count > 0)
+        {
+            Plugin.Log.Info($"[TripleTriadAutomation] Karten schon im Inventar - benutze sie: {string.Join(", ", cardsToLearn.Select(c => c.Name))}.");
+            currentNpcId = 0;
+            currentCards = cardsToLearn;
+            currentNpcName = cardsToLearn[0].Vendor;
+            BeginUsingCards();
+            return;
+        }
+
         var currentTerritory = Plugin.ClientState.TerritoryType;
         var byNpc = missingNpcCardsInZone
             .Where(e => e.EventNpcId != 0 && e.WorldPosition.HasValue && e.TerritoryTypeId == currentTerritory)
@@ -618,7 +637,17 @@ public sealed class TripleTriadAutomation
             return;
         }
 
+        // Alle Karten dieses Gegners liegen schon im Inventar (auch ohne diese Automation geholt) -
+        // gar nicht erst spielen, sondern direkt benutzen.
+        if (currentCards.All(IsCardObtained))
+        {
+            Plugin.Log.Info($"[TripleTriadAutomation] Alle Karten von {currentNpcName} bereits vorhanden - kein Spiel nötig.");
+            BeginUsingCards();
+            return;
+        }
+
         // Saucy im Modus "bis alle Karten gedroppt sind" starten - Gegner ist das gerade gesetzte Ziel.
+        saucyStopSent = false;
         Plugin.Log.Info($"[TripleTriadAutomation] Starte Saucy gegen {currentNpcName}.");
         SendCommand("/saucy tt cards all");
         SendCommand("/saucy tt go");
@@ -714,8 +743,19 @@ public sealed class TripleTriadAutomation
         var uiOpen = Plugin.IsTripleTriadUiOpen() || Plugin.Condition[ConditionFlag.OccupiedInEvent];
         if (obtained >= currentCards.Count)
         {
+            // Saucy zählt nur Drops dieser Sitzung, nicht das Inventar - daher sofort selbst stoppen,
+            // sobald alle Karten (egal woher) vorhanden sind, und eine angebotene Revanche ablehnen.
+            if (!saucyStopSent)
+            {
+                saucyStopSent = true;
+                Plugin.Log.Info($"[TripleTriadAutomation] Alle Karten von {currentNpcName} vorhanden - stoppe Saucy.");
+                SendCommand("/saucy tt stop");
+            }
+
             if (uiOpen)
             {
+                if (DateTime.UtcNow - lastRematchDeclineAt > TimeSpan.FromSeconds(1) && Plugin.TryDeclineSelectYesno())
+                    lastRematchDeclineAt = DateTime.UtcNow;
                 allCardsObtainedSince = null;
                 return;
             }
@@ -725,10 +765,7 @@ public sealed class TripleTriadAutomation
                 return;
 
             Plugin.Log.Info($"[TripleTriadAutomation] Alle Karten von {currentNpcName} erhalten - lerne sie.");
-            SendCommand("/saucy tt stop");
-            state = State.UsingCards;
-            stateEnteredAt = DateTime.UtcNow;
-            lastCardUseAt = DateTime.MinValue;
+            BeginUsingCards();
             return;
         }
 
@@ -757,6 +794,21 @@ public sealed class TripleTriadAutomation
         }
     }
 
+    private bool saucyStopSent;
+
+    // Benutzen einer Karte höchstens so oft versuchen (falls das Item sich nicht benutzen lässt, keine Endlosschleife).
+    private const int MaxLearnAttempts = 3;
+    private readonly Dictionary<uint, int> learnAttempts = new();
+    private DateTime lastRematchDeclineAt = DateTime.MinValue;
+
+    private void BeginUsingCards()
+    {
+        StopPath();
+        state = State.UsingCards;
+        stateEnteredAt = DateTime.UtcNow;
+        lastCardUseAt = DateTime.MinValue;
+    }
+
     private void UpdateUsingCards()
     {
         StatusText = Loc.T($"Lerne Karten von {currentNpcName}...", $"Learning cards from {currentNpcName}...");
@@ -768,10 +820,12 @@ public sealed class TripleTriadAutomation
             return;
 
         // Nächste gewonnene, noch nicht gelernte Karte benutzen.
-        var toLearn = currentCards.FirstOrDefault(c => !Plugin.Instance.IsOwned(c) && Plugin.Instance.GetCurrencyAmount(Plugin.GetUnlockItemId(c)) > 0);
+        var toLearn = currentCards.FirstOrDefault(c => !Plugin.Instance.IsOwned(c) && Plugin.Instance.GetCurrencyAmount(Plugin.GetUnlockItemId(c)) > 0
+                                                      && learnAttempts.GetValueOrDefault(Plugin.GetUnlockItemId(c)) < MaxLearnAttempts);
         if (toLearn != null)
         {
             lastCardUseAt = DateTime.UtcNow;
+            learnAttempts[Plugin.GetUnlockItemId(toLearn)] = learnAttempts.GetValueOrDefault(Plugin.GetUnlockItemId(toLearn)) + 1;
             var used = Plugin.TryUseInventoryItem(Plugin.GetUnlockItemId(toLearn));
             Plugin.Log.Info($"[TripleTriadAutomation] Lerne Karte {toLearn.Name}: {(used ? "benutzt" : "nicht gefunden")}.");
             return;

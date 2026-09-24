@@ -5553,6 +5553,18 @@ public sealed class Plugin : IDalamudPlugin
     /// Bestätigt ein offenes Ja/Nein-Fenster (SelectYesno) mit "Ja" - z.B. beim Crystal Gate der
     /// "Eight Sentinels" (siehe NoFlyAreaExit). true, wenn geklickt wurde.
     /// </summary>
+    /// <summary>Lehnt ein offenes Ja/Nein-Fenster ab (z.B. Triple-Triad-Revanche) - true, wenn eins offen war.</summary>
+    public static unsafe bool TryDeclineSelectYesno()
+    {
+        var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
+        if (addon == null || !addon->IsVisible)
+            return false;
+
+        addon->FireCallbackInt(1); // 1 = "Nein"/"No"
+        Log.Info("[TripleTriadAutomation] SelectYesno mit \"Nein\" abgelehnt.");
+        return true;
+    }
+
     public static unsafe bool TryConfirmSelectYesno()
     {
         var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
