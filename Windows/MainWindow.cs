@@ -96,7 +96,7 @@ public class MainWindow : Window
     private readonly (FontAwesomeIcon Icon, string Label, Action Draw)[] navItems;
 
     private const ImGuiWindowFlags BaseFlags =
-        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse;
+        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoResize;
 
     public MainWindow(Plugin plugin) : base(
         $"The Explorer's Codex (v{VersionText})##TheExplorersCodex",
@@ -119,6 +119,15 @@ public class MainWindow : Window
     }
 
     public void Dispose() { }
+
+    // Bei jedem Öffnen in voller Breite und Höhe (siehe PreDraw) - statt der zuletzt gezogenen Größe.
+    private bool openAtFullSize = true;
+
+    public override void OnOpen()
+    {
+        openAtFullSize = true;
+        collapsed = false;
+    }
 
     /// <summary>
     /// Verhindert, dass das Optionsfenster schon am Titelbildschirm (vor dem Einloggen) oder
@@ -144,14 +153,21 @@ public class MainWindow : Window
     {
         SizeConstraints = collapsed ? CollapsedSizeConstraints : ExpandedSizeConstraints;
 
-        // Eingeklappt bewusst NoResize: Bei einer so knappen Fensterhöhe (siehe CollapsedHeight)
-        // überlappt ImGuis eigene Rahmen-Zieh-Trefferzone (für Größenänderung per Maus) praktisch
-        // das GESAMTE Fenster - jeder Klick (auch der Doppelklick zum Wieder-Ausklappen) wurde dann
-        // von dieser Ziehzone abgefangen, statt unser InvisibleButton in DrawCustomHeader zu
-        // erreichen (beobachtet: Einklappen per Doppelklick ging noch, aber nicht mehr zurück).
-        Flags = collapsed ? BaseFlags | ImGuiWindowFlags.NoResize : BaseFlags;
+        // Größe ist fest (NoResize in BaseFlags, siehe OnOpen/openAtFullSize) - weder ein- noch
+        // ausgeklappt per Maus veränderbar.
+        Flags = BaseFlags;
 
-        if (!collapsed && collapsedLastFrame)
+        if (openAtFullSize && !collapsed)
+        {
+            // Maximalgröße, aber nie größer als der sichtbare Bildschirmbereich.
+            openAtFullSize = false;
+            var workSize = ImGui.GetMainViewport().WorkSize;
+            var max = ExpandedSizeConstraints.MaximumSize;
+            expandedSize = new Vector2(MathF.Min(max.X, workSize.X), MathF.Min(max.Y, workSize.Y));
+            Size = expandedSize;
+            SizeCondition = ImGuiCond.Always;
+        }
+        else if (!collapsed && collapsedLastFrame)
         {
             Size = expandedSize;
             SizeCondition = ImGuiCond.Always;
@@ -441,12 +457,9 @@ public class MainWindow : Window
 
                 ImGui.SameLine();
 
-                // NoScrollbar: Die Mindestfenstergröße (siehe ExpandedSizeConstraints) ist bewusst so
-                // hoch gewählt, dass jeder Tab-Inhalt hineinpasst - eine Scrollbar soll also gar nicht
-                // erst nötig sein/erscheinen. Ohne NoScrollbar würde ImGui bei einer versehentlichen
-                // Ein-Pixel-Überlänge sonst wieder eine Scrollbar samt der bekannten Pfeil-Kollision
-                // rechts einblenden (siehe Anzeige-Tab).
-                ImGui.BeginChild("##OptionsContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                // Mit Scrollbar: erscheint nur, wenn der Inhalt (z.B. lange Blacklist) nach unten
+                // über den sichtbaren Bereich hinausgeht.
+                ImGui.BeginChild("##OptionsContent", new Vector2(-ContentRightMargin, 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
@@ -455,7 +468,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Blacklist)
             {
-                ImGui.BeginChild("##BlacklistContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##BlacklistContent", new Vector2(-ContentRightMargin, 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawBlacklistPage();
@@ -464,7 +477,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Statistics)
             {
-                ImGui.BeginChild("##StatisticsContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##StatisticsContent", new Vector2(-ContentRightMargin, 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawStatisticsPage();
@@ -473,7 +486,7 @@ public class MainWindow : Window
             }
             else if (railPage == RailPage.Dependencies)
             {
-                ImGui.BeginChild("##DependenciesContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##DependenciesContent", new Vector2(-ContentRightMargin, 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawDependenciesPage();
@@ -482,7 +495,7 @@ public class MainWindow : Window
             }
             else
             {
-                ImGui.BeginChild("##AboutContent", new Vector2(-ContentRightMargin, 0f), false, ImGuiWindowFlags.NoScrollbar);
+                ImGui.BeginChild("##AboutContent", new Vector2(-ContentRightMargin, 0f), false);
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 DrawAboutPage();

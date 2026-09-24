@@ -26,6 +26,7 @@ public sealed class SightseeingAutomation
         WaitingForUnlock,
         EnsuringExactPosition,
         WalkingOut,
+        JumpingPuzzle,
     }
 
     private static readonly TimeSpan MountWaitTimeout = TimeSpan.FromSeconds(6);
@@ -65,7 +66,6 @@ public sealed class SightseeingAutomation
     private const float SmallAetheryteArrivalTolerance = 3.5f;
     private const float BigAetheryteArrivalTolerance = 6f;
 
-    private const float SprintDisableDistance = 8f;
     private static readonly TimeSpan StepMaxDuration = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan PathStartGracePeriod = TimeSpan.FromSeconds(5);
 
@@ -107,6 +107,9 @@ public sealed class SightseeingAutomation
     private readonly ICallGateSubscriber<object> pathStop;
     private readonly ICallGateSubscriber<bool> navmeshIsReady;
     private readonly ICallGateSubscriber<Vector3?> queryFlagToPoint;
+    private readonly ICallGateSubscriber<List<Vector3>, bool, object> moveToPath; // gerade Linie ohne Wegsuche (Jumping Puzzles)
+    private readonly ICallGateSubscriber<float> pathGetTolerance;
+    private readonly ICallGateSubscriber<float, object> pathSetTolerance;
 
     private readonly ICallGateSubscriber<uint, byte, bool> lifestreamTeleport;
     private readonly ICallGateSubscriber<uint, bool> lifestreamAethernetTeleportById;
@@ -166,6 +169,9 @@ public sealed class SightseeingAutomation
         pathStop = Plugin.PluginInterface.GetIpcSubscriber<object>("vnavmesh.Path.Stop");
         navmeshIsReady = Plugin.PluginInterface.GetIpcSubscriber<bool>("vnavmesh.Nav.IsReady");
         queryFlagToPoint = Plugin.PluginInterface.GetIpcSubscriber<Vector3?>("vnavmesh.Query.Mesh.FlagToPoint");
+        moveToPath = Plugin.PluginInterface.GetIpcSubscriber<List<Vector3>, bool, object>("vnavmesh.Path.MoveTo");
+        pathGetTolerance = Plugin.PluginInterface.GetIpcSubscriber<float>("vnavmesh.Path.GetTolerance");
+        pathSetTolerance = Plugin.PluginInterface.GetIpcSubscriber<float, object>("vnavmesh.Path.SetTolerance");
 
         lifestreamTeleport = Plugin.PluginInterface.GetIpcSubscriber<uint, byte, bool>("Lifestream.Teleport");
         lifestreamAethernetTeleportById = Plugin.PluginInterface.GetIpcSubscriber<uint, bool>("Lifestream.AethernetTeleportById");
@@ -239,6 +245,7 @@ public sealed class SightseeingAutomation
         state = State.Idle;
         currentTargetEntry = null;
         StopPath();
+        RestorePathTolerance();
 
         // Zusätzlich zum IPC-Stop (StopPath) noch den echten Chat-Befehl absetzen - manuell
         // angefordert, offenbar bricht das den laufenden vnavmesh-Pfad zuverlässiger komplett ab.
@@ -306,11 +313,16 @@ public sealed class SightseeingAutomation
                 case State.WalkingOut:
                     UpdateWalkingOut();
                     break;
+
+                case State.JumpingPuzzle:
+                    UpdateJumpingPuzzle(sightseeingInZone);
+                    break;
             }
         }
         catch (Exception ex)
         {
             // Nicht mehr stoppen (AFK-Modus) - aktuellen Punkt aufgeben, kurz pausieren, dann weiter.
+            RestorePathTolerance();
             Plugin.Log.Error(ex, "Fehler bei der Sightseeing-Automation - pausiere kurz und mache dann weiter.");
             StatusText = Loc.T("Fehler bei vnavmesh - neuer Versuch in Kürze...", "Error talking to vnavmesh - retrying shortly...");
             StopPath();
@@ -322,9 +334,10 @@ public sealed class SightseeingAutomation
 
     // Siehe Update - Pause nach einem Fehler, und wann übersprungene Punkte erneut versucht werden.
     private static readonly TimeSpan ErrorPauseDuration = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan SkippedRetryDelay = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan SkippedRetryDelay = TimeSpan.FromSeconds(15);
     private DateTime pausedUntil = DateTime.MinValue;
     private DateTime? retrySkippedAt;
+    private string lastSkipReason = string.Empty;
 
     private static bool StillNeeded(IReadOnlyList<CollectibleEntry> entries, uint id) => entries.Any(e => e.Id == id);
 
@@ -361,6 +374,19 @@ public sealed class SightseeingAutomation
                 }
             }
 
+            // Gerade aktive (nur übersprungene) Punkte haben Vorrang vor dem Warten auf Wetter/Uhrzeit -
+            // dann das anzeigen, nicht einen erst in einer Stunde verfügbaren Punkt.
+            if (available.Count > 0)
+            {
+                var retryIn = retrySkippedAt.HasValue ? Math.Max(0, (int)(retrySkippedAt.Value - DateTime.UtcNow).TotalSeconds) : 0;
+                var names = string.Join(", ", available.Select(e => e.Name));
+                var reason = string.IsNullOrEmpty(lastSkipReason) ? string.Empty : $" ({lastSkipReason})";
+                StatusText = Loc.T(
+                    $"Aktiv, aber übersprungen{reason}: {names} - neuer Versuch in {retryIn}s...",
+                    $"Active but skipped{reason}: {names} - retrying in {retryIn}s...");
+                return;
+            }
+
             // Leerlauf: auf den Punkt warten, der als nächstes (Wetter/Uhrzeit) verfügbar wird.
             var soonest = pending
                 .OrderBy(e => Plugin.GetSightseeingAvailableIn(e) ?? TimeSpan.MaxValue)
@@ -385,6 +411,14 @@ public sealed class SightseeingAutomation
 
         retrySkippedAt = null;
 
+        // Solange vnavmesh das Navmesh noch lädt (Start, nach Zonen-/Bezirkswechsel), NICHT als
+        // Versuch zählen - sonst war ein Punkt schon nach zwei Frames "zu oft versucht".
+        if (!navmeshIsReady.InvokeFunc())
+        {
+            StatusText = Loc.T("Warte auf vnavmesh-Navmesh für diese Zone...", "Waiting for vnavmesh's navmesh for this zone...");
+            return;
+        }
+
         var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
         var next = candidates.OrderBy(e => Vector3.Distance(playerPos, e.WorldPosition!.Value)).First();
         StartMovingTo(next);
@@ -397,6 +431,7 @@ public sealed class SightseeingAutomation
         if (attempts > MaxAttemptsPerTarget)
         {
             skippedIds.Add(entry.Id);
+            lastSkipReason = Loc.T("zu oft versucht", "too many attempts");
             StatusText = Loc.T($"Übersprungen (zu oft versucht): {entry.Name}", $"Skipped (too many attempts): {entry.Name}");
             state = State.Idle;
             return;
@@ -415,6 +450,9 @@ public sealed class SightseeingAutomation
         lastPathRetryAt = DateTime.MinValue;
         hasEnsuredExactPosition = false;
         currentLegAllowsFlying = true;
+        currentPuzzle = Plugin.TryGetSightseeingJumpingPuzzle(entry.Id, out var puzzle) ? puzzle : null;
+        puzzleAttempts = 0;
+        puzzleStepRetries = 0;
 
         // Sightseeing-Punkte einer geteilten Hauptstadt können in einem ANDEREN Bezirk liegen als
         // dem, in dem man gerade steht (siehe siblingTerritories-Filter in CompactOverlayWindow, z.B.
@@ -440,6 +478,10 @@ public sealed class SightseeingAutomation
     {
         if (!navmeshIsReady.InvokeFunc())
         {
+            // Nicht als Versuch zählen (siehe TryStartNext) - im nächsten Frame neu auswählen.
+            attemptCounts[entry.Id] = Math.Max(0, attemptCounts.GetValueOrDefault(entry.Id, 1) - 1);
+            currentTargetEntry = null;
+            state = State.Idle;
             StatusText = Loc.T("Warte auf vnavmesh-Navmesh für diese Zone...", "Waiting for vnavmesh's navmesh for this zone...");
             return;
         }
@@ -450,7 +492,13 @@ public sealed class SightseeingAutomation
         // Tür) einen bestimmten Anflugweg braucht. Läuft sie der Reihe nach ab (siehe UpdateMoving),
         // der eigentliche letzte, enge Schritt zur echten Position passiert unverändert danach über
         // BeginFinalApproach.
-        if (Plugin.TryGetSightseeingApproachWaypoints(entry.Id, out var waypoints))
+        if (currentPuzzle != null)
+        {
+            // Jumping Puzzle: erst normal (auch beritten/fliegend) in die Nähe des Startpunkts, der
+            // Rest läuft über UpdateJumpingPuzzle.
+            currentTargetPosition = currentPuzzle.Start;
+        }
+        else if (Plugin.TryGetSightseeingApproachWaypoints(entry.Id, out var waypoints))
         {
             pendingApproachWaypoints = waypoints;
             pendingApproachWaypointIndex = 0;
@@ -468,6 +516,7 @@ public sealed class SightseeingAutomation
             if (floorPoint == null)
             {
                 skippedIds.Add(entry.Id);
+                lastSkipReason = Loc.T("nicht erreichbar", "not reachable");
                 StatusText = Loc.T($"Übersprungen (nicht erreichbar): {entry.Name}", $"Skipped (not reachable): {entry.Name}");
                 currentTargetEntry = null;
                 state = State.Idle;
@@ -559,8 +608,6 @@ public sealed class SightseeingAutomation
             hasSeenPathRunning = true;
 
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
-            if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
-                Plugin.TryUseSprint();
 
             Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
 
@@ -601,6 +648,7 @@ public sealed class SightseeingAutomation
         if (!IsLifestreamAvailable())
         {
             skippedIds.Add(entry.Id);
+            lastSkipReason = Loc.T("Lifestream nicht gefunden", "Lifestream not found");
             StatusText = Loc.T(
                 $"Übersprungen (Lifestream nicht gefunden): {entry.Name}",
                 $"Skipped (Lifestream not found): {entry.Name}");
@@ -626,6 +674,7 @@ public sealed class SightseeingAutomation
         if (!accepted)
         {
             skippedIds.Add(entry.Id);
+            lastSkipReason = Loc.T("Bezirk nicht erreichbar", "district not reachable");
             StatusText = Loc.T(
                 $"Übersprungen (Bezirk nicht erreichbar): {entry.Name}",
                 $"Skipped (district not reachable): {entry.Name}");
@@ -664,7 +713,9 @@ public sealed class SightseeingAutomation
             // Zurück auf Idle statt direkt weiterzumachen - TryStartNext wählt dort frisch den
             // nächstgelegenen Punkt (meist, aber nicht zwingend, genau dieser hier), passend zur
             // inzwischen tatsächlichen neuen Position.
+            // Der Bezirkswechsel selbst zählt nicht als Versuch für den Punkt.
             districtTravelFinishedAt = null;
+            attemptCounts[currentTargetEntry.Id] = Math.Max(0, attemptCounts.GetValueOrDefault(currentTargetEntry.Id, 1) - 1);
             state = State.Idle;
             return;
         }
@@ -787,8 +838,6 @@ public sealed class SightseeingAutomation
             hasSeenPathRunning = true;
 
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
-            if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
-                Plugin.TryUseSprint();
 
             // Falls unterwegs durch Schwimmen zwangsweise abgestiegen wurde - sobald wieder Land
             // erreicht ist, erneut aufsitzen.
@@ -819,6 +868,12 @@ public sealed class SightseeingAutomation
 
         if (hasSeenPathRunning)
         {
+            if (currentPuzzle != null)
+            {
+                BeginJumpingPuzzle();
+                return;
+            }
+
             // Weiterer von Hand hinterlegter Zwischenstopp übrig (siehe Plugin.
             // SightseeingApproachWaypoints)? Dann erst dorthin, bevor der finale enge Schritt
             // (BeginFinalApproach) überhaupt versucht wird.
@@ -1162,8 +1217,6 @@ public sealed class SightseeingAutomation
             hasSeenPathRunning = true;
 
             var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? currentTargetPosition;
-            if (Vector3.Distance(playerPos, currentTargetPosition) > SprintDisableDistance)
-                Plugin.TryUseSprint();
 
             if (stuckDetector.CheckStuck(playerPos))
             {
@@ -1212,6 +1265,7 @@ public sealed class SightseeingAutomation
 
     private void FinishCurrent()
     {
+        RestorePathTolerance();
         Plugin.Log.Info($"[SightseeingAutomation] FinishCurrent({currentTargetEntry?.Name}): freigeschaltet.");
         StatusText = Loc.T($"Erledigt: {currentTargetEntry?.Name}", $"Done: {currentTargetEntry?.Name}");
         attemptCounts.Remove(currentTargetEntry!.Id);
@@ -1228,10 +1282,12 @@ public sealed class SightseeingAutomation
 
     private void SkipCurrent(string reason)
     {
+        RestorePathTolerance();
         Plugin.Log.Info($"[SightseeingAutomation] SkipCurrent({currentTargetEntry?.Name}): {reason}");
         if (currentTargetEntry != null)
         {
             skippedIds.Add(currentTargetEntry.Id);
+            lastSkipReason = reason;
             StatusText = $"{Loc.T("Übersprungen", "Skipped")} ({reason}): {currentTargetEntry.Name}";
         }
 
@@ -1239,4 +1295,554 @@ public sealed class SightseeingAutomation
         currentTargetEntry = null;
         state = State.Idle;
     }
+
+    // ---- Jumping Puzzles (siehe Plugin.SightseeingJumpingPuzzles) ----
+
+    private enum PuzzlePhase
+    {
+        Dismounting,
+        GoingToStart,
+        StepSettling,
+        StepMoving,
+        EvaluatingFailure,
+        ReturningToStepStart,
+        FinalPrecisePosition,
+        FlyingToStart,
+    }
+
+    private const float PuzzleFlyToStartTolerance = 0.1f;
+
+    // Letzter Puzzle-Punkt (= Sightseeing-Kugel): mit dieser vnavmesh-Wegpunkt-Toleranz genau draufstellen.
+    private const float PuzzleFinalPreciseTolerance = 0.05f;
+    private static readonly TimeSpan PuzzleFinalPreciseTimeout = TimeSpan.FromSeconds(4);
+    private float? savedPathTolerance;
+
+    private void BeginFinalPrecisePosition(Vector3 target)
+    {
+        try
+        {
+            savedPathTolerance ??= pathGetTolerance.InvokeFunc();
+            pathSetTolerance.InvokeAction(PuzzleFinalPreciseTolerance);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning(ex, "[SightseeingAutomation] vnavmesh-Toleranz konnte nicht gesetzt werden.");
+        }
+
+        moveToPath.InvokeAction(new List<Vector3> { target }, false);
+        SetPuzzlePhase(PuzzlePhase.FinalPrecisePosition);
+        StatusText = Loc.T(
+            $"Jumping Puzzle: stelle mich genau auf den Punkt: {currentTargetEntry?.Name}...",
+            $"Jumping puzzle: stepping precisely onto the point: {currentTargetEntry?.Name}...");
+    }
+
+    // Für Puzzle-Schritte mit Exact: enge vnavmesh-Wegpunkt-Toleranz, sonst wieder die ursprüngliche.
+    private void SetExactPathTolerance(bool exact)
+    {
+        if (!exact)
+        {
+            RestorePathTolerance();
+            return;
+        }
+
+        try
+        {
+            savedPathTolerance ??= pathGetTolerance.InvokeFunc();
+            pathSetTolerance.InvokeAction(PuzzleFinalPreciseTolerance);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning(ex, "[SightseeingAutomation] vnavmesh-Toleranz konnte nicht gesetzt werden.");
+        }
+    }
+
+    private void RestorePathTolerance()
+    {
+        if (savedPathTolerance is not { } tolerance)
+            return;
+
+        savedPathTolerance = null;
+        try
+        {
+            pathSetTolerance.InvokeAction(tolerance);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Warning(ex, "[SightseeingAutomation] vnavmesh-Toleranz konnte nicht zurückgesetzt werden.");
+        }
+    }
+
+    private const int MaxPuzzleAttempts = 10;
+
+    // Misslungener Sprung, aber noch oben am Absprungpunkt (z.B. Apkallu Falls Punkt 2 -> 3, klappt
+    // nicht immer): denselben Schritt so oft wiederholen, bis er klappt - nur nach einem Absturz
+    // zurück zum Startpunkt.
+    private const int MaxPuzzleStepRetries = 50;
+    private const float PuzzleStepRetryHeightMargin = 0.5f;
+    private const float PuzzleStepRetryRadius = 3f;
+    private const float PuzzleStartTolerance = 0.3f;
+    private const float PuzzleStartExactTolerance = 0.1f;
+    private const float PuzzlePointTolerance = 1.0f;
+    private const float PuzzleFallMargin = 1.5f;
+    private static readonly TimeSpan PuzzleStepSettleDuration = TimeSpan.FromSeconds(0.4);
+    private static readonly TimeSpan PuzzleJumpDelay = TimeSpan.FromSeconds(0.1);
+    private static readonly TimeSpan PuzzleStepTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan PuzzleGoToStartTimeout = TimeSpan.FromSeconds(60);
+
+    private Plugin.SightseeingJumpingPuzzle? currentPuzzle;
+    private PuzzlePhase puzzlePhase;
+    private int puzzleStepIndex;
+    private int puzzleAttempts;
+    private DateTime puzzlePhaseStartedAt;
+    private DateTime lastPuzzleDismountAttempt = DateTime.MinValue;
+    private bool puzzleJumpSent;
+    private bool puzzleGoToStartRequested;
+    private float puzzleStepFromY;
+    private int puzzleStepRetries;
+    private bool puzzleRunUpPending;
+    private float puzzleReturnFloorY;
+    private bool puzzleSprintUsed;
+
+    // Festlaufen innerhalb eines Schritts (siehe StepMoving): weniger als diese Strecke in dieser Zeit.
+    private const float PuzzleProgressMinDistance = 0.15f;
+    private static readonly TimeSpan PuzzleStuckDuration = TimeSpan.FromSeconds(0.6);
+    private Vector3 puzzleProgressPos;
+    private DateTime puzzleProgressAt;
+
+    // Sprung mit Anlauf (SightseeingPuzzleStep.RunUp): so nah (waagerecht) am Absprungpunkt wird
+    // abgesprungen, ohne anzuhalten.
+    private const float PuzzleRunUpJumpDistance = 0.2f;
+
+    private void BeginJumpingPuzzle()
+    {
+        StopPath();
+        state = State.JumpingPuzzle;
+        stateEnteredAt = DateTime.UtcNow;
+
+        // Startpunkt in der Luft: erst beritten genau hinfliegen, dort absteigen.
+        if (currentPuzzle?.DismountAtStart == true && Plugin.Condition[ConditionFlag.Mounted])
+        {
+            SetExactPathTolerance(true);
+            var accepted = Plugin.CanFly && pathfindAndMoveCloseTo.InvokeFunc(currentPuzzle.Start, true, PuzzleFlyToStartTolerance);
+            if (!accepted)
+                moveToPath.InvokeAction(new List<Vector3> { currentPuzzle.Start }, true);
+            SetPuzzlePhase(PuzzlePhase.FlyingToStart);
+            StatusText = Loc.T($"Fliege genau zum Startpunkt: {currentTargetEntry?.Name}...", $"Flying precisely to the start point: {currentTargetEntry?.Name}...");
+            return;
+        }
+
+        SetPuzzlePhase(PuzzlePhase.Dismounting);
+        StatusText = Loc.T($"Jumping Puzzle: {currentTargetEntry?.Name}...", $"Jumping puzzle: {currentTargetEntry?.Name}...");
+    }
+
+    private void SetPuzzlePhase(PuzzlePhase phase)
+    {
+        puzzlePhase = phase;
+        puzzlePhaseStartedAt = DateTime.UtcNow;
+        puzzleJumpSent = false;
+        puzzleGoToStartRequested = false;
+        puzzleRunUpPending = false;
+        puzzleProgressPos = Plugin.ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
+        puzzleProgressAt = DateTime.UtcNow;
+    }
+
+    private void UpdateJumpingPuzzle(IReadOnlyList<CollectibleEntry> entries)
+    {
+        if (currentTargetEntry == null || currentPuzzle == null)
+        {
+            state = State.Idle;
+            return;
+        }
+
+        if (!StillNeeded(entries, currentTargetEntry.Id))
+        {
+            FinishCurrent();
+            return;
+        }
+
+        var player = Plugin.ObjectTable.LocalPlayer;
+        if (player == null)
+            return;
+
+        var playerPos = player.Position;
+        var sinceStart = DateTime.UtcNow - puzzlePhaseStartedAt;
+
+        switch (puzzlePhase)
+        {
+            case PuzzlePhase.Dismounting:
+                // Gesprungen wird zu Fuß.
+                if (Plugin.Condition[ConditionFlag.Mounted])
+                {
+                    if (DateTime.UtcNow - lastPuzzleDismountAttempt > TimeSpan.FromSeconds(1))
+                    {
+                        lastPuzzleDismountAttempt = DateTime.UtcNow;
+                        Plugin.TryDismount();
+                    }
+
+                    puzzlePhaseStartedAt = DateTime.UtcNow;
+                    return;
+                }
+
+                if (sinceStart < DismountSettleDelay || Plugin.Condition[ConditionFlag.Jumping])
+                    return;
+
+                // Startpunkt in der Luft (DismountAtStart): die Landestelle darunter ist der Start.
+                if (currentPuzzle.DismountAtStart)
+                {
+                    BeginPuzzleStep(0);
+                    return;
+                }
+
+                SetPuzzlePhase(PuzzlePhase.GoingToStart);
+                return;
+
+            case PuzzlePhase.FlyingToStart:
+                if (Plugin.IsVnavPathfindInProgress() || pathIsRunning.InvokeFunc() || sinceStart < TimeSpan.FromSeconds(0.5))
+                {
+                    if (sinceStart < PuzzleGoToStartTimeout)
+                        return;
+                    StopPath();
+                }
+
+                // Genau über dem Startpunkt - jetzt absteigen (senkrecht nach unten).
+                RestorePathTolerance();
+                SetPuzzlePhase(PuzzlePhase.Dismounting);
+                return;
+
+            case PuzzlePhase.GoingToStart:
+            {
+                var start = currentPuzzle.Start;
+                if (!puzzleGoToStartRequested)
+                {
+                    puzzleGoToStartRequested = true;
+                    if (IsAtPuzzlePoint(playerPos, start)
+                        && Vector2.Distance(new Vector2(playerPos.X, playerPos.Z), new Vector2(start.X, start.Z)) <= PuzzleStartExactTolerance)
+                    {
+                        BeginPuzzleStep(0);
+                        return;
+                    }
+
+                    // Normale Wegsuche (z.B. vom Boden unterhalb nach einem Absturz), genau auf den Startpunkt.
+                    if (!pathfindAndMoveCloseTo.InvokeFunc(start, false, PuzzleStartTolerance))
+                        moveToPath.InvokeAction(new List<Vector3> { start }, false);
+
+                    StatusText = Loc.T(
+                        $"Jumping Puzzle: laufe zum Startpunkt ({puzzleAttempts + 1}. Versuch)...",
+                        $"Jumping puzzle: walking to the start point (attempt {puzzleAttempts + 1})...");
+                    return;
+                }
+
+                if (sinceStart > PuzzleGoToStartTimeout)
+                {
+                    SkipCurrent(Loc.T("Startpunkt des Jumping Puzzles nicht erreichbar", "Jumping puzzle start point not reachable"));
+                    return;
+                }
+
+                if (Plugin.IsVnavPathfindInProgress() || pathIsRunning.InvokeFunc() || sinceStart < TimeSpan.FromSeconds(0.5))
+                    return;
+
+                // Startpunkt ohne Abweichung - sonst das letzte Stück in gerader Linie mit enger
+                // Toleranz nachlaufen.
+                if (IsAtPuzzlePoint(playerPos, start)
+                    && Vector2.Distance(new Vector2(playerPos.X, playerPos.Z), new Vector2(start.X, start.Z)) <= PuzzleStartExactTolerance)
+                {
+                    BeginPuzzleStep(0);
+                    return;
+                }
+
+                SetExactPathTolerance(true);
+                moveToPath.InvokeAction(new List<Vector3> { start }, false);
+                return;
+            }
+
+            case PuzzlePhase.StepSettling:
+            {
+                // Kurz stillstehen, damit jeder Sprung aus dem Stand mit gleichem Anlauf beginnt.
+                if (sinceStart < PuzzleStepSettleDuration || Plugin.Condition[ConditionFlag.Jumping])
+                    return;
+
+                var step = currentPuzzle.Steps[puzzleStepIndex];
+
+                // Noch aktiven Sprint entfernen (CancelSprintBefore) - warten, bis er wirklich weg ist.
+                if (step.CancelSprintBefore && !Plugin.TryCancelSprint())
+                {
+                    StatusText = Loc.T("Jumping Puzzle: entferne Sprint...", "Jumping puzzle: removing Sprint...");
+                    puzzlePhaseStartedAt = DateTime.UtcNow;
+                    return;
+                }
+
+                // Sprint auf Anweisung (SprintBefore) - bei Abklingzeit hier am Absprungpunkt warten.
+                if (step.SprintBefore && !puzzleSprintUsed)
+                {
+                    if (!Plugin.TryUseSprintNow())
+                    {
+                        StatusText = Loc.T("Jumping Puzzle: warte auf Sprint...", "Jumping puzzle: waiting for Sprint...");
+                        return;
+                    }
+
+                    puzzleSprintUsed = true;
+                    puzzlePhaseStartedAt = DateTime.UtcNow; // kurz stehen lassen, bis Sprint wirkt
+                    return;
+                }
+
+                puzzleStepFromY = playerPos.Y;
+
+                // Folgt ein Sprung mit Anlauf: durchgehend über diesen Punkt hinaus zum Sprungziel
+                // laufen, abgesprungen wird beim Überqueren (siehe StepMoving).
+                // Auch über mehrere Punkte hintereinander (Kette aus RunUp-Schritten).
+                var hasRunUpNext = puzzleStepIndex + 1 < currentPuzzle.Steps.Length && currentPuzzle.Steps[puzzleStepIndex + 1].RunUp;
+                var path = new List<Vector3> { step.Target };
+                var anyExact = step.Exact;
+                for (var i = puzzleStepIndex + 1; i < currentPuzzle.Steps.Length && currentPuzzle.Steps[i].RunUp; i++)
+                {
+                    path.Add(currentPuzzle.Steps[i].Target);
+                    anyExact |= currentPuzzle.Steps[i].Exact;
+                }
+
+                SetExactPathTolerance(anyExact);
+                moveToPath.InvokeAction(path, false);
+                SetPuzzlePhase(PuzzlePhase.StepMoving);
+                puzzleRunUpPending = hasRunUpNext;
+                StatusText = Loc.T(
+                    $"Jumping Puzzle: {(step.Jump ? "Sprung" : "Laufe")} {puzzleStepIndex + 1}/{currentPuzzle.Steps.Length}...",
+                    $"Jumping puzzle: {(step.Jump ? "jump" : "walk")} {puzzleStepIndex + 1}/{currentPuzzle.Steps.Length}...");
+                return;
+            }
+
+            case PuzzlePhase.EvaluatingFailure:
+                UpdatePuzzleFailure(playerPos, sinceStart);
+                return;
+
+            case PuzzlePhase.ReturningToStepStart:
+                UpdateReturningToStepStart(playerPos, sinceStart);
+                return;
+
+            case PuzzlePhase.StepMoving:
+            {
+                // Anlauf für den nächsten Sprung: beim Überqueren des Absprungpunkts (Ziel dieses
+                // Schritts) im Laufen abspringen - ab dann wird gegen das Sprungziel geprüft.
+                // Anlauf-Kette: beim Überqueren des aktuellen Punkts ohne anzuhalten zum nächsten
+                // Schritt wechseln - ist der ein Sprung, dabei abspringen. Gesprungen wird nur am
+                // Boden (z.B. wenn der Anlauf selbst mit einem Sprung beginnt), auch wenn der Punkt
+                // bei der Landung schon knapp überquert wurde.
+                while (puzzleRunUpPending)
+                {
+                    var takeoff = currentPuzzle.Steps[puzzleStepIndex].Target;
+                    var next = currentPuzzle.Steps[puzzleStepIndex + 1];
+                    var player2 = new Vector2(playerPos.X, playerPos.Z);
+                    var takeoff2 = new Vector2(takeoff.X, takeoff.Z);
+                    var passedTakeoff = Vector2.Dot(new Vector2(next.Target.X, next.Target.Z) - takeoff2, player2 - takeoff2) > 0f;
+                    var jumpDistance = currentPuzzle.Steps[puzzleStepIndex].Exact ? PuzzleFinalPreciseTolerance : PuzzleRunUpJumpDistance;
+                    if (Vector2.Distance(player2, takeoff2) > jumpDistance && !passedTakeoff)
+                        break;
+
+                    var ownJumpPending = currentPuzzle.Steps[puzzleStepIndex].Jump && !currentPuzzle.Steps[puzzleStepIndex].RunUp && !puzzleJumpSent;
+                    if (next.Jump && (ownJumpPending || Plugin.Condition[ConditionFlag.Jumping]))
+                        break;
+
+                    puzzleStepIndex++;
+                    puzzleStepFromY = MathF.Min(puzzleStepFromY, playerPos.Y);
+                    puzzleJumpSent = true;
+                    puzzleRunUpPending = puzzleStepIndex + 1 < currentPuzzle.Steps.Length && currentPuzzle.Steps[puzzleStepIndex + 1].RunUp;
+                    if (next.Jump)
+                    {
+                        Plugin.TryJump();
+                        StatusText = Loc.T(
+                            $"Jumping Puzzle: Sprung mit Anlauf {puzzleStepIndex + 1}/{currentPuzzle.Steps.Length}...",
+                            $"Jumping puzzle: running jump {puzzleStepIndex + 1}/{currentPuzzle.Steps.Length}...");
+                    }
+                }
+
+                var step = currentPuzzle.Steps[puzzleStepIndex];
+                if (step.Jump && !step.RunUp && !puzzleJumpSent && sinceStart >= PuzzleJumpDelay)
+                {
+                    puzzleJumpSent = true;
+                    Plugin.TryJump();
+                }
+
+                // Heruntergefallen - von vorne.
+                if (playerPos.Y < MathF.Min(puzzleStepFromY, step.Target.Y) - PuzzleFallMargin)
+                {
+                    FailPuzzleAttempt($"Absturz bei Schritt {puzzleStepIndex + 1}");
+                    return;
+                }
+
+                var inAir = Plugin.Condition[ConditionFlag.Jumping];
+                if (pathIsRunning.InvokeFunc() || inAir || sinceStart < TimeSpan.FromSeconds(0.3))
+                {
+                    // Läuft gegen eine Wand/Kante (kein Vorankommen mehr, obwohl der Laufweg noch
+                    // aktiv ist) - sofort als Fehlversuch werten statt bis zum Timeout weiterzulaufen.
+                    if (!inAir && Vector3.Distance(playerPos, puzzleProgressPos) > PuzzleProgressMinDistance)
+                    {
+                        puzzleProgressPos = playerPos;
+                        puzzleProgressAt = DateTime.UtcNow;
+                    }
+                    else if (!inAir && DateTime.UtcNow - puzzleProgressAt > PuzzleStuckDuration)
+                    {
+                        FailPuzzleAttempt($"Schritt {puzzleStepIndex + 1}: festgelaufen");
+                        return;
+                    }
+
+                    if (sinceStart > PuzzleStepTimeout)
+                        FailPuzzleAttempt($"Zeitüberschreitung bei Schritt {puzzleStepIndex + 1}");
+                    return;
+                }
+
+                // Laufweg zu Ende, aber der Sprung mit Anlauf wurde nie ausgelöst (z.B. stehen
+                // geblieben) - nicht als Erfolg werten, sondern neu versuchen.
+                if (puzzleRunUpPending)
+                {
+                    FailPuzzleAttempt($"Sprung mit Anlauf nach Schritt {puzzleStepIndex + 1} nicht ausgelöst");
+                    return;
+                }
+
+                if (!IsAtPuzzlePoint(playerPos, step.Target))
+                {
+                    FailPuzzleAttempt($"Schritt {puzzleStepIndex + 1} nicht erreicht");
+                    return;
+                }
+
+                puzzleStepRetries = 0;
+                if (puzzleStepIndex + 1 < currentPuzzle.Steps.Length)
+                {
+                    BeginPuzzleStep(puzzleStepIndex + 1);
+                    return;
+                }
+
+                // Letzter Punkt erreicht - noch exakt draufstellen (sonst steht er u.U. knapp neben
+                // der Kugel und der Punkt schaltet nicht frei).
+                BeginFinalPrecisePosition(currentPuzzle.ExactStand ?? step.Target);
+                return;
+            }
+
+            case PuzzlePhase.FinalPrecisePosition:
+            {
+                var target = currentPuzzle.ExactStand ?? currentPuzzle.Steps[^1].Target;
+                if (pathIsRunning.InvokeFunc() || Plugin.Condition[ConditionFlag.Jumping] || sinceStart < TimeSpan.FromSeconds(0.3))
+                {
+                    if (sinceStart < PuzzleFinalPreciseTimeout)
+                        return;
+                    StopPath();
+                }
+
+                // Abgestürzt (vom kleinen Plateau gerutscht) - Puzzle neu.
+                if (playerPos.Y < target.Y - PuzzleFallMargin)
+                {
+                    RestorePathTolerance();
+                    RestartPuzzleFromStart();
+                    return;
+                }
+
+                RestorePathTolerance();
+                Plugin.Log.Info($"[SightseeingAutomation] Jumping Puzzle {currentTargetEntry.Name} geschafft (Abweichung {Vector2.Distance(new Vector2(playerPos.X, playerPos.Z), new Vector2(target.X, target.Z)):F2}).");
+                hasEnsuredExactPosition = true;
+                didFinalApproach = true;
+                dismountedAt = DateTime.UtcNow - DismountSettleDelay;
+                state = State.WaitingForUnlock;
+                stateEnteredAt = DateTime.UtcNow;
+                StatusText = Loc.T($"Warte auf Freischaltung: {currentTargetEntry.Name}...", $"Waiting to unlock: {currentTargetEntry.Name}...");
+                return;
+            }
+        }
+    }
+
+    private void BeginPuzzleStep(int index)
+    {
+        puzzleStepIndex = index;
+        puzzleSprintUsed = false;
+        SetPuzzlePhase(PuzzlePhase.StepSettling);
+    }
+
+    private void FailPuzzleAttempt(string reason)
+    {
+        StopPath();
+        Plugin.Log.Info($"[SightseeingAutomation] Jumping Puzzle {currentTargetEntry?.Name}: {reason}.");
+
+        // Erst landen lassen, dann entscheiden: noch oben am Absprungpunkt -> denselben Schritt
+        // wiederholen, sonst (abgestürzt) vom Startpunkt neu.
+        SetPuzzlePhase(PuzzlePhase.EvaluatingFailure);
+    }
+
+    // Absprungpunkt des aktuellen Schritts: Startpunkt bzw. Ziel des vorherigen Schritts.
+    private Vector3 CurrentStepFromPoint() =>
+        puzzleStepIndex == 0 ? currentPuzzle!.Start : currentPuzzle!.Steps[puzzleStepIndex - 1].Target;
+
+    private void UpdatePuzzleFailure(Vector3 playerPos, TimeSpan sinceStart)
+    {
+        if (sinceStart < TimeSpan.FromSeconds(0.3) || Plugin.Condition[ConditionFlag.Jumping])
+            return;
+
+        var from = CurrentStepFromPoint();
+        var stillOnPlatform = playerPos.Y >= from.Y - PuzzleStepRetryHeightMargin
+                              && Vector2.Distance(new Vector2(playerPos.X, playerPos.Z), new Vector2(from.X, from.Z)) <= PuzzleStepRetryRadius;
+        if (stillOnPlatform && puzzleStepRetries < MaxPuzzleStepRetries)
+        {
+            puzzleStepRetries++;
+            Plugin.Log.Info($"[SightseeingAutomation] Jumping Puzzle: wiederhole Schritt {puzzleStepIndex + 1} ({puzzleStepRetries}. Wiederholung).");
+
+            // Sprung mit Anlauf: den Anlauf (vorherigen Schritt) komplett wiederholen, nicht vom
+            // Absprungpunkt aus dem Stand springen.
+            // Bei einer Anlauf-Kette bis zu deren Anfang zurück.
+            if (currentPuzzle!.Steps[puzzleStepIndex].RunUp && puzzleStepIndex > 0)
+            {
+                while (currentPuzzle.Steps[puzzleStepIndex].RunUp && puzzleStepIndex > 0)
+                    puzzleStepIndex--;
+                from = CurrentStepFromPoint();
+            }
+
+            // Tiefer als diese Höhe während des Zurücklaufens = abgestürzt.
+            puzzleReturnFloorY = MathF.Min(playerPos.Y, from.Y) - PuzzleStepRetryHeightMargin;
+            SetExactPathTolerance(puzzleStepIndex > 0 && currentPuzzle.Steps[puzzleStepIndex - 1].Exact);
+            moveToPath.InvokeAction(new List<Vector3> { from }, false);
+            SetPuzzlePhase(PuzzlePhase.ReturningToStepStart);
+            StatusText = Loc.T(
+                $"Jumping Puzzle: wiederhole Schritt {puzzleStepIndex + 1} ({puzzleStepRetries}. Wiederholung)...",
+                $"Jumping puzzle: retrying step {puzzleStepIndex + 1} (retry {puzzleStepRetries})...");
+            return;
+        }
+
+        RestartPuzzleFromStart();
+    }
+
+    private void UpdateReturningToStepStart(Vector3 playerPos, TimeSpan sinceStart)
+    {
+        var from = CurrentStepFromPoint();
+        if (playerPos.Y < puzzleReturnFloorY)
+        {
+            RestartPuzzleFromStart();
+            return;
+        }
+
+        if (pathIsRunning.InvokeFunc() || sinceStart < TimeSpan.FromSeconds(0.3))
+        {
+            if (sinceStart > PuzzleStepTimeout)
+                RestartPuzzleFromStart();
+            return;
+        }
+
+        if (IsAtPuzzlePoint(playerPos, from))
+            BeginPuzzleStep(puzzleStepIndex);
+        else
+            RestartPuzzleFromStart();
+    }
+
+    private void RestartPuzzleFromStart()
+    {
+        StopPath();
+        RestorePathTolerance();
+        puzzleAttempts++;
+        puzzleStepRetries = 0;
+        Plugin.Log.Info($"[SightseeingAutomation] Jumping Puzzle {currentTargetEntry?.Name}: von vorne - Versuch {puzzleAttempts}/{MaxPuzzleAttempts}.");
+        if (puzzleAttempts >= MaxPuzzleAttempts)
+        {
+            SkipCurrent(Loc.T("Jumping Puzzle zu oft fehlgeschlagen", "Jumping puzzle failed too often"));
+            return;
+        }
+
+        SetPuzzlePhase(PuzzlePhase.Dismounting);
+    }
+
+    private static bool IsAtPuzzlePoint(Vector3 playerPos, Vector3 point) =>
+        Vector2.Distance(new Vector2(playerPos.X, playerPos.Z), new Vector2(point.X, point.Z)) <= PuzzlePointTolerance
+        && MathF.Abs(playerPos.Y - point.Y) <= PuzzlePointTolerance;
 }
