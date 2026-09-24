@@ -230,6 +230,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
             CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id) || IsQuestObsoletedByMutualExclusion(entry.Id),
             CollectibleType.Chocobokeep => IsChocoboTaxiStandUnlocked(entry.Id),
+            CollectibleType.Achievement => IsAchievementCompleteById(entry.Id),
             _ => false,
         };
     }
@@ -2408,6 +2409,132 @@ public sealed class Plugin : IDalamudPlugin
 
     private static List<CollectibleEntry>? chocobokeepEntriesCache;
 
+    // Lumina "Achievement".Type für die zonengebundenen Errungenschaften (per Auswertung der
+    // Spieldaten verifiziert): 8 = "Mapping the Realm" (Key = Map-RowId), 20 = "Freebird" (Key =
+    // AetherCurrentCompFlgSet-RowId). "Free Market Friend" (geteilter FATE-Rang) hat keinen
+    // Zonen-Key und wird über den Zonennamen zugeordnet.
+    private const byte AchievementTypeMapExploration = 8;
+    private const byte AchievementTypeAetherCurrents = 20;
+    private const string FreeMarketFriendPrefix = "Free Market Friend: ";
+
+    private static List<CollectibleEntry>? achievementEntriesCache;
+
+    /// <summary>
+    /// Errungenschaften, die fest EINER Zone zugeordnet werden können (zonenunabhängige Gesamtliste,
+    /// wie GetChocobokeepEntries - das Overlay filtert nach TerritoryTypeId):
+    /// - "Mapping the Realm: X" - Karte der Zone/Instanz vollständig aufdecken. Auch Dungeons, Raids,
+    ///   Eureka, Bozja usw. - die erscheinen, solange man sich IN der jeweiligen Instanz befindet.
+    /// - "Freebird: X" - alle Ätherströmungen der Zone.
+    /// - "Free Market Friend: X" - geteilter FATE-Rang der Zone (Shadowbringers bis Dawntrail).
+    /// Erledigt-Status über das Spiel selbst (siehe IsAchievementCompleteById).
+    /// </summary>
+    public static List<CollectibleEntry> GetAchievementEntries()
+    {
+        if (achievementEntriesCache != null)
+            return achievementEntriesCache;
+
+        var result = new List<CollectibleEntry>();
+        try
+        {
+            var achievementSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Achievement>();
+            var mapSheet = DataManager.GetExcelSheet<Lumina.Excel.Sheets.Map>();
+            var aetherCurrentSetSheet = DataManager.GetExcelSheet<AetherCurrentCompFlgSet>();
+            var territorySheet = DataManager.GetExcelSheet<TerritoryType>();
+            if (achievementSheet == null || mapSheet == null || aetherCurrentSetSheet == null || territorySheet == null)
+                return achievementEntriesCache = result;
+
+            // Zonenname -> Zone, nur Feldzonen (TerritoryIntendedUse 1) - für "Free Market Friend".
+            // Führendes "The " ignorieren ("The Tempest" vs. "Tempest" o.ä.).
+            static string NormalizeZoneName(string name) =>
+                name.StartsWith("The ", StringComparison.OrdinalIgnoreCase) ? name[4..] : name;
+            var fieldZoneByName = new Dictionary<string, TerritoryType>(StringComparer.OrdinalIgnoreCase);
+            foreach (var territory in territorySheet)
+            {
+                var placeName = territory.PlaceName.ValueNullable?.Name.ToString();
+                if (territory.TerritoryIntendedUse.RowId == 1 && territory.Map.RowId != 0 && !string.IsNullOrEmpty(placeName))
+                    fieldZoneByName.TryAdd(NormalizeZoneName(placeName), territory);
+            }
+
+            foreach (var achievement in achievementSheet)
+            {
+                var name = achievement.Name.ToString();
+                if (string.IsNullOrEmpty(name))
+                    continue;
+
+                uint territoryId = 0;
+                uint mapId = 0;
+                if (achievement.Type == AchievementTypeMapExploration && mapSheet.TryGetRow(achievement.Key.RowId, out var map))
+                {
+                    territoryId = map.TerritoryType.RowId;
+                    mapId = map.RowId;
+                }
+                else if (achievement.Type == AchievementTypeAetherCurrents && aetherCurrentSetSheet.TryGetRow(achievement.Key.RowId, out var currentSet))
+                {
+                    territoryId = currentSet.Territory.RowId;
+                    mapId = currentSet.Territory.ValueNullable?.Map.RowId ?? 0;
+                }
+                else if (name.StartsWith(FreeMarketFriendPrefix, StringComparison.Ordinal)
+                         && fieldZoneByName.TryGetValue(NormalizeZoneName(name[FreeMarketFriendPrefix.Length..]), out var zone))
+                {
+                    territoryId = zone.RowId;
+                    mapId = zone.Map.RowId;
+                }
+
+                if (territoryId == 0)
+                    continue;
+
+                result.Add(new CollectibleEntry
+                {
+                    Id = achievement.RowId,
+                    Name = name,
+                    Type = CollectibleType.Achievement,
+                    Category = Loc.T("Errungenschaft", "Achievement"),
+                    TerritoryTypeId = territoryId,
+                    MapId = mapId,
+                    Source = achievement.Description.ToString(),
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Fehler beim Aufbau der zonengebundenen Errungenschaften.");
+        }
+
+        Log.Info($"[Achievements] {result.Count} zonengebundene Errungenschaften.");
+        return achievementEntriesCache = result;
+    }
+
+    // Siehe EnsureAchievementsLoaded - Drossel für die Server-Anfrage.
+    private static DateTime lastAchievementRequestAt = DateTime.MinValue;
+    private static readonly TimeSpan AchievementRequestInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Der Erledigt-Status aller Errungenschaften liegt im Client erst vor, nachdem er beim Server
+    /// angefragt wurde (normalerweise beim ersten Öffnen des Errungenschaften-Fensters) - das
+    /// übernimmt hier das Plugin selbst (gedrosselt), damit man das Fenster nicht erst öffnen muss.
+    /// </summary>
+    public static unsafe bool EnsureAchievementsLoaded()
+    {
+        var achievements = FFXIVClientStructs.FFXIV.Client.Game.UI.Achievement.Instance();
+        if (achievements == null)
+            return false;
+
+        if (achievements->IsLoaded())
+            return true;
+
+        if (achievements->State == FFXIVClientStructs.FFXIV.Client.Game.UI.Achievement.AchievementState.Invalid
+            && DateTime.UtcNow - lastAchievementRequestAt > AchievementRequestInterval)
+        {
+            lastAchievementRequestAt = DateTime.UtcNow;
+            achievements->RequestCompletedAchievements();
+        }
+
+        return false;
+    }
+
+    private static unsafe bool IsAchievementCompleteById(uint achievementId) =>
+        EnsureAchievementsLoaded() && FFXIVClientStructs.FFXIV.Client.Game.UI.Achievement.Instance()->IsComplete((int)achievementId);
+
     /// <summary>
     /// Alle Chocobo-Reitstände im gesamten Spiel (zonenunabhängige Gesamtliste, wie GetFrameKitEntries),
     /// aus ChocobokeepLocations - Entry.Id ist bewusst die "ChocoboTaxiStand"-RowId (nicht irgendeine
@@ -3207,6 +3334,15 @@ public sealed class Plugin : IDalamudPlugin
 
     private static string? ComputeGrandCompanyOrTribeGateReason(CollectibleEntry entry)
     {
+        // Errungenschafts-Fortschritt noch nicht vom Server geladen (siehe EnsureAchievementsLoaded) -
+        // sonst stünden kurz ALLE Errungenschaften fälschlich als "fehlt" da.
+        if (entry.Type == CollectibleType.Achievement && !EnsureAchievementsLoaded())
+        {
+            return Loc.T(
+                "Errungenschafts-Fortschritt wird noch vom Server geladen...",
+                "Achievement progress is still being loaded from the server...");
+        }
+
         // Triple Triad selbst wird erst mit der Quest "Triple Triad Trial" freigeschaltet - vorher ist
         // KEINE Karte nutzbar, egal wo/wie erhältlich. Hat daher Vorrang vor allen anderen
         // Voraussetzungen der Karte.
@@ -3790,7 +3926,10 @@ public sealed class Plugin : IDalamudPlugin
             return false;
         if (row.BeastTribe.RowId != 0)
             return false;
-        if (row.JournalGenre.RowId == 0)
+        // Ohne Journal-Genre UND ohne Vergabe-NPC ist es keine annehmbare Quest (interne Zeilen).
+        // Freischalt-Quests ("blaues Plus", z.B. "Triple Triad Trial", "Hitting the Cactpot", "So You
+        // Want to Be a ...") haben zwar KEIN Genre, aber einen Vergabe-NPC - die gehören dazu.
+        if (row.JournalGenre.RowId == 0 && row.IssuerLocation.RowId == 0)
             return false;
 
         // Hauptquests (MSQ) gehören nicht in eine Sammelobjekt-Übersicht - erkannt über
@@ -4038,13 +4177,25 @@ public sealed class Plugin : IDalamudPlugin
 
         var playerLevel = ObjectTable.LocalPlayer?.Level ?? 0;
         var questSheet = DataManager.GetExcelSheet<Quest>();
+
+        // Für Quests ohne PlaceName (siehe unten) - wie bei den generischen Stadtnamen zählt in
+        // geteilten Hauptstädten jeder Bezirk.
+        var acceptableQuestIssuerTerritoryIds = SplitCityTerritories.TryGetValue(territoryId, out var questSiblingIds)
+            ? questSiblingIds.ToHashSet()
+            : new HashSet<uint> { territoryId };
+
         if (questSheet != null && playerLevel > 0)
         {
             foreach (var row in questSheet)
             {
                 try
                 {
-                    if (!acceptablePlaceNameIds.Contains(row.PlaceName.RowId))
+                    // Freischalt-Quests (siehe IsQuestCurrentlyAcceptable) tragen oft KEINEN
+                    // PlaceName (leer) - dann über die Zone des Vergabe-NPCs zuordnen.
+                    var matchesPlace = acceptablePlaceNameIds.Contains(row.PlaceName.RowId)
+                        || (string.IsNullOrEmpty(row.PlaceName.ValueNullable?.Name.ToString())
+                            && acceptableQuestIssuerTerritoryIds.Contains(row.IssuerLocation.ValueNullable?.Territory.RowId ?? 0));
+                    if (!matchesPlace)
                         continue;
                     if (!IsQuestCurrentlyAcceptable(row, playerLevel))
                         continue;
