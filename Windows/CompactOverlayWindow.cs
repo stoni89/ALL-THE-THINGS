@@ -396,7 +396,11 @@ public class CompactOverlayWindow : Window
         var missingSightseeingInZone = plugin.GetLiveZoneEntries(effectiveTerritoryId)
             .Where(e => e.Type == CollectibleType.Sightseeing && siblingTerritories.Contains(e.TerritoryTypeId))
             .Where(e => !Plugin.IsBlacklisted(e)) // nicht aus allForZone abgeleitet, daher hier eigens
-            .Where(e => !Plugin.IsSightseeingUnsupportedByAutomation(e.Id) && !Plugin.IsSightseeingBlockedByFlying(e))
+            // Ausnahme Simulation: Punkte mit hinterlegtem Jumping Puzzle (Plugin.SightseeingJumpingPuzzles)
+            // dürfen dort trotz "nicht unterstützt" angelaufen werden - zum Testen des Sprung-Ablaufs.
+            .Where(e => (!Plugin.IsSightseeingUnsupportedByAutomation(e.Id)
+                         || (config.SimulateSightseeingAutomation && Plugin.TryGetSightseeingJumpingPuzzle(e.Id, out _)))
+                        && !Plugin.IsSightseeingBlockedByFlying(e))
             .Where(e => config.SimulateSightseeingAutomation || (!plugin.IsOwned(e) && !Plugin.IsAchievementOrRankGated(e)))
             .ToList();
         // Punkte, die NUR wegen Wetter/Uhrzeit gerade nicht gehen (siehe
@@ -803,7 +807,7 @@ public class CompactOverlayWindow : Window
                     var color = isActive ? AffordableColor : UnsupportedColor;
 
                     OutlineText(
-                        Loc.T($"(Bedingung nicht erfüllt{timerSuffix})", $"(condition not met{timerSuffix})"),
+                        Loc.T($"(Aktuell nicht unterstützt{timerSuffix})", $"(currently unsupported{timerSuffix})"),
                         color);
                     if (ImGui.IsItemHovered())
                         ImGui.SetTooltip(Plugin.GetAchievementOrRankGateReason(entry));
@@ -2017,14 +2021,14 @@ public class CompactOverlayWindow : Window
         [CollectibleType.Emote] = new(1f, 0.55f, 0.75f, 1f),
         [CollectibleType.Facewear] = new(0.55f, 0.75f, 1f, 1f),
         [CollectibleType.FashionAccessory] = new(0.75f, 0.9f, 0.45f, 1f),
-        [CollectibleType.TripleTriadCard] = new(1f, 0.5f, 0.5f, 1f),
+        [CollectibleType.TripleTriadCard] = new(0.25f, 0.6f, 1f, 1f),
         [CollectibleType.FrameKit] = new(0.55f, 0.55f, 0.95f, 1f),
         [CollectibleType.Hairstyle] = new(0.9f, 0.7f, 0.9f, 1f),
         [CollectibleType.Aetheryte] = new(0.6f, 1f, 0.75f, 1f),
         [CollectibleType.Quest] = new(1f, 0.9f, 0.5f, 1f),
         [CollectibleType.HuntingLog] = new(0.68f, 0.45f, 0.95f, 1f),
         [CollectibleType.AetherCurrent] = new(0.65f, 0.95f, 1f, 1f),
-        [CollectibleType.Sightseeing] = new(1f, 0.8f, 0.4f, 1f),
+        [CollectibleType.Sightseeing] = new(0.3f, 0.8f, 0.45f, 1f),
         [CollectibleType.Chocobokeep] = new(0.95f, 0.85f, 0.2f, 1f),
         [CollectibleType.Achievement] = new(0.95f, 0.6f, 0.3f, 1f),
     };
