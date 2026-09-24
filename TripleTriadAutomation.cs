@@ -137,6 +137,20 @@ public sealed class TripleTriadAutomation
     // Karten-Items nacheinander benutzen (jedes Benutzen hat eine kurze Animation).
     private static readonly TimeSpan UseCardInterval = TimeSpan.FromSeconds(2);
 
+    // Gegner, die vnavmesh nicht selbst erreicht (z.B. in Gebäuden): fester Laufweg. Der erste Punkt
+    // wird normal (auch fliegend) angesteuert, ab dort wird gelaufen - zuletzt zum NPC. Zurück geht es
+    // denselben Weg rückwärts, aber nur, wenn danach noch ein Gegner in der Zone offen ist.
+    private static readonly Dictionary<string, Vector3[]> NpcEntryRoutes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Trachtoum"] = new[]
+        {
+            new Vector3(704.27924f, 65.783325f, -287.72842f),
+            new Vector3(712.80835f, 66.027f, -279.32993f),
+        },
+    };
+
+    private const float RouteTolerance = 0.5f;
+
     private readonly ICallGateSubscriber<Vector3, bool, float, bool> pathfindAndMoveCloseTo;
     private readonly ICallGateSubscriber<bool> pathIsRunning;
     private readonly ICallGateSubscriber<object> pathStop;
@@ -149,6 +163,16 @@ public sealed class TripleTriadAutomation
     private List<CollectibleEntry> currentCards = new();
     private Vector3 currentTargetPosition;
     private float currentPathTolerance = PathTolerance;
+    private float pendingPathTolerance = PathTolerance;
+    private bool currentAllowFly = true;
+
+    // Fester Laufweg (siehe NpcEntryRoutes): noch anzusteuernde Punkte, ob es der Rückweg ist, ob der
+    // aktuelle Gegner einen Laufweg hat bzw. wir schon drinnen sind, und der Rückweg für den nächsten Start.
+    private readonly Queue<Vector3> routeQueue = new();
+    private bool routeIsExit;
+    private Vector3[]? activeRoute;
+    private bool routeEntered;
+    private Vector3[]? pendingExitRoute;
     private DateTime stateEnteredAt;
     private bool hasSeenPathRunning;
     private DateTime? npcNotFoundSince;
@@ -228,6 +252,8 @@ public sealed class TripleTriadAutomation
         finishedNpcIds.Clear();
         skippedNpcIds.Clear();
         currentNpcId = 0;
+        ResetRoute();
+        pendingExitRoute = null;
         StatusText = Loc.T("Automation gestartet...", "Automation started...");
     }
 
@@ -237,6 +263,8 @@ public sealed class TripleTriadAutomation
         IsActive = false;
         state = State.Idle;
         currentNpcId = 0;
+        ResetRoute();
+        pendingExitRoute = null;
         StopPath();
         if (wasPlaying)
             SendCommand("/saucy tt stop");
@@ -348,6 +376,21 @@ public sealed class TripleTriadAutomation
             return;
         }
 
+        // Vom letzten Gegner mit festem Laufweg erst wieder hinaus, bevor der nächste angesteuert wird.
+        if (pendingExitRoute != null)
+        {
+            var exitRoute = pendingExitRoute;
+            pendingExitRoute = null;
+            ResetRoute();
+            routeIsExit = true;
+            foreach (var point in exitRoute)
+                routeQueue.Enqueue(point);
+
+            Plugin.Log.Info("[TripleTriadAutomation] Laufe festen Laufweg zurück.");
+            BeginRouteLeg();
+            return;
+        }
+
         var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? Vector3.Zero;
         var next = byNpc.OrderBy(g => Vector3.Distance(playerPos, g.First().WorldPosition!.Value)).First();
 
@@ -367,6 +410,20 @@ public sealed class TripleTriadAutomation
         // ChocobokeepAutomation) - schlägt das fehl, direkt die rohe NPC-Position nehmen.
         Plugin.OpenEntryMap(currentCards[0], showMapWindow: false);
         currentTargetPosition = queryFlagToPoint.InvokeFunc() ?? currentTargetPosition;
+        pendingPathTolerance = PathTolerance;
+
+        ResetRoute();
+        if (NpcEntryRoutes.TryGetValue(currentNpcName, out var route) && route.Length > 0)
+        {
+            // Erster Routenpunkt normal (auch fliegend) anfliegen, der Rest wird gelaufen.
+            activeRoute = route;
+            currentTargetPosition = route[0];
+            pendingPathTolerance = RouteTolerance;
+            foreach (var point in route.Skip(1))
+                routeQueue.Enqueue(point);
+
+            Plugin.Log.Info($"[TripleTriadAutomation] {currentNpcName}: fester Laufweg mit {route.Length} Punkten.");
+        }
 
         lastMountAttempt = DateTime.UtcNow;
         if (Plugin.TryRequestAetheryteMount())
@@ -377,20 +434,20 @@ public sealed class TripleTriadAutomation
             return;
         }
 
-        BeginPathfind(currentTargetPosition, PathTolerance);
+        BeginPathfind(currentTargetPosition, pendingPathTolerance);
     }
 
     private void UpdateMounting()
     {
         if (Plugin.Condition[ConditionFlag.Mounted])
         {
-            BeginPathfind(currentTargetPosition, PathTolerance);
+            BeginPathfind(currentTargetPosition, pendingPathTolerance);
             return;
         }
 
         if (DateTime.UtcNow - stateEnteredAt > MountWaitTimeout)
         {
-            BeginPathfind(currentTargetPosition, PathTolerance);
+            BeginPathfind(currentTargetPosition, pendingPathTolerance);
             return;
         }
 
@@ -402,11 +459,11 @@ public sealed class TripleTriadAutomation
         }
     }
 
-    private void BeginPathfind(Vector3 destination, float tolerance)
+    private void BeginPathfind(Vector3 destination, float tolerance, bool allowFly = true)
     {
         var accepted = false;
         var flyingAccepted = false;
-        if (Plugin.Condition[ConditionFlag.Mounted] && Plugin.CanFly)
+        if (allowFly && Plugin.Condition[ConditionFlag.Mounted] && Plugin.CanFly)
             accepted = flyingAccepted = pathfindAndMoveCloseTo.InvokeFunc(destination, true, tolerance);
 
         if (!accepted)
@@ -419,6 +476,7 @@ public sealed class TripleTriadAutomation
         }
 
         currentPathTolerance = tolerance;
+        currentAllowFly = allowFly;
         state = State.MovingTo;
         stateEnteredAt = DateTime.UtcNow;
         hasSeenPathRunning = false;
@@ -438,7 +496,7 @@ public sealed class TripleTriadAutomation
                 Plugin.TryRemountAfterForcedDismount(ref lastRemountAttempt);
 
             // Aus einem Flugverbots-Bereich heraus (siehe FlightPathUpgrade) - jetzt fliegend weiter.
-            if (flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
+            if (currentAllowFly && flightUpgrade.ShouldReplanFlying(playerPos, currentTargetPosition))
             {
                 StopPath();
                 BeginPathfind(currentTargetPosition, currentPathTolerance);
@@ -449,7 +507,7 @@ public sealed class TripleTriadAutomation
             {
                 Plugin.Log.Info($"[TripleTriadAutomation] Unterwegs zu {currentNpcName}: scheinbar steckengeblieben - Laufweg wird neu angefordert.");
                 StopPath();
-                BeginPathfind(currentTargetPosition, PathTolerance);
+                BeginPathfind(currentTargetPosition, currentPathTolerance, currentAllowFly);
                 return;
             }
 
@@ -461,6 +519,35 @@ public sealed class TripleTriadAutomation
 
         if (hasSeenPathRunning)
         {
+            // Fester Laufweg: nächsten Punkt zu Fuß ansteuern bzw. Rückweg beenden.
+            if (routeQueue.Count > 0)
+            {
+                // Nach dem Anflug auf den ersten Punkt erst landen - zu Fuß geht es nur am Boden weiter.
+                if (Plugin.Condition[ConditionFlag.InFlight])
+                {
+                    if (DateTime.UtcNow - lastRemountAttempt > MountRetryInterval)
+                    {
+                        lastRemountAttempt = DateTime.UtcNow;
+                        Plugin.TryDismount();
+                    }
+                    return;
+                }
+
+                BeginRouteLeg();
+                return;
+            }
+
+            if (routeIsExit)
+            {
+                Plugin.Log.Info("[TripleTriadAutomation] Rückweg abgeschlossen.");
+                ResetRoute();
+                state = State.Idle;
+                return;
+            }
+
+            if (activeRoute != null)
+                routeEntered = true;
+
             state = State.Approaching;
             stateEnteredAt = DateTime.UtcNow;
             npcNotFoundSince = null;
@@ -508,7 +595,7 @@ public sealed class TripleTriadAutomation
         if (Vector3.Distance(playerPos, npc.Position) > InteractDistance)
         {
             currentTargetPosition = npc.Position;
-            BeginPathfind(npc.Position, InteractDistance - 0.5f);
+            BeginPathfind(npc.Position, InteractDistance - 0.5f, allowFly: activeRoute == null);
             return;
         }
 
@@ -693,11 +780,22 @@ public sealed class TripleTriadAutomation
         Plugin.Log.Info($"[TripleTriadAutomation] Gegner {currentNpcName} erledigt.");
         finishedNpcIds.Add(currentNpcId);
         currentNpcId = 0;
+        QueueExitRouteIfInside();
         state = State.Idle;
     }
 
     private void SkipCurrent(string reason)
     {
+        // Abgelehnter Laufweg auf dem Rückweg: einfach normal weiter (TryStartNext plant neu).
+        if (routeIsExit)
+        {
+            Plugin.Log.Info($"[TripleTriadAutomation] Rückweg abgebrochen: {reason}");
+            StopPath();
+            ResetRoute();
+            state = State.Idle;
+            return;
+        }
+
         Plugin.Log.Info($"[TripleTriadAutomation] Überspringe {currentNpcName}: {reason}");
         if (currentNpcId != 0)
             skippedNpcIds.Add(currentNpcId);
@@ -705,6 +803,35 @@ public sealed class TripleTriadAutomation
         StatusText = Loc.T($"Übersprungen ({reason}): {currentNpcName}", $"Skipped ({reason}): {currentNpcName}");
         StopPath();
         currentNpcId = 0;
+        QueueExitRouteIfInside();
         state = State.Idle;
+    }
+
+    private void ResetRoute()
+    {
+        routeQueue.Clear();
+        routeIsExit = false;
+        activeRoute = null;
+        routeEntered = false;
+    }
+
+    // Nach einem Gegner mit festem Laufweg: den Weg rückwärts merken - TryStartNext läuft ihn nur,
+    // wenn danach noch ein Gegner in der Zone offen ist (sonst endet die Automation einfach).
+    private void QueueExitRouteIfInside()
+    {
+        if (activeRoute != null && routeEntered)
+            pendingExitRoute = activeRoute.Reverse().ToArray();
+
+        ResetRoute();
+    }
+
+    private void BeginRouteLeg()
+    {
+        currentTargetPosition = routeQueue.Dequeue();
+        BeginPathfind(currentTargetPosition, RouteTolerance, allowFly: false);
+        if (state == State.MovingTo)
+            StatusText = routeIsExit
+                ? Loc.T("Laufe festen Laufweg zurück...", "Walking the fixed route back...")
+                : Loc.T($"Laufe festen Laufweg zu: {currentNpcName}...", $"Walking the fixed route to: {currentNpcName}...");
     }
 }
