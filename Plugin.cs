@@ -1784,8 +1784,8 @@ public sealed class Plugin : IDalamudPlugin
 
     // ExactStand = genaue Position der Sightseeing-Kugel, falls sie nicht exakt der Landepunkt des
     // letzten Schritts ist - dorthin wird nach der Landung noch genau gelaufen.
-    // DismountAtStart = Start ist eine Position in der Luft: beritten genau dorthin fliegen, dort
-    // absteigen (senkrecht nach unten landen) und von der Landestelle aus die Schritte ablaufen.
+    // DismountAtStart = beritten (fliegend, sonst reitend) genau bis zum Startpunkt, erst dort absteigen
+    // (liegt er in der Luft: senkrecht nach unten landen) und von dort aus die Schritte ablaufen.
     public sealed record SightseeingJumpingPuzzle(Vector3 Start, SightseeingPuzzleStep[] Steps, Vector3? ExactStand = null, bool DismountAtStart = false);
 
     // Von Hand hinterlegte Jumping Puzzles (Key = Adventure-RowId): Die Automation steuert zuerst
@@ -1838,6 +1838,14 @@ public sealed class Plugin : IDalamudPlugin
                 new SightseeingPuzzleStep(new Vector3(-275.7539f, -14.272285f, 74.517914f), Jump: false, Exact: true), // Punkt 2 (Sightseeing-Punkt)
             },
             DismountAtStart: true),
+        [2162726] = new( // The Bannock (Central Shroud) - kein Sprung, nur genauer Fußweg
+            new Vector3(96.94209f, 2.7136912f, -73.20404f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(96.68277f, 2.7444344f, -76.00062f), Jump: false, Exact: true), // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(97.89942f, 3.56555f, -75.178215f), Jump: false, Exact: true),  // Punkt 3 (Sightseeing-Punkt)
+            },
+            DismountAtStart: true), // erst genau am Startpunkt absteigen
         [2162724] = new( // The Carline Canopy (Gridania)
             new Vector3(144.2908f, -13.261837f, 160.06638f),
             new[]
@@ -6284,10 +6292,20 @@ public sealed class Plugin : IDalamudPlugin
         if (string.IsNullOrEmpty(mountName))
             return false;
 
-        Log.Info($"[MountDebug] Sende '/mount \"{mountName}\"' über SendGameChatCommand (mountId={resolvedMountId}).");
-
+        // Direkt über die Spiel-Aktion (ActionType.Mount + RowId) statt über den Text-Befehl
+        // "/mount <Name>" - eindeutig und unabhängig von Client-Sprache/Schreibweise des Namens (der
+        // Text-Befehl konnte dadurch ein anderes als das eingestellte Mount rufen). Nur falls die
+        // Aktion abgelehnt wird, als Rückfall der Text-Befehl.
         try
         {
+            var actionManager = ActionManager.Instance();
+            if (actionManager != null && actionManager->UseAction(ActionType.Mount, resolvedMountId))
+            {
+                Log.Info($"[MountDebug] Mount-Aktion benutzt (mountId={resolvedMountId}, {mountName}).");
+                return true;
+            }
+
+            Log.Info($"[MountDebug] Mount-Aktion abgelehnt - sende '/mount \"{mountName}\"' (mountId={resolvedMountId}).");
             SendGameChatCommand($"/mount \"{mountName}\"");
         }
         catch (Exception ex)
