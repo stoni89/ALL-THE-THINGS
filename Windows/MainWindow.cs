@@ -87,8 +87,8 @@ public class MainWindow : Window
     // Spieler soll das Fenster gar nicht erst so klein ziehen können, dass eine Scrollbar nötig würde.
     private static readonly WindowSizeConstraints ExpandedSizeConstraints = new()
     {
-        MinimumSize = new Vector2(520 + ContentRightMargin, 930),
-        MaximumSize = new Vector2(1100 + ContentRightMargin, 1050),
+        MinimumSize = new Vector2(520 + ContentRightMargin, 700),
+        MaximumSize = new Vector2(2400, 1600),
     };
 
     private static readonly WindowSizeConstraints CollapsedSizeConstraints = new()
@@ -100,7 +100,7 @@ public class MainWindow : Window
     private readonly (FontAwesomeIcon Icon, string Label, Action Draw)[] navItems;
 
     private const ImGuiWindowFlags BaseFlags =
-        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse | ImGuiWindowFlags.NoResize;
+        ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse;
 
     public MainWindow(Plugin plugin) : base(
         $"The Explorer's Codex (v{VersionText})##TheExplorersCodex",
@@ -124,12 +124,8 @@ public class MainWindow : Window
 
     public void Dispose() { }
 
-    // Bei jedem Öffnen in voller Breite und Höhe (siehe PreDraw) - statt der zuletzt gezogenen Größe.
-    private bool openAtFullSize = true;
-
     public override void OnOpen()
     {
-        openAtFullSize = true;
         collapsed = false;
     }
 
@@ -157,21 +153,13 @@ public class MainWindow : Window
     {
         SizeConstraints = collapsed ? CollapsedSizeConstraints : ExpandedSizeConstraints;
 
-        // Größe ist fest (NoResize in BaseFlags, siehe OnOpen/openAtFullSize) - weder ein- noch
-        // ausgeklappt per Maus veränderbar.
-        Flags = BaseFlags;
+        // Ausgeklappt frei in der Größe veränderbar - eingeklappt nicht (dort würde die Zieh-Zone des
+        // Rahmens die ganze niedrige Titelleiste überdecken und den Doppelklick zum Ausklappen abfangen).
+        Flags = collapsed ? BaseFlags | ImGuiWindowFlags.NoResize : BaseFlags;
 
-        if (openAtFullSize && !collapsed)
-        {
-            // Maximalgröße, aber nie größer als der sichtbare Bildschirmbereich.
-            openAtFullSize = false;
-            var workSize = ImGui.GetMainViewport().WorkSize;
-            var max = ExpandedSizeConstraints.MaximumSize;
-            expandedSize = new Vector2(MathF.Min(max.X, workSize.X), MathF.Min(max.Y, workSize.Y));
-            Size = expandedSize;
-            SizeCondition = ImGuiCond.Always;
-        }
-        else if (!collapsed && collapsedLastFrame)
+        // Frei veränderbare Größe - ImGui merkt sie sich selbst (auch über Neustarts); die Startgröße
+        // (expandedSize) gilt nur beim allerersten Öffnen (FirstUseEver).
+        if (!collapsed && collapsedLastFrame)
         {
             Size = expandedSize;
             SizeCondition = ImGuiCond.Always;
@@ -1389,50 +1377,66 @@ public class MainWindow : Window
         }
         ModernUi.EndCard();
 
-        ModernUi.GroupLabel(Loc.T("Simulation", "Simulation"));
-        ModernUi.BeginCard();
-        TextDisabledWrapped(Loc.T(
-            "Lässt die Automation auch bereits freigeschaltete Ziele erneut anlaufen, zum Testen von Laufweg/Interaktion. Wirkt sich nur auf die Automation aus, nicht auf die normale Anzeige im Overlay.",
-            "Makes the automation revisit already-unlocked targets too, for testing pathing/interaction. Only affects the automation, not the normal overlay display."));
-        var simulateAetheryte = config.SimulateAetheryteAutomation;
-        if (ModernUi.ToggleRow(Loc.T("Auto Aetheryte simulieren", "Simulate Auto Aetheryte"), ref simulateAetheryte))
+        // Simulation und Debug-Dumps nur in der Dev-Version (als Dev-Plugin geladen) - reine
+        // Entwickler-Werkzeuge, die in der installierten Version niemanden etwas angehen.
+        if (Plugin.PluginInterface.IsDev)
         {
-            config.SimulateAetheryteAutomation = simulateAetheryte;
-            config.Save();
-        }
-        var simulateChocobokeep = config.SimulateChocobokeepAutomation;
-        if (ModernUi.ToggleRow(Loc.T("Auto Chocobokeep simulieren", "Simulate Auto Chocobokeep"), ref simulateChocobokeep))
-        {
-            config.SimulateChocobokeepAutomation = simulateChocobokeep;
-            config.Save();
-        }
-        var simulateSightseeing = config.SimulateSightseeingAutomation;
-        if (ModernUi.ToggleRow(Loc.T("Auto Sightseeing simulieren", "Simulate Auto Sightseeing"), ref simulateSightseeing))
-        {
-            config.SimulateSightseeingAutomation = simulateSightseeing;
-            config.Save();
-        }
-        ModernUi.EndCard();
+            ModernUi.GroupLabel(Loc.T("Simulation", "Simulation"));
+            ModernUi.BeginCard();
+            TextDisabledWrapped(Loc.T(
+                "Lässt die Automation auch bereits freigeschaltete Ziele erneut anlaufen, zum Testen von Laufweg/Interaktion. Wirkt sich nur auf die Automation aus, nicht auf die normale Anzeige im Overlay.",
+                "Makes the automation revisit already-unlocked targets too, for testing pathing/interaction. Only affects the automation, not the normal overlay display."));
 
-        ModernUi.GroupLabel(Loc.T("Debug-Dumps (ins Log schreiben)", "Debug dumps (write to log)"));
-        ModernUi.BeginCard();
-        DrawWrappedButtonRow(new (string Label, Action OnClick)[]
-        {
-            (Loc.T("Aetheryten", "Aetherytes"), () => plugin.DumpAetheryteDebugInfo()),
-            (Loc.T("Hunting Log", "Hunting log"), Plugin.DumpHuntingLogDebugInfo),
-            (Loc.T("Sightseeing", "Sightseeing"), () => plugin.DumpSightseeingDebugInfo()),
-            (Loc.T("Eigene Position", "My position"), () => plugin.DumpPlayerPositionDebugInfo()),
-            (Loc.T("Framer's Kit", "Framer's kit"), Plugin.DumpFrameKitDebugInfo),
-            (Loc.T("Moderne Ästhetik", "Modern Aesthetics"), Plugin.DumpHairstyleDebugInfo),
-            (Loc.T("Chocobokeep", "Chocobokeep"), Plugin.DumpChocobokeepDebugInfo),
-            (Loc.T("Händler-Positionen", "Vendor positions"), Plugin.DumpVendorPositionEnrichmentDebugInfo),
-            (Loc.T("GK-Bardinghändler", "GC barding vendors"), Plugin.DumpGrandCompanyBardingVendorDebugInfo),
-            (Loc.T("Dungeon-Zonen", "Dungeon zones"), Plugin.DumpZoneEnrichmentDebugInfo),
-            (Loc.T("Saisonevent", "Seasonal event"), Plugin.DumpSeasonalEventDebugInfo),
-            (Loc.T("Ätherströmungen (aktuelle Zone)", "Aether currents (current zone)"), Plugin.DumpAetherCurrentDebugInfo),
-            (Loc.T("Ätherströmungen (alle Zonen)", "Aether currents (all zones)"), Plugin.DumpAetherCurrentDebugInfoAllZones),
-        });
-        ModernUi.EndCard();
+            var simulateAetheryte = config.SimulateAetheryteAutomation;
+            if (ModernUi.ToggleRow(Loc.T("Auto Aetheryte simulieren", "Simulate Auto Aetheryte"), ref simulateAetheryte))
+            {
+                config.SimulateAetheryteAutomation = simulateAetheryte;
+                config.Save();
+            }
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.Spacing();
+
+            var simulateChocobokeep = config.SimulateChocobokeepAutomation;
+            if (ModernUi.ToggleRow(Loc.T("Auto Chocobokeep simulieren", "Simulate Auto Chocobokeep"), ref simulateChocobokeep))
+            {
+                config.SimulateChocobokeepAutomation = simulateChocobokeep;
+                config.Save();
+            }
+
+            ImGui.Spacing();
+            ImGui.Separator();
+            ImGui.Spacing();
+
+            var simulateSightseeing = config.SimulateSightseeingAutomation;
+            if (ModernUi.ToggleRow(Loc.T("Auto Sightseeing simulieren", "Simulate Auto Sightseeing"), ref simulateSightseeing))
+            {
+                config.SimulateSightseeingAutomation = simulateSightseeing;
+                config.Save();
+            }
+            ModernUi.EndCard();
+
+            ModernUi.GroupLabel(Loc.T("Debug-Dumps (ins Log schreiben)", "Debug dumps (write to log)"));
+            ModernUi.BeginCard();
+            DrawWrappedButtonRow(new (string Label, Action OnClick)[]
+            {
+                (Loc.T("Aetheryten", "Aetherytes"), () => plugin.DumpAetheryteDebugInfo()),
+                (Loc.T("Hunting Log", "Hunting log"), Plugin.DumpHuntingLogDebugInfo),
+                (Loc.T("Sightseeing", "Sightseeing"), () => plugin.DumpSightseeingDebugInfo()),
+                (Loc.T("Eigene Position", "My position"), () => plugin.DumpPlayerPositionDebugInfo()),
+                (Loc.T("Framer's Kit", "Framer's kit"), Plugin.DumpFrameKitDebugInfo),
+                (Loc.T("Moderne Ästhetik", "Modern Aesthetics"), Plugin.DumpHairstyleDebugInfo),
+                (Loc.T("Chocobokeep", "Chocobokeep"), Plugin.DumpChocobokeepDebugInfo),
+                (Loc.T("Händler-Positionen", "Vendor positions"), Plugin.DumpVendorPositionEnrichmentDebugInfo),
+                (Loc.T("GK-Bardinghändler", "GC barding vendors"), Plugin.DumpGrandCompanyBardingVendorDebugInfo),
+                (Loc.T("Dungeon-Zonen", "Dungeon zones"), Plugin.DumpZoneEnrichmentDebugInfo),
+                (Loc.T("Saisonevent", "Seasonal event"), Plugin.DumpSeasonalEventDebugInfo),
+                (Loc.T("Ätherströmungen (aktuelle Zone)", "Aether currents (current zone)"), Plugin.DumpAetherCurrentDebugInfo),
+                (Loc.T("Ätherströmungen (alle Zonen)", "Aether currents (all zones)"), Plugin.DumpAetherCurrentDebugInfoAllZones),
+            });
+            ModernUi.EndCard();
+        }
 
         ModernUi.GroupLabel(Loc.T("Aktueller Status", "Current status"));
         ModernUi.BeginCard();
