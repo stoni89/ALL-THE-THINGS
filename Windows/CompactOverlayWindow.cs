@@ -1787,7 +1787,7 @@ public class CompactOverlayWindow : Window
     /// "Auf die Blacklist setzen". Muss direkt NACH dem Namen-Widget (OutlineText/ImGui-Item)
     /// aufgerufen werden, da ImGui.OpenPopupOnItemClick sich auf das zuletzt gezeichnete Item bezieht.
     /// </summary>
-    private static void DrawEntryContextMenu(CollectibleEntry entry, bool allaganToolsEnabled)
+    internal static void DrawEntryContextMenu(CollectibleEntry entry, bool allaganToolsEnabled)
     {
         var popupId = $"##EntryMenu{entry.Type}{entry.Id}";
         ImGui.OpenPopupOnItemClick(popupId, ImGuiPopupFlags.MouseButtonRight);
@@ -2031,7 +2031,7 @@ public class CompactOverlayWindow : Window
     // Aetheryte/HuntingLog/AetherCurrent/Chocobokeep sind keine Items. FrameKit/Hairstyle tragen zwar
     // nur den Namen des Rahmens/der Frisur, werden aber über Plugin.ResolveUnlockItemId auf das
     // freischaltende Item (Framer's Kit bzw. "Modern Aesthetics"-Buch) aufgelöst (siehe DrawClickableName).
-    private static readonly HashSet<CollectibleType> AllaganToolsEligibleTypes = new()
+    internal static readonly HashSet<CollectibleType> AllaganToolsEligibleTypes = new()
     {
         CollectibleType.Mount,
         CollectibleType.Minion,

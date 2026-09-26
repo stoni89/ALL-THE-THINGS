@@ -4618,22 +4618,23 @@ public sealed class Plugin : IDalamudPlugin
         return !string.IsNullOrEmpty(row.Name.ToString());
     }
 
-    private static List<uint>? globalQuestIdsCache;
+    private static List<CollectibleEntry>? globalQuestEntriesCache;
 
     /// <summary>
     /// Alle Quests, die der Charakter aktuell (unabhängig von der Zone) annehmen könnte oder
-    /// bereits abgeschlossen hat - für die globale Statistik (siehe MainWindow.DrawStatisticsPage).
-    /// Anders als ComputeLiveZoneEntries wird hier NICHT nach Vergabeort gefiltert, sondern einmal
-    /// über das komplette Quest-Sheet gegangen. Wird wie frameKitEntriesCache nur einmal pro
-    /// Plugin-Sitzung berechnet (nicht jeden Frame) - neu erreichte Story-/Level-Fortschritte, die
-    /// weitere Quests freischalten, tauchen erst nach einem Plugin-Neuladen in der Statistik auf.
+    /// bereits abgeschlossen hat - für die globale Statistik (siehe MainWindow.DrawStatisticsPage)
+    /// und die Datenbank-Seite (siehe MainWindow.DrawDatabasePage). Anders als ComputeLiveZoneEntries
+    /// wird hier NICHT nach Vergabeort gefiltert, sondern einmal über das komplette Quest-Sheet
+    /// gegangen. Wird wie frameKitEntriesCache nur einmal pro Plugin-Sitzung berechnet (nicht jeden
+    /// Frame) - neu erreichte Story-/Level-Fortschritte, die weitere Quests freischalten, tauchen
+    /// erst nach einem Plugin-Neuladen auf.
     /// </summary>
-    public unsafe List<uint> GetAllTrackedQuestIds()
+    public unsafe List<CollectibleEntry> GetAllTrackedQuestEntries()
     {
-        if (globalQuestIdsCache != null)
-            return globalQuestIdsCache;
+        if (globalQuestEntriesCache != null)
+            return globalQuestEntriesCache;
 
-        var result = new List<uint>();
+        var result = new List<CollectibleEntry>();
         var questSheet = DataManager.GetExcelSheet<Quest>();
         var playerLevel = ObjectTable.LocalPlayer?.Level ?? 0;
         if (questSheet != null && playerLevel > 0)
@@ -4643,7 +4644,7 @@ public sealed class Plugin : IDalamudPlugin
                 try
                 {
                     if (IsQuestCurrentlyAcceptable(row, playerLevel))
-                        result.Add(row.RowId);
+                        result.Add(new CollectibleEntry { Id = row.RowId, Name = row.Name.ToString(), Type = CollectibleType.Quest, Category = Loc.T("Quest", "Quest") });
                 }
                 catch (Exception ex)
                 {
@@ -4652,9 +4653,12 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        globalQuestIdsCache = result;
+        globalQuestEntriesCache = result;
         return result;
     }
+
+    /// <summary>Nur die Ids - siehe GetAllTrackedQuestEntries.</summary>
+    public List<uint> GetAllTrackedQuestIds() => GetAllTrackedQuestEntries().Select(e => e.Id).ToList();
 
     private unsafe List<CollectibleEntry> ComputeLiveZoneEntries(uint territoryId)
     {

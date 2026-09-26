@@ -165,6 +165,10 @@ public class Configuration : IPluginConfiguration
     // Einstellungen automatisch wieder ausgeschaltet, falls das Plugin nachträglich entfernt wird.
     public bool EnableAllaganToolsIntegration { get; set; } = false;
 
+    // Datenbank-Seite (siehe MainWindow.DrawDatabasePage): blendet bereits besessene/abgeschlossene
+    // Einträge aus, damit man nur noch sieht, was einem noch fehlt.
+    public bool DatabaseHideOwned { get; set; } = false;
+
     // Lässt die Quest- und Hunting-Log-Automation den Chocobo-Begleiter beschwören/am Leben
     // erhalten (siehe ChocoboCompanionSupport) - nur wirksam, solange die Quest "My Feisty Little
     // Chocobo" abgeschlossen (das System freigeschaltet) ist, siehe Plugin.IsChocoboCompanionUnlocked.

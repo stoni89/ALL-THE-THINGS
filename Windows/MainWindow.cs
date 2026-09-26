@@ -19,6 +19,7 @@ public class MainWindow : Window
     private enum RailPage
     {
         Settings,
+        Database,
         Blacklist,
         Statistics,
         Dependencies,
@@ -399,6 +400,9 @@ public class MainWindow : Window
             if (ModernUi.RailButton(FontAwesomeIcon.SlidersH, railPage == RailPage.Settings, Loc.T("Einstellungen", "Settings")))
                 railPage = RailPage.Settings;
             ImGui.Spacing();
+            if (ModernUi.RailButton(FontAwesomeIcon.Database, railPage == RailPage.Database, Loc.T("Datenbank", "Database")))
+                railPage = RailPage.Database;
+            ImGui.Spacing();
             if (ModernUi.RailButton(FontAwesomeIcon.Ban, railPage == RailPage.Blacklist, Loc.T("Blacklist", "Blacklist")))
                 railPage = RailPage.Blacklist;
             ImGui.Spacing();
@@ -455,6 +459,15 @@ public class MainWindow : Window
                 ImGui.Spacing();
                 ImGui.Indent(4f);
                 navItems[selectedNavIndex].Draw();
+                ImGui.Unindent(4f);
+                ImGui.EndChild();
+            }
+            else if (railPage == RailPage.Database)
+            {
+                ImGui.BeginChild("##DatabaseContent", new Vector2(-(ContentRightMargin - ScrollbarShiftRight), 0f), false);
+                ImGui.Spacing();
+                ImGui.Indent(4f);
+                DrawDatabasePage();
                 ImGui.Unindent(4f);
                 ImGui.EndChild();
             }
@@ -1566,6 +1579,411 @@ public class MainWindow : Window
         ImGui.PushStyleColor(ImGuiCol.PlotHistogram, ModernUi.Accent);
         ImGui.ProgressBar(total == 0 ? 0f : owned / (float)total, new Vector2(-1f, barHeight), string.Empty);
         ImGui.PopStyleColor();
+    }
+
+    // Alle Kategorien, für die es eine zonenunabhängige Gesamtliste gibt (siehe GetDatabaseEntries) -
+    // Aetheryte/HuntingLog fehlen bewusst, dafür gibt es (anders als Quest/Sightseeing) keine fertige
+    // globale Liste, sondern nur pro-Zone berechnete Ausschnitte (siehe StatisticsTypes-Kommentar).
+    private static readonly CollectibleType[] DatabaseTypes =
+    {
+        CollectibleType.Mount, CollectibleType.Minion, CollectibleType.Orchestrion, CollectibleType.Barding,
+        CollectibleType.Emote, CollectibleType.Facewear, CollectibleType.FashionAccessory, CollectibleType.TripleTriadCard,
+        CollectibleType.FrameKit, CollectibleType.Hairstyle, CollectibleType.AetherCurrent, CollectibleType.Chocobokeep,
+        CollectibleType.Achievement, CollectibleType.Quest, CollectibleType.Sightseeing,
+    };
+
+    private static List<CollectibleEntry>? databaseEntriesCache;
+
+    /// <summary>
+    /// Alle Sammelobjekte, die das Plugin kennt (siehe DatabaseTypes), einmal zusammengeführt und pro
+    /// (Type, Id) dedupliziert - CollectionData.GetAllEntries() allein deckt Quest/Sightseeing nicht ab
+    /// (siehe deren eigene, ebenfalls zonenunabhängige Methoden). Nur einmal pro Sitzung berechnet, wie
+    /// die anderen globalen Caches (GetAllTrackedQuestEntries, frameKitEntriesCache, ...).
+    /// </summary>
+    private List<CollectibleEntry> GetDatabaseEntries()
+    {
+        if (databaseEntriesCache != null)
+            return databaseEntriesCache;
+
+        var entries = CollectionData.GetAllEntries()
+            .Concat(plugin.GetAllTrackedQuestEntries())
+            .Concat(Plugin.GetSightseeingEntries())
+            .GroupBy(e => (e.Type, e.Id))
+            .Select(g => g.First())
+            .ToList();
+
+        databaseEntriesCache = entries;
+        return entries;
+    }
+
+    // Nur für die Datenbank-Seite (siehe DrawDatabasePage) - Sitzungszustand, nicht gespeichert.
+    private string databaseSearch = string.Empty;
+
+    /// <summary>
+    /// Übersicht ALLER vom Plugin verwalteten Sammelobjekte (siehe GetDatabaseEntries), unabhängig von
+    /// Zone/Fortschritt - ein Tab pro Kategorie. Anders als das Overlay zeigt das hier auch bereits
+    /// besessene Einträge (mit grünem Haken), damit man nachschlagen kann, was es überhaupt gibt.
+    /// </summary>
+    private void DrawDatabasePage()
+    {
+        ImGui.SetWindowFontScale(1.25f);
+        ImGui.TextUnformatted(Loc.T("Datenbank", "Database"));
+        ImGui.SetWindowFontScale(1f);
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextWrapped(Loc.T(
+            "Alle Sammelobjekte, die dieses Plugin kennt - unabhängig von Zone oder Fortschritt, mit Status (schon besessen oder nicht).",
+            "All collectibles this plugin knows about - independent of zone or progress, with status (already owned or not)."));
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        ImGui.SetNextItemWidth(-1f);
+        ImGui.InputTextWithHint("##DatabaseSearch", Loc.T("Datenbank durchsuchen...", "Search database..."), ref databaseSearch, 100);
+        ImGui.Dummy(new Vector2(0f, 4f));
+
+        var config = plugin.Configuration;
+        var hideOwned = config.DatabaseHideOwned;
+        if (ModernUi.ToggleRow(Loc.T("Bereits Besessene/Abgeschlossene ausblenden", "Hide already owned/completed"), ref hideOwned))
+        {
+            config.DatabaseHideOwned = hideOwned;
+            config.Save();
+        }
+        ImGui.Dummy(new Vector2(0f, 6f));
+
+        var allEntries = GetDatabaseEntries().Where(e => !config.DatabaseHideOwned || !plugin.IsOwned(e)).ToList();
+        var availableTypes = DatabaseTypes.Where(t => allEntries.Any(e => e.Type == t)).ToList();
+        if (availableTypes.Count == 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+            ImGui.TextWrapped(Loc.T("Alles besessen/abgeschlossen - Glückwunsch!", "Everything owned/completed - congratulations!"));
+            ImGui.PopStyleColor();
+            return;
+        }
+
+        if (!availableTypes.Contains(databaseSelectedType))
+            databaseSelectedType = availableTypes[0];
+
+        // Eigene, zeilenumbrechende Auswahl statt ImGui.BeginTabBar: bei 15 Kategorien reicht eine
+        // einzelne Tab-Zeile nicht (ImGui würde sie sonst hinter einem Scroll-Pfeil verstecken) -
+        // Nutzeranforderung, die Kategorien stattdessen über zwei (oder mehr, je nach Fensterbreite)
+        // Zeilen umbrechen zu lassen.
+        DrawDatabaseTypeSelector(availableTypes);
+        ImGui.Dummy(new Vector2(0f, 10f));
+
+        var selectedEntries = allEntries.Where(e => e.Type == databaseSelectedType).ToList();
+        DrawDatabaseTable(databaseSelectedType, selectedEntries);
+    }
+
+    // Nur für die Datenbank-Seite - Sitzungszustand, nicht gespeichert.
+    private CollectibleType databaseSelectedType = CollectibleType.Mount;
+
+    /// <summary>
+    /// Zeichnet für jede Kategorie einen kleinen Auswahl-Knopf, umbricht dabei automatisch in die
+    /// nächste Zeile, sobald der nächste Knopf nicht mehr in die verfügbare Breite passt - das
+    /// Standard-ImGui-Muster für umbrechende Knopfreihen (siehe imgui_demo.cpp "Wrapping").
+    /// </summary>
+    private void DrawDatabaseTypeSelector(IReadOnlyList<CollectibleType> availableTypes)
+    {
+        var windowVisibleX2 = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        var framePaddingX = ImGui.GetStyle().FramePadding.X;
+
+        float MeasureWidth(CollectibleType t) => ImGui.CalcTextSize(Loc.TypeName(t)).X + framePaddingX * 2f;
+
+        for (var i = 0; i < availableTypes.Count; i++)
+        {
+            var type = availableTypes[i];
+            var selected = databaseSelectedType == type;
+
+            ImGui.PushStyleColor(ImGuiCol.Button, selected ? ModernUi.SidebarSelected : new Vector4(0f, 0f, 0f, 0f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ModernUi.SidebarHover);
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, ModernUi.SidebarSelected);
+            if (ImGui.Button($"{Loc.TypeName(type)}##dbtype_{type}"))
+                databaseSelectedType = type;
+            ImGui.PopStyleColor(3);
+
+            if (i + 1 < availableTypes.Count)
+            {
+                var lastButtonX2 = ImGui.GetItemRectMax().X;
+                var nextButtonX2 = lastButtonX2 + spacing + MeasureWidth(availableTypes[i + 1]);
+                if (nextButtonX2 < windowVisibleX2)
+                    ImGui.SameLine();
+            }
+        }
+    }
+
+    // Für diese Typen macht weder eine Preisangabe noch ein Anbieter/Questgeber Sinn (Errungenschaften/
+    // Chocobokeep/Quests/Sightseeing haben keine Kaufwährung, Ätherströmungen ohnehin nie - und
+    // "Von" wäre dort ebenso leer bzw. bedeutungslos) - Nutzeranforderung.
+    private static readonly HashSet<CollectibleType> DatabaseTypesWithoutVendorInfo = new()
+    {
+        CollectibleType.Achievement, CollectibleType.Chocobokeep, CollectibleType.Quest,
+        CollectibleType.Sightseeing, CollectibleType.AetherCurrent,
+    };
+
+    private void DrawDatabaseTable(CollectibleType type, List<CollectibleEntry> typeEntries)
+    {
+        var filtered = typeEntries
+            .Where(e => string.IsNullOrWhiteSpace(databaseSearch) || e.Name.Contains(databaseSearch, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+        ImGui.TextUnformatted(Loc.T($"{filtered.Count} von {typeEntries.Count} Einträgen", $"{filtered.Count} of {typeEntries.Count} entries"));
+        ImGui.PopStyleColor();
+        ImGui.Spacing();
+
+        if (filtered.Count == 0)
+        {
+            ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+            ImGui.TextWrapped(Loc.T("Nichts gefunden.", "Nothing found."));
+            ImGui.PopStyleColor();
+            return;
+        }
+
+        var showVendorInfo = !DatabaseTypesWithoutVendorInfo.Contains(type);
+
+        // Eigene Breite statt ImGui.GetFrameHeight(): das Icon sitzt in einem SmallButton mit der
+        // FontAwesome-Schrift, die etwas breiter als der reine FrameHeight ist - ohne den Zuschlag
+        // wurde der Button in der zu knappen Spalte abgeschnitten/falsch ausgerichtet dargestellt.
+        float goToIconWidth;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+            goToIconWidth = ImGui.CalcTextSize(FontAwesomeIcon.Running.ToIconString()).X;
+        var goToColumnWidth = goToIconWidth + ImGui.GetStyle().FramePadding.X * 2f + 4f;
+        var statusColumnWidth = 60f;
+        var currencyColumnWidth = 90f;
+        var columnCount = showVendorInfo ? 6 : 4;
+
+        ImGui.BeginChild($"##DatabaseList{type}", new Vector2(0f, 0f), false);
+        if (ImGui.BeginTable($"##DatabaseTable{type}", columnCount, ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.PadOuterX))
+        {
+            ImGui.TableSetupColumn("##GoTo", ImGuiTableColumnFlags.WidthFixed, goToColumnWidth);
+            // Name, Von und Zone teilen sich den übrigen Platz proportional (2:1:1) - reines
+            // WidthStretch nur auf Name ließ diese Spalte bei breitem Fenster unverhältnismäßig groß
+            // wirken, während die schmalen Fixed-Spalten (Preis/Status) daneben zusammengequetscht aussahen.
+            ImGui.TableSetupColumn(Loc.T("Name", "Name"), ImGuiTableColumnFlags.WidthStretch, 2f);
+            if (showVendorInfo)
+                ImGui.TableSetupColumn(Loc.T("Preis", "Price"), ImGuiTableColumnFlags.WidthFixed, currencyColumnWidth);
+            if (showVendorInfo)
+                ImGui.TableSetupColumn(Loc.T("Von", "From"), ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableSetupColumn(Loc.T("Zone", "Zone"), ImGuiTableColumnFlags.WidthStretch, 1f);
+            ImGui.TableSetupColumn(Loc.T("Status", "Status"), ImGuiTableColumnFlags.WidthFixed, statusColumnWidth);
+
+            var headers = showVendorInfo
+                ? new[] { (1, Loc.T("NAME", "NAME")), (2, Loc.T("PREIS", "PRICE")), (3, Loc.T("VON", "FROM")), (4, Loc.T("ZONE", "ZONE")), (5, Loc.T("STATUS", "STATUS")) }
+                : new[] { (1, Loc.T("NAME", "NAME")), (2, Loc.T("ZONE", "ZONE")), (3, Loc.T("STATUS", "STATUS")) };
+            ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
+            ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg0, 0u);
+            foreach (var (column, header) in headers)
+            {
+                ImGui.TableSetColumnIndex(column);
+                ImGui.Dummy(new Vector2(0f, 2f));
+                ImGui.SetWindowFontScale(0.85f);
+                ImGui.TextColored(ModernUi.TextMuted, header);
+                ImGui.SetWindowFontScale(1f);
+            }
+
+            ImGui.TableSetColumnIndex(columnCount - 1);
+            var headerBottomY = ImGui.GetItemRectMax().Y + 4f;
+            var tableMinX = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMin().X;
+            var tableMaxX = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
+            var headerDrawList = ImGui.GetWindowDrawList();
+            headerDrawList.PushClipRect(new Vector2(tableMinX, headerBottomY - 1f), new Vector2(tableMaxX, headerBottomY + 1f), false);
+            headerDrawList.AddLine(new Vector2(tableMinX, headerBottomY), new Vector2(tableMaxX, headerBottomY), ImGui.GetColorU32(ImGuiCol.Separator));
+            headerDrawList.PopClipRect();
+            ImGui.Dummy(new Vector2(0f, 6f));
+
+            foreach (var entry in filtered)
+            {
+                ImGui.TableNextRow();
+
+                // "Hinlaufen"-Icon - nur, wenn der Eintrag überhaupt ein Kartenziel/Weltposition hat.
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                if (entry.HasGoToTarget)
+                    DrawDatabaseGoToIcon(entry);
+
+                // Name: Linksklick öffnet die Karte, Rechtsklick das Menü (Mehr Informationen/
+                // Blacklist) - eigene, schlichte Variante ohne den Schatten-/Verdeckungs-Umgang des
+                // Overlays (der ist nur für das transparente Kompakt-Overlay gedacht, siehe
+                // DrawDatabaseName-Kommentar).
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                DrawDatabaseName(entry);
+
+                if (showVendorInfo)
+                {
+                    ImGui.TableNextColumn();
+                    ImGui.AlignTextToFramePadding();
+                    DrawDatabaseCurrency(entry);
+
+                    ImGui.TableNextColumn();
+                    ImGui.AlignTextToFramePadding();
+                    ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+                    ImGui.TextUnformatted(string.IsNullOrEmpty(entry.Vendor) ? "-" : entry.Vendor);
+                    ImGui.PopStyleColor();
+                }
+
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                ImGui.PushStyleColor(ImGuiCol.Text, ModernUi.TextMuted);
+                ImGui.TextUnformatted(entry.TerritoryTypeId != 0 ? Plugin.GetZoneName(entry.TerritoryTypeId) : "-");
+                ImGui.PopStyleColor();
+
+                ImGui.TableNextColumn();
+                ImGui.AlignTextToFramePadding();
+                var owned = plugin.IsOwned(entry);
+                using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+                    ImGui.TextColored(owned ? new Vector4(0.45f, 0.9f, 0.45f, 1f) : new Vector4(0.95f, 0.35f, 0.4f, 1f),
+                        (owned ? FontAwesomeIcon.Check : FontAwesomeIcon.Times).ToIconString());
+            }
+
+            ImGui.EndTable();
+        }
+        ImGui.EndChild();
+    }
+
+    /// <summary>
+    /// Preisangabe (Icon + Menge, ggf. mehrere Währungen) für die Datenbank-Seite - eigenständige,
+    /// vereinfachte Variante von CompactOverlayWindow.DrawCurrencyRequirement: die dortige Version
+    /// beginnt bewusst mit ImGui.SameLine() (hängt sich an ein vorher gezeichnetes "-" an), was in
+    /// einer frisch begonnenen Tabellenzelle hier nicht passt.
+    /// </summary>
+    /// <summary>
+    /// "Hinlaufen"-Icon für die Datenbank-Seite - eigenständige, schlichte Variante von
+    /// CompactOverlayWindow.DrawGoToIcon (dieselbe Funktion, kein Schatten-/Verdeckungs-Umgang nötig,
+    /// da die Datenbank in einem normalen, undurchsichtigen Fenster steht statt im transparenten
+    /// Kompakt-Overlay).
+    /// </summary>
+    private void DrawDatabaseGoToIcon(CollectibleEntry entry)
+    {
+        var automation = plugin.GoToAutomation;
+        var isThisEntryActive = automation.IsNavigatingTo(entry);
+        var available = automation.IsAvailable();
+
+        bool clicked;
+        bool hovered;
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+        {
+            var icon = isThisEntryActive ? FontAwesomeIcon.StopCircle : FontAwesomeIcon.Running;
+            var color = !available ? ModernUi.TextMuted : isThisEntryActive ? new Vector4(1f, 0.65f, 0.2f, 1f) : new Vector4(0.55f, 0.95f, 0.55f, 1f);
+
+            // Ohne eigenen Button-Hintergrund (nur beim Hovern/Klicken dezent hervorgehoben) - reines
+            // Icon statt eines sichtbaren Knopf-Kastens, wie die übrigen Icon-Spalten in der Tabelle.
+            ImGui.PushStyleColor(ImGuiCol.Text, color);
+            ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0f, 0f, 0f, 0f));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ModernUi.SidebarHover);
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, ModernUi.SidebarSelected);
+            if (!available)
+                ImGui.BeginDisabled();
+
+            // Typ mit in die ImGui-ID einbezogen wie beim Overlay - verschiedene Datenquellen
+            // vergeben ihre IDs unabhängig voneinander (siehe CompactOverlayWindow.DrawGoToIcon).
+            clicked = ImGui.SmallButton($"{icon.ToIconString()}##DbGoTo{entry.Type}{entry.Id}");
+
+            if (!available)
+                ImGui.EndDisabled();
+            ImGui.PopStyleColor(4);
+
+            hovered = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled);
+        }
+
+        if (hovered)
+        {
+            ImGui.SetTooltip(!available
+                ? Loc.T("vnavmesh/Lifestream nicht gefunden - bitte installieren.", "vnavmesh/Lifestream not found - please install them.")
+                : isThisEntryActive
+                    ? Loc.T("Hinlaufen abbrechen", "Cancel walking there")
+                    : Loc.T("Automatisch hinlaufen", "Automatically walk there"));
+        }
+
+        if (clicked && available)
+        {
+            if (isThisEntryActive)
+                automation.Cancel();
+            else
+                automation.GoTo(entry);
+        }
+    }
+
+    /// <summary>
+    /// Klickbarer Name für die Datenbank-Seite - eigenständige, schlichte Variante von
+    /// CompactOverlayWindow.DrawClickableName: dieselbe Klick-/Menü-Logik (Linksklick öffnet die
+    /// Karte, Rechtsklick das Menü, siehe CompactOverlayWindow.DrawEntryContextMenu), aber ohne dessen
+    /// OutlineText/IsOccluded - die sind nur für das transparente Kompakt-Overlay gedacht (Schatten
+    /// für Lesbarkeit auf dem 3D-Untergrund, Verstecken hinter nativen Fenstern GENAU an dessen
+    /// eigener Bildschirmposition) und passten hier weder farblich noch inhaltlich (u.a. wurde Text
+    /// fälschlich anhand der Overlay-Position als "verdeckt" ausgeblendet).
+    /// </summary>
+    private void DrawDatabaseName(CollectibleEntry entry)
+    {
+        var allaganToolsEnabled = plugin.Configuration.EnableAllaganToolsIntegration
+                                   && Plugin.IsAllaganToolsAvailable()
+                                   && CompactOverlayWindow.AllaganToolsEligibleTypes.Contains(entry.Type)
+                                   && (entry.Type is not (CollectibleType.FrameKit or CollectibleType.Hairstyle) || Plugin.HasUnlockItem(entry));
+
+        if (entry.HasGoToTarget)
+            ImGui.TextColored(new Vector4(0.5f, 0.8f, 1f, 1f), entry.Name);
+        else
+            ImGui.TextUnformatted(entry.Name);
+
+        // Der Anbieter/Questgeber steht jetzt in einer eigenen Spalte (siehe DrawDatabaseTable) statt
+        // nur im Tooltip - hier daher nur noch der Hand-Cursor als Klick-Hinweis.
+        if (entry.HasGoToTarget && ImGui.IsItemHovered())
+            ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
+
+        if (entry.HasGoToTarget && ImGui.IsItemClicked())
+            Plugin.OpenEntryMap(entry);
+
+        CompactOverlayWindow.DrawEntryContextMenu(entry, allaganToolsEnabled);
+    }
+
+    private void DrawDatabaseCurrency(CollectibleEntry entry)
+    {
+        if (string.IsNullOrEmpty(entry.Currency))
+            return;
+
+        void DrawOne(uint iconId, uint amount, string label, bool sameLine)
+        {
+            if (sameLine)
+                ImGui.SameLine();
+
+            if (iconId != 0)
+            {
+                var icon = Plugin.TextureProvider.GetFromGameIcon(new Dalamud.Interface.Textures.GameIconLookup(iconId)).GetWrapOrEmpty();
+                // Icon über die VOLLE Zeilenhöhe (FrameHeight) statt nur TextLineHeight - dadurch
+                // füllt es die Zeile automatisch von oben bis unten und sitzt zwangsläufig vertikal
+                // zentriert, ganz ohne empirisch geschätzten Pixel-Versatz (der bei unterschiedlichen
+                // Icon-Grafiken/Schriftgrößen nie zuverlässig für alle Fälle passt, siehe Nutzer-
+                // Screenshots). Der Cursor steht hier bereits um (FrameHeight-TextLineHeight)/2 nach
+                // unten verschoben (siehe AlignTextToFramePadding im Aufrufer) - das erst rückgängig
+                // machen, um wieder beim TATSÄCHLICHEN Zeilenanfang zu starten.
+                var alignedY = ImGui.GetCursorPosY();
+                var frameHeight = ImGui.GetFrameHeight();
+                var trueRowTopY = alignedY - (frameHeight - ImGui.GetTextLineHeight()) * 0.5f;
+                ImGui.SetCursorPosY(trueRowTopY);
+                ImGui.Image(icon.Handle, new Vector2(frameHeight));
+                ImGui.SameLine();
+                ImGui.SetCursorPosY(alignedY);
+            }
+
+            if (amount != 0)
+                ImGui.TextUnformatted(amount.ToString("N0"));
+            else if (iconId == 0)
+                ImGui.TextUnformatted(label);
+
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(label);
+        }
+
+        DrawOne(entry.CurrencyIconId, entry.CurrencyAmount, entry.Currency, false);
+
+        if (entry.AdditionalCurrencies == null)
+            return;
+
+        foreach (var additional in entry.AdditionalCurrencies)
+            DrawOne(additional.CurrencyIconId, additional.CurrencyAmount, additional.Currency, true);
     }
 
     // Nur für die Blacklist-Seite (siehe DrawBlacklistPage) - Sitzungszustand, nicht gespeichert.
