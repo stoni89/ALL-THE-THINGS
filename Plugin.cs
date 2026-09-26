@@ -245,7 +245,7 @@ public sealed class Plugin : IDalamudPlugin
             CollectibleType.Aetheryte => IsAetheryteUnlocked(entry.Id),
             CollectibleType.AetherCurrent => IsAetherCurrentUnlocked(entry.Id),
             CollectibleType.Sightseeing => IsAdventureComplete(entry.Id),
-            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id) || IsQuestObsoletedByMutualExclusion(entry.Id),
+            CollectibleType.Quest => QuestManager.IsQuestComplete((ushort)entry.Id) || IsQuestObsoletedByAchievement(entry.Id) || IsQuestObsoletedByMutualExclusion(entry.Id) || IsQuestObsoletedByClassJobUnlock(entry.Id),
             CollectibleType.Chocobokeep => IsChocoboTaxiStandUnlocked(entry.Id),
             CollectibleType.Achievement => IsAchievementCompleteById(entry.Id),
             _ => false,
@@ -1867,6 +1867,13 @@ public sealed class Plugin : IDalamudPlugin
                 new SightseeingPuzzleStep(new Vector3(150.24185f, -9.401789f, 161.39577f), Jump: false, SprintBefore: true, Exact: true), // Punkt 6 - auf Punkt 5 Sprint, dann genau hierhin
                 new SightseeingPuzzleStep(new Vector3(150.25928f, -9.405594f, 160.7533f), Jump: false, Exact: true),        // Punkt 7 - Anlauf ab Punkt 6, genau hier abspringen
                 new SightseeingPuzzleStep(new Vector3(150.56349f, -9.47222f, 154.79427f), Jump: true, RunUp: true),         // Punkt 8 (Sightseeing-Punkt) - bei Punkt 7 abspringen
+            }),
+        [2162702] = new( // The Gold Court (Ul'dah)
+            new Vector3(23.742538f, 29.999996f, -0.08629319f),
+            new[]
+            {
+                new SightseeingPuzzleStep(new Vector3(20.095932f, 30.999998f, 0.047614243f), Jump: true), // Punkt 2
+                new SightseeingPuzzleStep(new Vector3(15.2992935f, 19.797047f, -0.01418628f), Jump: false), // Punkt 3 (Sightseeing-Punkt)
             }),
     };
 
@@ -4328,6 +4335,50 @@ public sealed class Plugin : IDalamudPlugin
         var achievementId = ResolveAchievementIdByName(requiredAchievement);
         return achievementId != null && achievementSheet != null
             && achievementSheet.TryGetRow(achievementId.Value, out var row) && UnlockState.IsAchievementComplete(row);
+    }
+
+    /// <summary>
+    /// Die acht ARR-Klassenquests ("So You Want to Be a ..."), die eine Klasse überhaupt erst
+    /// freischalten - Nutzer-Report: "So You Want to Be an Archer" blieb in Gridania dauerhaft als
+    /// "noch nicht abgeschlossen" markiert, obwohl Archer längst gespielt wird. Vermutlich ein
+    /// zweiter, im Spiel selbst nicht mehr vergebener Lumina-Datensatz mit demselben Namen (bzw. eine
+    /// abweichende RowId-Zuordnung) - da man eine Klasse ausschließlich über den Abschluss genau
+    /// dieser Quest bekommt, ist ein bereits erreichter Klassen-Rang (PlayerState.GetClassJobLevel,
+    /// > 0) ein zuverlässiger Ersatzbeleg dafür, dass die Quest funktional erledigt ist, selbst wenn
+    /// der rohe QuestManager-Abschluss-Flag (aus welchem Grund auch immer) nicht mehr zutrifft. Von
+    /// Hand gepflegt wie QuestObsoletedByAchievement, wird nur ergänzt, wenn konkrete Quests genannt
+    /// werden.
+    /// </summary>
+    private static readonly Dictionary<string, byte> StarterClassQuestJobIds = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["So You Want to Be a Gladiator"] = 1,
+        ["So You Want to Be a Pugilist"] = 2,
+        ["So You Want to Be a Marauder"] = 3,
+        ["So You Want to Be a Lancer"] = 4,
+        ["So You Want to Be an Archer"] = 5,
+        ["So You Want to Be a Conjurer"] = 6,
+        ["So You Want to Be a Thaumaturge"] = 7,
+        ["So You Want to Be an Arcanist"] = 26,
+    };
+
+    private static Dictionary<uint, byte>? starterClassQuestJobIdCache;
+
+    /// <summary>Siehe StarterClassQuestJobIds-Kommentar.</summary>
+    private static unsafe bool IsQuestObsoletedByClassJobUnlock(uint questId)
+    {
+        if (starterClassQuestJobIdCache == null)
+        {
+            starterClassQuestJobIdCache = new Dictionary<uint, byte>();
+            foreach (var (questName, jobId) in StarterClassQuestJobIds)
+            {
+                var resolvedId = ResolveQuestIdByName(questName);
+                if (resolvedId != null)
+                    starterClassQuestJobIdCache[resolvedId.Value] = jobId;
+            }
+        }
+
+        return starterClassQuestJobIdCache.TryGetValue(questId, out var classJobId)
+            && PlayerState.Instance()->GetClassJobLevel(classJobId) > 0;
     }
 
     /// <summary>
