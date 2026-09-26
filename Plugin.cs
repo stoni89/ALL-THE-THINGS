@@ -5744,7 +5744,7 @@ public sealed class Plugin : IDalamudPlugin
     public static unsafe bool TryDeclineSelectYesno()
     {
         var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
-        if (addon == null || !addon->IsVisible)
+        if (addon == null || !addon->IsVisible || !addon->IsReady)
             return false;
 
         addon->FireCallbackInt(1); // 1 = "Nein"/"No"
@@ -5752,10 +5752,20 @@ public sealed class Plugin : IDalamudPlugin
         return true;
     }
 
+    /// <summary>
+    /// Bestätigt "Ja", sobald das Fenster nicht nur sichtbar, sondern auch tatsächlich bedienbar ist
+    /// (IsReady) - Nutzer-Report: blieb im Gold Saucer (Fahrstuhl-NPC, siehe Plugin.
+    /// ManualDistrictEntryPoints) teilweise am Ja/Nein-Dialog hängen. IsVisible wird schon einen
+    /// Frame VOR IsReady gesetzt (Fenster fährt noch ein/lädt seine Ereignis-Listener) - ein
+    /// FireCallbackInt in genau diesem Zwischenframe wird vom Spiel stillschweigend ignoriert, obwohl
+    /// die Methode "true" zurückgäbe. Ohne den zusätzlichen IsReady-Check verließ sich der Aufrufer
+    /// darauf, dass ein einziger true-Rückgabewert reicht (z.B. Phasenwechsel zu WaitingForZoneChange),
+    /// obwohl der Klick real gar nicht ankam - das Fenster blieb offen und niemand versuchte es erneut.
+    /// </summary>
     public static unsafe bool TryConfirmSelectYesno()
     {
         var addon = (AtkUnitBase*)GameGui.GetAddonByName("SelectYesno").Address;
-        if (addon == null || !addon->IsVisible)
+        if (addon == null || !addon->IsVisible || !addon->IsReady)
             return false;
 
         addon->FireCallbackInt(0); // 0 = "Ja"/"Yes"
