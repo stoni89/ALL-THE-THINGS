@@ -24,7 +24,15 @@ public sealed class AetheryteAutomation
         MovingTo,
         Interacting,
         TravelingToDistrict,
+        ManualDistrictEntry,
         SimulationWaitingForWindowClose,
+    }
+
+    private enum ManualEntryPhase
+    {
+        Walking,
+        Interacting,
+        WaitingForZoneChange,
     }
 
     // Wie lange maximal aufs Aufsteigen gewartet wird (Ruf-Animation), bevor trotzdem
@@ -207,6 +215,23 @@ public sealed class AetheryteAutomation
     private DateTime? districtTravelFinishedAt;
     private readonly HashSet<uint> skippedIds = new();
 
+    // Manueller Bezirks-Zugang (siehe Plugin.ManualDistrictEntryPoints/TryTravelToDistrict).
+    private ManualEntryPhase manualEntryPhase;
+    private DateTime manualEntryPhaseStartedAt;
+    private uint manualEntryTargetTerritory;
+    private Vector3 manualEntryPosition;
+    private int manualEntryInteractAttempts;
+    private DateTime manualEntryInteractedAt;
+    private DateTime? manualEntryDismountedAt;
+    private DateTime lastManualEntryMountAttempt = DateTime.MinValue;
+    private const float ManualEntryArrivalTolerance = 0.6f;
+    private const float ManualEntryObjectSearchRadius = 8f;
+    private static readonly TimeSpan ManualEntryWalkTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ManualEntryPathRetryInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan ManualEntryDismountSettleDelay = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan ManualEntryZoneChangeTimeout = TimeSpan.FromSeconds(30);
+    private const int ManualEntryMaxInteractAttempts = 3;
+
     // Nach "Lifestream.IsBusy() == false" kann es noch einen Moment dauern, bis Plugin.ClientState.
     // TerritoryType (und andere Zonen-Metadaten) tatsächlich auf die neue Zone aktualisiert sind -
     // ohne diese kurze Verzögerung hält TryStartNext die Zone noch für die alte und schickt die
@@ -321,6 +346,7 @@ public sealed class AetheryteAutomation
         attemptCounts.Clear();
         interactObjectNotFoundSince = null;
         districtTravelFinishedAt = null;
+        manualEntryBlockedUntil = DateTime.MinValue;
         StatusText = Loc.T("Automation gestartet...", "Automation started...");
     }
 
@@ -370,6 +396,10 @@ public sealed class AetheryteAutomation
 
                 case State.TravelingToDistrict:
                     UpdateTravelingToDistrict();
+                    break;
+
+                case State.ManualDistrictEntry:
+                    UpdateManualDistrictEntry();
                     break;
 
                 case State.SimulationWaitingForWindowClose:
@@ -479,7 +509,7 @@ public sealed class AetheryteAutomation
             return;
         }
 
-        TryTravelToDistrict(otherDistrictCandidate, candidates);
+        TryTravelToDistrict(otherDistrictCandidate, candidates, currentTerritory);
     }
 
     private void StartMovingTo(CollectibleEntry next, Vector3 targetPosition)
@@ -639,7 +669,7 @@ public sealed class AetheryteAutomation
     /// oder ohne einen bereits freigeschalteten Aetheryten dort werden alle Kandidaten dieses
     /// Bezirks übersprungen, statt endlos erneut zu versuchen.
     /// </summary>
-    private void TryTravelToDistrict(CollectibleEntry targetCandidate, List<CollectibleEntry> allCandidates)
+    private void TryTravelToDistrict(CollectibleEntry targetCandidate, List<CollectibleEntry> allCandidates, uint currentTerritory)
     {
         var targetTerritory = HomeTerritory(targetCandidate);
 
@@ -649,8 +679,31 @@ public sealed class AetheryteAutomation
                 skippedIds.Add(c.Id);
         }
 
+        // Manueller Bezirks-Zugang (z.B. Gold-Saucer-Fahrstuhl) - für Bezirke, in denen noch KEIN
+        // Aetheryte/Aethernetz-Kristall freigeschaltet ist, kann Lifestream ohnehin nicht bootstrappen
+        // (siehe Plugin.ManualDistrictEntryPoints-Kommentar). Braucht selbst kein Lifestream.
+        bool TryManualEntry()
+        {
+            if (DateTime.UtcNow < manualEntryBlockedUntil || !Plugin.TryGetManualDistrictEntryPoint(currentTerritory, targetTerritory, out var entryPosition))
+                return false;
+
+            Plugin.Log.Info($"[AetheryteAutomation] TryTravelToDistrict({targetTerritory}): nutze manuellen Bezirks-Zugang bei {entryPosition}.");
+            BeginManualDistrictEntry(targetTerritory, entryPosition);
+            return true;
+        }
+
+        // Im Simulation-Modus (siehe Configuration.SimulateAetheryteAutomation) den manuellen Zugang
+        // IMMER nutzen, statt der Aethernetz-/Teleport-Abkürzungen unten - der Zielkristall ist dort
+        // zu Testzwecken absichtlich schon freigeschaltet, im echten "noch nicht freigeschaltet"-Fall
+        // wäre der Zugang aber ohnehin die einzige Möglichkeit (siehe Plugin.SimulateAetheryteAutomation).
+        if (Plugin.SimulateAetheryteAutomation && TryManualEntry())
+            return;
+
         if (!IsLifestreamAvailable())
         {
+            if (TryManualEntry())
+                return;
+
             SkipWholeDistrict();
             StatusText = Loc.T(
                 "Nachbarbezirk übersprungen (Lifestream nicht gefunden)",
@@ -683,6 +736,9 @@ public sealed class AetheryteAutomation
         var mainAetheryteId = Plugin.FindUnlockedMainAetheryteId(targetTerritory);
         if (mainAetheryteId == null)
         {
+            if (TryManualEntry())
+                return;
+
             SkipWholeDistrict();
             StatusText = Loc.T(
                 "Nachbarbezirk übersprungen (dort noch kein Aetheryte freigeschaltet)",
@@ -730,6 +786,189 @@ public sealed class AetheryteAutomation
             state = State.Idle;
             StatusText = Loc.T("Reise dauert zu lange - abgebrochen", "Travel took too long - aborted");
         }
+    }
+
+    /// <summary>Siehe Plugin.ManualDistrictEntryPoints - hinlaufen, interagieren, "Ja" bestätigen, auf den Zonenwechsel warten.</summary>
+    private void BeginManualDistrictEntry(uint targetTerritory, Vector3 entryPosition)
+    {
+        manualEntryTargetTerritory = targetTerritory;
+        manualEntryPosition = entryPosition;
+        manualEntryInteractAttempts = 0;
+        manualEntryDismountedAt = null;
+        state = State.ManualDistrictEntry;
+        stateEnteredAt = DateTime.UtcNow;
+        SetManualEntryPhase(ManualEntryPhase.Walking);
+    }
+
+    private void SetManualEntryPhase(ManualEntryPhase phase)
+    {
+        manualEntryPhase = phase;
+        manualEntryPhaseStartedAt = DateTime.UtcNow;
+    }
+
+    private void UpdateManualDistrictEntry()
+    {
+        switch (manualEntryPhase)
+        {
+            case ManualEntryPhase.Walking:
+                UpdateManualEntryWalking();
+                break;
+            case ManualEntryPhase.Interacting:
+                UpdateManualEntryInteracting();
+                break;
+            case ManualEntryPhase.WaitingForZoneChange:
+                UpdateManualEntryWaitingForZoneChange();
+                break;
+        }
+    }
+
+    private void UpdateManualEntryWalking()
+    {
+        StatusText = Loc.T("Laufe zum Zugang des Nachbarbezirks...", "Walking to the neighboring district's entrance...");
+
+        var playerPos = Plugin.ObjectTable.LocalPlayer?.Position ?? manualEntryPosition;
+        if (Vector3.Distance(playerPos, manualEntryPosition) <= ManualEntryArrivalTolerance)
+        {
+            StopPath();
+            manualEntryDismountedAt = null;
+            SetManualEntryPhase(ManualEntryPhase.Interacting);
+            return;
+        }
+
+        if (DateTime.UtcNow - manualEntryPhaseStartedAt > ManualEntryWalkTimeout)
+        {
+            Plugin.Log.Info("[AetheryteAutomation] ManualDistrictEntry: Zugang nicht erreicht - gebe auf.");
+            FailManualDistrictEntry();
+            return;
+        }
+
+        var running = false;
+        try { running = pathIsRunning.InvokeFunc(); } catch { /* vnavmesh fehlt */ }
+        if (running)
+            return;
+
+        if (DateTime.UtcNow - lastManualEntryMountAttempt > ManualEntryPathRetryInterval)
+        {
+            lastManualEntryMountAttempt = DateTime.UtcNow;
+            var mounted = Plugin.Condition[ConditionFlag.Mounted];
+            var flying = mounted && Plugin.CanFly;
+            var accepted = flying && pathfindAndMoveCloseTo.InvokeFunc(manualEntryPosition, true, ManualEntryArrivalTolerance);
+            if (!accepted)
+                accepted = pathfindAndMoveCloseTo.InvokeFunc(manualEntryPosition, false, ManualEntryArrivalTolerance);
+            Plugin.Log.Info($"[AetheryteAutomation] ManualDistrictEntry: Laufe zum Zugang, angenommen={accepted}.");
+        }
+    }
+
+    private void UpdateManualEntryInteracting()
+    {
+        StatusText = Loc.T("Betrete den Nachbarbezirk...", "Entering the neighboring district...");
+
+        // Das Ja/Nein-Fenster jeden Frame bestätigen, sobald es da ist.
+        if (Plugin.TryConfirmSelectYesno())
+        {
+            SetManualEntryPhase(ManualEntryPhase.WaitingForZoneChange);
+            return;
+        }
+
+        if (Plugin.Condition[ConditionFlag.Mounted])
+        {
+            Plugin.TryDismount();
+            manualEntryDismountedAt = null;
+            return;
+        }
+
+        manualEntryDismountedAt ??= DateTime.UtcNow;
+        if (DateTime.UtcNow - manualEntryDismountedAt.Value < ManualEntryDismountSettleDelay)
+            return;
+
+        // Nach einem Interact-Versuch kurz auf das Fenster warten.
+        if (manualEntryInteractAttempts > 0 && DateTime.UtcNow - manualEntryInteractedAt < TimeSpan.FromSeconds(3))
+            return;
+
+        if (manualEntryInteractAttempts >= ManualEntryMaxInteractAttempts)
+        {
+            Plugin.Log.Info("[AetheryteAutomation] ManualDistrictEntry: Zugang reagiert nicht - gebe auf.");
+            FailManualDistrictEntry();
+            return;
+        }
+
+        var target = FindManualEntryObject();
+        if (target == null)
+        {
+            Plugin.Log.Info("[AetheryteAutomation] ManualDistrictEntry: Zugangs-Objekt nicht gefunden - gebe auf.");
+            FailManualDistrictEntry();
+            return;
+        }
+
+        if (!Plugin.IsCurrentTarget(target))
+        {
+            Plugin.SetTarget(target);
+            return;
+        }
+
+        Plugin.Log.Info($"[AetheryteAutomation] ManualDistrictEntry: Interagiere mit '{target.Name}'.");
+        Plugin.InteractWithGameObject(target);
+        manualEntryInteractAttempts++;
+        manualEntryInteractedAt = DateTime.UtcNow;
+    }
+
+    private void UpdateManualEntryWaitingForZoneChange()
+    {
+        // Falls das Fenster ein zweites Mal kommt.
+        Plugin.TryConfirmSelectYesno();
+
+        if (Plugin.ResolveEffectiveTerritoryId(Plugin.ClientState.TerritoryType) == manualEntryTargetTerritory
+            && !Plugin.Condition[ConditionFlag.BetweenAreas] && !Plugin.Condition[ConditionFlag.BetweenAreas51]
+            && !Plugin.Condition[ConditionFlag.OccupiedInEvent])
+        {
+            Plugin.Log.Info("[AetheryteAutomation] ManualDistrictEntry: Nachbarbezirk betreten - Automation läuft weiter.");
+            state = State.Idle;
+            return;
+        }
+
+        if (DateTime.UtcNow - manualEntryPhaseStartedAt > ManualEntryZoneChangeTimeout)
+        {
+            Plugin.Log.Info("[AetheryteAutomation] ManualDistrictEntry: Zonenwechsel blieb aus - versuche erneut zu interagieren.");
+            SetManualEntryPhase(ManualEntryPhase.Interacting);
+            manualEntryDismountedAt = DateTime.UtcNow - ManualEntryDismountSettleDelay;
+        }
+    }
+
+    private Dalamud.Game.ClientState.Objects.Types.IGameObject? FindManualEntryObject()
+    {
+        // Der Zugang ist i.d.R. ein ansprechbarer NPC (z.B. der Fahrstuhlführer "Seathrith"), also
+        // gezielt nach EventNpc/EventObj suchen statt (wie zuvor) versehentlich alle ICharacter
+        // auszuschließen - das hätte genau diesen NPC nie gefunden.
+        Dalamud.Game.ClientState.Objects.Types.IGameObject? nearest = null;
+        var bestDistance = ManualEntryObjectSearchRadius;
+        foreach (var obj in Plugin.ObjectTable)
+        {
+            if (!obj.IsTargetable || (obj.ObjectKind != ObjectKind.EventNpc && obj.ObjectKind != ObjectKind.EventObj))
+                continue;
+
+            var distance = Vector3.Distance(obj.Position, manualEntryPosition);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                nearest = obj;
+            }
+        }
+
+        return nearest;
+    }
+
+    // Nach einem Fehlschlag (Zugang nicht erreicht/reagiert nicht) so lange nicht erneut versuchen -
+    // ohne diese Sperre würde die Automation bei einem dauerhaften Problem (z.B. Objekt nicht
+    // gefunden) jeden Frame von Neuem denselben Fehlschlag produzieren.
+    private static readonly TimeSpan ManualEntryFailureCooldown = TimeSpan.FromMinutes(2);
+    private DateTime manualEntryBlockedUntil = DateTime.MinValue;
+
+    private void FailManualDistrictEntry()
+    {
+        StopPath();
+        manualEntryBlockedUntil = DateTime.UtcNow + ManualEntryFailureCooldown;
+        StatusText = Loc.T("Nachbarbezirk übersprungen (Zugang nicht erreichbar)", "Skipped neighboring district (entrance not reachable)");
+        state = State.Idle;
     }
 
     private void UpdateMoving()

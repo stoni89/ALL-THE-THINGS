@@ -65,6 +65,16 @@ public sealed class Plugin : IDalamudPlugin
     /// </summary>
     public static bool SimulateSightseeingAutomation => instance.Configuration.SimulateSightseeingAutomation;
 
+    /// <summary>
+    /// Für AetheryteAutomation (hält sonst bewusst keine Plugin-Instanz) - ob gerade
+    /// Configuration.SimulateAetheryteAutomation aktiv ist, damit im Simulation-Modus ein manueller
+    /// Bezirks-Zugang (siehe ManualDistrictEntryPoints) auch dann genutzt wird, wenn der Zielkristall
+    /// (zu Testzwecken) technisch schon freigeschaltet ist und Lifestream sonst per Aethernetz
+    /// abkürzen würde - im echten "noch nicht freigeschaltet"-Fall bleibt der Zugang ja ohnehin die
+    /// einzige Möglichkeit, das soll auch beim Testen genau so durchlaufen werden.
+    /// </summary>
+    public static bool SimulateAetheryteAutomation => instance.Configuration.SimulateAetheryteAutomation;
+
     public readonly WindowSystem WindowSystem = new("TheExplorersCodex");
     private MainWindow MainWindow { get; init; }
     public CompactOverlayWindow CompactOverlayWindow { get; init; }
@@ -3206,6 +3216,25 @@ public sealed class Plugin : IDalamudPlugin
     /// Stadtbezirk angezeigt werden, egal in welchem Bezirk man gerade steht - man kann schließlich
     /// überall im Aethernetz-Menü der Stadt sehen/anwählen, was schon freigeschaltet ist.
     /// </summary>
+    /// <summary>
+    /// Manuelle Bezirks-Zugänge für die Aetheryten-Automation (siehe AetheryteAutomation.
+    /// TryTravelToDistrict) - für geteilte "Städte" (siehe SplitCityTerritories), deren
+    /// Nachbarbezirk NICHT per Aethernetz/Teleport erreichbar ist, solange dort noch KEIN einziger
+    /// Aetheryte/Aethernetz-Kristall freigeschaltet ist (Lifestream braucht immer einen bereits
+    /// freigeschalteten Punkt als Sprungziel). Der Gold Saucer betritt seine Unterzone
+    /// "Chocobo Square" z.B. nur über einen Fahrstuhl mit Ja/Nein-Abfrage, nie über einen normalen
+    /// Laufweg oder Aethernetz-Sprung. Key = (von TerritoryTypeId, nach TerritoryTypeId), Wert = die
+    /// Stelle, an der interagiert werden muss (vom Nutzer per Position im Spiel ermittelt).
+    /// </summary>
+    private static readonly Dictionary<(uint From, uint To), Vector3> ManualDistrictEntryPoints = new()
+    {
+        [(144, 388)] = new Vector3(-83.341324f, 0.039088488f, 29.157055f), // The Gold Saucer -> Chocobo Square (Fahrstuhl)
+    };
+
+    /// <summary>Siehe ManualDistrictEntryPoints-Kommentar.</summary>
+    public static bool TryGetManualDistrictEntryPoint(uint from, uint to, out Vector3 position) =>
+        ManualDistrictEntryPoints.TryGetValue((from, to), out position);
+
     private static readonly Dictionary<uint, uint[]> SplitCityTerritories = new()
     {
         [130] = new[] { 130u, 131u, 599u, 178u },   // Ul'dah (Steps of Nald / Steps of Thal / Flame Barracks / The Hourglass)
@@ -3359,6 +3388,99 @@ public sealed class Plugin : IDalamudPlugin
     };
 
     private const string DyeUnlockQuestName = "Simply to Dye For";
+
+    /// <summary>
+    /// Lokalisierte Standardtexte für CollaborationGatedItems - ein Cross-Game-Kollaborations-Event
+    /// als Voraussetzung, das (anders als "Final Fantasy XV Collaboration", siehe
+    /// KnownCollaborationWindows) kein verlässlich bekanntes, aktuelles Zeitfenster hat.
+    /// </summary>
+    private static readonly (string De, string En) YoKaiWatchCollaborationReason = (
+        "Nur während der einmaligen Yo-kai-Watch-Kollaboration (2016/2017) erhältlich - dieses Event ist seither nicht zurückgekehrt, die \"Yo-kai Medals\" sind nicht mehr erhältlich.",
+        "Only available during the one-time Yo-kai Watch crossover event (2016/2017) - this event hasn't returned since, and Yo-kai Medals are no longer obtainable.");
+
+    private static readonly (string De, string En) FallGuysCollaborationReason = (
+        "Nur während des wiederkehrenden Fall-Guys-Kollaborations-Events (\"Blunderville\") erhältlich, das gerade nicht läuft.",
+        "Only available during the recurring Fall Guys crossover event (\"Blunderville\"), which isn't currently running.");
+
+    private static readonly (string De, string En) DragonQuestXCollaborationReason = (
+        "Nur während der Dragon-Quest-X-Kollaboration erhältlich.",
+        "Only available during the Dragon Quest X crossover event.");
+
+    private static readonly (string De, string En) FinalFantasyXVICollaborationReason = (
+        "Nur während des Kollaborations-Events \"Final Fantasy XVI Collaboration: The Path Infernal\" beim Gold Saucer Attendant erhältlich, das gerade nicht läuft.",
+        "Only available during the \"Final Fantasy XVI Collaboration: The Path Infernal\" crossover event at the Gold Saucer Attendant, which isn't currently running.");
+
+    /// <summary>
+    /// Sammelobjekte (meist aus dem Gold Saucer bzw. mit Gold-Saucer-Bezug, siehe entry.Source), deren
+    /// einzige Voraussetzung ein Cross-Game-Kollaborations-Event ist, für das es KEIN verlässlich
+    /// auslesbares, aktuelles Zeitfenster gibt (anders als z.B. "Final Fantasy XV Collaboration",
+    /// siehe KnownCollaborationWindows, das bereits über die generische Saisonevent-Prüfung läuft).
+    /// Nutzerentscheidung: lieber immer als "Bedingung nicht erfüllt" mit Klartext-Hinweis auf das
+    /// Event anzeigen, statt es (wie der generische Saisonevent-Fallback in
+    /// IsSeasonalEventEntryCurrentlyActive das sonst täte) fälschlich als "erhältlich" durchgehen zu
+    /// lassen. Per consolegameswiki.com recherchiert.
+    ///
+    /// Bewusst NICHT enthalten: Torgal/Torgal Pup (Final Fantasy XVI Collaboration) - laut Wiki über
+    /// die reguläre, dauerhaft verfügbare Quest "The Path Infernal" (Clive Rosfield) erhältlich, keine
+    /// echte Zeitbeschränkung bekannt. Die Orchestrion-Rollen für 20.000 MGP beim Gold Saucer
+    /// Attendant hingegen SIND an dasselbe Kollaborations-Event gebunden und nur während dessen
+    /// (aktuell nicht laufenden) Zeitfensters kaufbar (Nutzer-Korrektur) - siehe
+    /// FinalFantasyXVICollaborationReason.
+    /// </summary>
+    private static readonly Dictionary<(CollectibleType Type, string Name), (string De, string En)> CollaborationGatedItems = new()
+    {
+        // Yo-kai Watch Collaboration (2016/2017).
+        [(CollectibleType.Minion, "Damona")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Zazel")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Lord Ananta")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Lord Enma")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "USApyon")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Robonyan F-type")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Hovernyan")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Shogunyan")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Venoct")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Noko")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Manjimutt")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Komajiro")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Kyubi")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Blizzaria")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Whisper")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Komasan")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Minion, "Jibanyan")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Mount, "Whisper-go")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Mount, "Whisper A-go-go")] = YoKaiWatchCollaborationReason,
+        [(CollectibleType.Mount, "Jibanyan Couch")] = YoKaiWatchCollaborationReason,
+
+        // Fall Guys Collaboration ("Blunderville", wiederkehrend - MGF bleibt zwischen den
+        // Durchläufen erhalten, aber ohne bekanntes aktuelles Zeitfenster gerade nicht aktiv).
+        [(CollectibleType.Minion, "Pegwin")] = FallGuysCollaborationReason,
+        [(CollectibleType.Minion, "Pink Bean")] = FallGuysCollaborationReason,
+        [(CollectibleType.Mount, "Rhiyes")] = FallGuysCollaborationReason,
+        [(CollectibleType.Emote, "Victory Reveal")] = FallGuysCollaborationReason,
+        [(CollectibleType.Orchestrion, "Everybody Falls (Fall Guys Theme)")] = FallGuysCollaborationReason,
+
+        // Dragon Quest X Collaboration.
+        [(CollectibleType.Minion, "Wind-up Brickman")] = DragonQuestXCollaborationReason,
+
+        // Final Fantasy XVI Collaboration: The Path Infernal - Orchestrion-Rollen beim Gold Saucer
+        // Attendant (20.000 MGP), nur während des (aktuell nicht laufenden) Event-Zeitfensters kaufbar.
+        [(CollectibleType.Orchestrion, "Land of Eikons")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Find the Flame")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "To Sail Forbidden Seas")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Away (Refrain)")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Who I Really Am")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "The State of the Realm")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Before the Storm - Caer Norvent")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Forevermore - The Grand Duchy of Rosaria")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Idylls of the Empire")] = FinalFantasyXVICollaborationReason,
+        [(CollectibleType.Orchestrion, "Tonitrua ex Machina")] = FinalFantasyXVICollaborationReason,
+
+        // Final Fantasy XI Collaboration - laut Wiki tatsächlich nur über den offiziellen Mog
+        // Station Online Store (Echtgeld) erhältlich, nicht im Spiel selbst.
+        [(CollectibleType.Minion, "Wind-up Shantotto")] = (
+            "Nur über den offiziellen Mog Station Online Store (gegen Echtgeld) erhältlich, nicht im Spiel selbst (Final Fantasy XI Collaboration).",
+            "Only available via the official Mog Station online store (real money), not obtainable in-game (Final Fantasy XI Collaboration)."),
+    };
 
     /// <summary>
     /// Ob ein Mount (per Anzeigename, siehe QuestRequiredMounts) bereits freigeschaltet ist - löst
@@ -3931,6 +4053,12 @@ public sealed class Plugin : IDalamudPlugin
                     $"Requires the completed quest \"{jobQuestName}\" (or that of another A Realm Reborn job).");
             }
         }
+
+        // Kollaborations-Events ohne bekanntes Zeitfenster (siehe CollaborationGatedItems-Kommentar) -
+        // VOR dem generischen Saisonevent-Fallback geprüft, da dieser sie sonst fälschlich als
+        // "erhältlich" durchgehen lassen würde.
+        if (CollaborationGatedItems.TryGetValue((entry.Type, entry.Name), out var collaborationReason))
+            return Loc.T(collaborationReason.De, collaborationReason.En);
 
         // Nur während eines saisonalen Events kaufbare Einträge (Category "Saisonevent", siehe
         // IsSeasonalEventEntryCurrentlyActive) - früher komplett aus der Liste gefiltert, statt
