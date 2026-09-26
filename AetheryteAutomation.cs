@@ -863,6 +863,10 @@ public sealed class AetheryteAutomation
     {
         StatusText = Loc.T("Betrete den Nachbarbezirk...", "Entering the neighboring district...");
 
+        // Der Fahrstuhlführer redet erst noch (reiner Text-Dialog, siehe Nutzer-Report Gold Saucer) -
+        // den jeden Frame weiterklicken, sonst kommt das Ja/Nein-Fenster nie dazu, überhaupt aufzugehen.
+        Plugin.TryAdvanceTalkDialogue();
+
         // Das Ja/Nein-Fenster jeden Frame bestätigen, sobald es da ist.
         if (Plugin.TryConfirmSelectYesno())
         {
@@ -914,7 +918,8 @@ public sealed class AetheryteAutomation
 
     private void UpdateManualEntryWaitingForZoneChange()
     {
-        // Falls das Fenster ein zweites Mal kommt.
+        // Falls noch weiterer Dialogtext bzw. das Fenster ein zweites Mal kommt.
+        Plugin.TryAdvanceTalkDialogue();
         Plugin.TryConfirmSelectYesno();
 
         if (Plugin.ResolveEffectiveTerritoryId(Plugin.ClientState.TerritoryType) == manualEntryTargetTerritory
