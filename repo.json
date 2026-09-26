@@ -3,7 +3,7 @@
     "Author": "Stoni",
     "Name": "The Explorer's Codex",
     "InternalName": "TheExplorersCodex",
-    "AssemblyVersion": "1.2.0.0",
+    "AssemblyVersion": "1.3.0.0",
     "Description": "Completionist plugin per zone with automation capabilities.",
     "Punchline": "Zone Completion, inspired by \"All the Things\" from WoW",
     "ApplicableVersion": "any",
