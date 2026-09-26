@@ -696,14 +696,15 @@ public class MainWindow : Window
         if (avail > buttonSize.X)
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - buttonSize.X) * 0.5f);
 
-        // Dunkles GitHub-Grau statt des sonst transparent/dezenten Knopf-Stils, damit der Knopf als
-        // eigene, erkennbare Marke heraussticht statt mit dem Hintergrund zu verschmelzen.
-        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.14f, 0.16f, 0.18f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.20f, 0.22f, 0.25f, 1f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.10f, 0.11f, 0.13f, 1f));
+        // Grün statt des sonst transparent/dezenten Knopf-Stils, damit der Knopf als eigene,
+        // erkennbare Marke heraussticht statt mit dem Hintergrund zu verschmelzen.
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.2f, 0.55f, 0.3f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.26f, 0.64f, 0.36f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.16f, 0.46f, 0.24f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text, Vector4.One);
         if (IconTextButton("AboutGitHub", FontAwesomeIcon.CodeBranch, githubText, buttonSize))
             Util.OpenLink("https://github.com/stoni89/explorers-codex");
-        ImGui.PopStyleColor(3);
+        ImGui.PopStyleColor(4);
     }
 
     private void DrawGeneralTab()

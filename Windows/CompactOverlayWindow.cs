@@ -1752,24 +1752,15 @@ public class CompactOverlayWindow : Window
         // "Auf Karte anzeigen"-Namen - siehe Plugin.OpenEntryMap, das beide Positionsarten
         // einheitlich behandelt. Das "Hinlaufen"-Icon selbst sitzt nicht mehr hier, sondern ganz
         // vorne in der Zeile (siehe DrawGoToColumn).
-        var allaganToolsHint = Loc.T("SHIFT + Klick: Mehr Informationen (Allagan Tools)", "SHIFT + click: more information (Allagan Tools)");
-        var blacklistHint = Loc.T("STRG + SHIFT + Klick: Auf die Blacklist setzen (ausblenden)", "CTRL + SHIFT + click: add to the blacklist (hide)");
-
         if (!entry.HasGoToTarget)
         {
             OutlineText(entry.Name, isNotYetPossible ? NotYetPossibleColor : affordable ? AffordableColor : NormalColor);
 
-            // Ohne Kartenziel sonst nicht interaktiv - außer für SHIFT + Klick (Allagan Tools, falls
-            // aktiviert) und STRG + SHIFT + Klick (Blacklist, immer).
+            // Ohne Kartenziel sonst nicht interaktiv - außer für das Rechtsklick-Menü (siehe unten).
             if (ImGui.IsItemHovered())
-            {
                 ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-                ImGui.SetTooltip(allaganToolsEnabled ? $"{allaganToolsHint}\n{blacklistHint}" : blacklistHint);
-            }
 
-            if (ImGui.IsItemClicked())
-                HandleModifierClick(entry, allaganToolsEnabled);
-
+            DrawEntryContextMenu(entry, allaganToolsEnabled);
             return;
         }
 
@@ -1777,39 +1768,40 @@ public class CompactOverlayWindow : Window
         if (ImGui.IsItemHovered())
         {
             ImGui.SetMouseCursor(ImGuiMouseCursor.Hand);
-            var mapTooltip = string.IsNullOrEmpty(entry.Vendor)
-                ? Loc.T("Auf Karte anzeigen", "Show on map")
-                : Loc.T($"Bei {entry.Vendor} - Auf Karte anzeigen", $"From {entry.Vendor} - show on map");
-            ImGui.SetTooltip(allaganToolsEnabled
-                ? $"{mapTooltip}\n{allaganToolsHint}\n{blacklistHint}"
-                : $"{mapTooltip}\n{blacklistHint}");
+            // Nur noch der Anbieter (Nutzeranforderung) - weder "Auf Karte anzeigen" noch der
+            // Rechtsklick-Hinweis stehen hier noch im Tooltip.
+            if (!string.IsNullOrEmpty(entry.Vendor))
+                ImGui.SetTooltip(Loc.T($"Bei {entry.Vendor}", $"From {entry.Vendor}"));
         }
 
-        if (ImGui.IsItemClicked() && !HandleModifierClick(entry, allaganToolsEnabled))
+        if (ImGui.IsItemClicked())
             Plugin.OpenEntryMap(entry);
+
+        DrawEntryContextMenu(entry, allaganToolsEnabled);
     }
 
     /// <summary>
-    /// STRG + SHIFT + Klick: auf die Blacklist (siehe Plugin.AddToBlacklist) - hat Vorrang vor
-    /// SHIFT + Klick (Allagan Tools), da beide SHIFT enthalten. true, wenn der Klick damit behandelt
-    /// ist (kein normaler Klick mehr, z.B. "Auf Karte anzeigen").
+    /// Rechtsklick-Menü direkt am Item-Namen (löst die frühere SHIFT + Klick / STRG + SHIFT + Klick-
+    /// Tastenkombinationen ab, siehe Nutzerentscheidung: "nicht mehr mit unterschiedlichen
+    /// Tastenkombinationen machen") - "Mehr Informationen" (Allagan Tools, nur falls verfügbar) und
+    /// "Auf die Blacklist setzen". Muss direkt NACH dem Namen-Widget (OutlineText/ImGui-Item)
+    /// aufgerufen werden, da ImGui.OpenPopupOnItemClick sich auf das zuletzt gezeichnete Item bezieht.
     /// </summary>
-    private static bool HandleModifierClick(CollectibleEntry entry, bool allaganToolsEnabled)
+    private static void DrawEntryContextMenu(CollectibleEntry entry, bool allaganToolsEnabled)
     {
-        var io = ImGui.GetIO();
-        if (io.KeyCtrl && io.KeyShift)
-        {
-            Plugin.AddToBlacklist(entry);
-            return true;
-        }
+        var popupId = $"##EntryMenu{entry.Type}{entry.Id}";
+        ImGui.OpenPopupOnItemClick(popupId, ImGuiPopupFlags.MouseButtonRight);
 
-        if (io.KeyShift && allaganToolsEnabled)
-        {
+        if (!ImGui.BeginPopup(popupId))
+            return;
+
+        if (allaganToolsEnabled && ImGui.Selectable(Loc.T("Mehr Informationen (Allagan Tools)", "More information (Allagan Tools)")))
             Plugin.OpenAllaganToolsItemInfo(entry);
-            return true;
-        }
 
-        return false;
+        if (ImGui.Selectable(Loc.T("Auf die Blacklist setzen", "Add to blacklist")))
+            Plugin.AddToBlacklist(entry);
+
+        ImGui.EndPopup();
     }
 
     /// <summary>
